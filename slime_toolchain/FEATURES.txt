@@ -1,0 +1,175 @@
+================================================================================
+ FEATURES - what this toolchain can actually do, at a glance
+================================================================================
+A checklist, not an explanation. See STEP_BY_STEP_GUIDE.txt for why each of
+these exists, README.txt for the exact flags, AI_CONTEXT.md for the deep
+numbers.
+
+TWO WAYS TO USE THIS
+  1. STANDALONE. Fully self-contained - every capability listed below is
+     reachable from the commands in README.txt. No AI, no account, no
+     internet. Build it, run the commands, read the output. The docs are
+     written to be sufficient on their own.
+  2. WITH CLAUDE (or any AI assistant) - much easier, and recommended.
+     Point it at this folder and ask in plain English. It reads every source
+     file and doc here and answers immediately, including things written
+     down nowhere ("what does --climb-scan do," "where do results get
+     saved," "how do I widen the search area"). It can also DO the work: run
+     hunts, score a seed you paste in, find the best spot near spawn,
+     generate the in-game commands, explain any number it produced, retune
+     for your GPU, or add features outright.
+     The difference is real - standalone means finding the right flag across
+     four docs and four tools and interpreting the output yourself; with an
+     assistant you say what you want. This project was built that way.
+     Try: "read AI_CONTEXT.md, then hunt for a record"
+
+*** STOP - BUILD FIRST. The .exe files here are compiled with -arch=native
+and WILL NOT RUN on a different GPU than the one that built them: you get
+"CUDA error: no kernel image is available for execution on the device",
+with nothing pointing at the real fix. Verified - RTX PRO 6000 (sm_120)
+binaries fail on an RTX 4050 (sm_89); the same build.ps1 on that laptop
+rebuilt all four tools and passed every self-test. So on any new machine:
+
+    powershell -ExecutionPolicy Bypass -File build.ps1
+
+Needs the CUDA Toolkit (for nvcc; a toolkit-ONLY CUDA 13 install must have
+cuda_crt + libnvvm + cuda_nvcc's bin/crt added or .cu files will not compile
+at all) and Visual Studio Build Tools with the "Desktop development with
+C++" workload (for cl.exe). Neither ships here. Detail in AI_CONTEXT.md's
+STOP section. ***
+
+*** IMPORTANT: every speed/throughput number anywhere in this project was
+measured on ONE specific GPU. On different hardware these numbers can be
+off by an order of magnitude (measured fact: the same code went from ~4M
+to ~54-58M seeds/s between two real GPUs already used on this project) -
+re-measure with --bench and a short timed hunt on the actual target
+machine before trusting or tuning anything time-based. See AI_CONTEXT.md's
+top section for the full explanation. ***
+
+--------------------------------------------------------------------------------
+ FINDING WHERE TO LOOK
+--------------------------------------------------------------------------------
+- Wide-area scan across thousands of candidate spots at once (--scan),
+  ranked by measured hit rate, no manual pre-judging required.
+- Single-spot check (--check) - prints a spot's derived mask and its ready-
+  to-run hunt/refine commands without scanning anything else.
+- Z-lattice-aware search (--z-all): automatically restricts to the only
+  chunk-rows that can ever host a good spot, a ~48x search-space reduction
+  derived from a genuine bug in Minecraft's own seed formula, not a guess.
+- Rank by resemblance to known-good spots instead of hard cutoffs
+  (--rank-by like), or by real record-beating odds instead of raw hit rate
+  (--rank-by win).
+- Efficiency-aware bit derivation (--derive-eff): finds seed bits that
+  predict PACKING quality, not just chunk count, on top of the normal
+  derivation.
+- Exact, GPU-measured packing-ceiling statistics per spot (cqCeil, pWin) at
+  full sample depth, not a thin CPU-only estimate.
+- Widen a mask from real hunt hits instead of random sampling
+  (--from-seeds).
+- Speed/timing projection for a full run before committing to it (--bench).
+
+--------------------------------------------------------------------------------
+ HUNTING SEEDS
+--------------------------------------------------------------------------------
+- GPU brute-force search at millions-to-tens-of-millions of seeds/second,
+  restricted to a derived bitmask family (--fix-mask/--fix-val).
+- Fused single-kernel hunt path (default) - ~2x faster than the older
+  two-kernel path by avoiding a redundant bitmap round-trip.
+- Seeds generated directly on the GPU (default) - no CPU-side bottleneck
+  feeding the hunt.
+- CUDA-stream double-buffered batches (default, --no-stream to disable) -
+  squeezes out GPU idle time between batches.
+- Persistent worker mode (--worker): one long-lived process hunts many
+  spots back to back instead of paying a fresh-process cost per spot -
+  the single biggest throughput win for many-small-spot workloads.
+- Auto-abort on dead families: judges a family's productivity early and
+  gives up instead of burning a full time budget on nothing
+  (--give-up-after / --give-up-hits).
+- GPU-accelerated high-bit neighbor climb (--climb-scan): cheaply sweeps
+  thousands of close variants of a known seed at chunk resolution to find
+  better-packed siblings, before spending CPU time refining them exactly.
+- Exhaustive family enumeration (--enumerate): visits every seed in a
+  derived family exactly once - proves a family's TRUE maximum instead of
+  sampling toward it.
+- Free exact duplicates of any known-good seed: the top 16 bits of a
+  64-bit world seed are PROVABLY inert - proven from the code AND
+  independently confirmed by refining the 66.21 record seed against 4
+  top-bit-flipped variants in separate processes, all landing on the exact
+  same 16950 blocks / 66.21 cq / position (see AI_CONTEXT.md's EXACT SEED
+  DUPLICATES section). Every seed sharing the same low 48 bits produces the
+  byte-identical slime-chunk map everywhere in that world - that's 65,536
+  true duplicates of any record seed for the cost of a loop, no hunting
+  required - the mechanism behind generating large batches of
+  interchangeable seeds that all reproduce one known
+  layout. Not yet wrapped into a one-command tool (see WHAT'S GENUINELY
+  NOT DONE), but fully usable by hand today.
+- Wall-clock time cap per hunt independent of process lifetime
+  (--time-limit-ms), usable inside worker mode.
+
+--------------------------------------------------------------------------------
+ SCORING / REFINING A SEED
+--------------------------------------------------------------------------------
+- Exact block-resolution scoring (not just chunk count) - replaces needing
+  the community SlimeFinder.jar at all.
+- Renders a PNG image of the layout alongside every score log.
+- High-bit neighbor climbing at full block precision (--climb,
+  --climb-recurse) - squeezes extra score out of a seed already in hand,
+  for free, no new hunting.
+- Batch-scores an entire seeds file at once, ranked, with configurable
+  thread count.
+
+--------------------------------------------------------------------------------
+ IN-GAME VERIFICATION (checking the model against reality)
+--------------------------------------------------------------------------------
+Requires the Carpet mod (for /perimeterinfo) and WorldEdit (for the void
+step) both installed on the world being tested - neither is optional.
+
+- One command generates a full physical test rig for any (seed, spot):
+  teleport/spawnpoint/gamerule setup, a WorldEdit void of the surrounding
+  area, and a slime-chunk-only obsidian floor - measurable directly with
+  Carpet mod's /perimeterinfo, the game's own spawn-space count
+  (perimeter_setup.exe).
+- Ships the floor as a single pasteable "one-command monolith" (a classic
+  falling-block/activator-rail trick) so a rig needing 100+ /fill commands
+  still only needs ONE command block - plus a re-triggerable chain-block
+  form as an alternative.
+- Self-destructing rig: the floor-placing structure removes itself after
+  running, since leftover command blocks are solid and would otherwise
+  inflate the very spawn count being measured.
+- Documents exactly why a model prediction and an in-game measurement can
+  legitimately differ (AFK height changes the 3D exclusion/despawn
+  geometry, not just the flat model) instead of leaving it as a mystery.
+
+--------------------------------------------------------------------------------
+ AUTOMATION / THE FULL LOOP
+--------------------------------------------------------------------------------
+- One command runs the entire scan -> hunt -> score -> climb -> family-
+  sweep -> push cycle, repeatable N times, resumable across sessions
+  (record_cycle.ps1 -Repeat N).
+- Persistent ledger (main\families.csv): every family ever hunted is
+  remembered, so a run days later never re-hunts the same ground.
+- Numbered, append-only run log (main\cycles.txt) - a full history of every
+  cycle, what it found, and how long it took.
+- Auto-filing of every 64+ cq result into one flat, deduplicated archive
+  (main\records\, files prefixed "<cq>_<seed>" so the best results sort
+  together) - the same layout found by different seeds doesn't masquerade
+  as separate discoveries.
+- "Best-elsewhere" tracking - separates a re-confirmed known plateau from
+  genuinely new progress in the cycle log, so the headline number can't lie
+  by omission.
+- Status reporting without touching a running search (-Status) - safe to
+  run anytime, including mid-batch.
+- One correct, verified-safe way to stop everything (stop_all.ps1) - kills
+  scripts, then workers, then confirms the GPU actually goes idle, instead
+  of risking an orphaned GPU process that breaks the next run.
+
+--------------------------------------------------------------------------------
+ BUILD / VERIFICATION / OPS
+--------------------------------------------------------------------------------
+- One script builds all three tools and runs every self-test, hard-failing
+  loudly instead of silently testing against stale binaries (build.ps1).
+- Self-tests on every tool (--self-test), each checking new GPU math
+  against an independent CPU reference before anything is trusted.
+- Full stress/benchmark pass (self-tests + timed hunts + a refine batch +
+  one rendered image) in one command, with a fast mode for a quick sanity
+  check (stress_toolchain.ps1 [-Quick]).

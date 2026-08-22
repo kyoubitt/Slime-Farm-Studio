@@ -1,0 +1,376 @@
+================================================================================
+ STEP-BY-STEP GUIDE - from "what is this project" to "how the record was found"
+================================================================================
+Written to build understanding in order, easiest concept first. Each section
+assumes only the ones before it. If you just need commands, use README.txt's
+"RECORD COMMANDS" section instead - this file is for understanding WHY those
+commands do what they do.
+
+STOP - BUILD BEFORE ANY COMMAND IN THIS FILE. The .exe files shipped here
+are compiled with -arch=native and WILL NOT RUN on a different GPU than the
+one that built them; you get "CUDA error: no kernel image is available for
+execution on the device" with no hint that rebuilding is the fix (verified:
+RTX PRO 6000 sm_120 binaries fail on an RTX 4050 sm_89, and the same
+build.ps1 on that laptop rebuilt everything and passed all self-tests):
+
+    powershell -ExecutionPolicy Bypass -File build.ps1
+
+That needs the CUDA Toolkit (for nvcc - and a toolkit-ONLY CUDA 13 install
+needs the cuda_crt, libnvvm and cuda_nvcc bin/crt components added or it
+cannot compile a .cu at all) plus Visual Studio Build Tools with the
+"Desktop development with C++" workload (for cl.exe). Neither ships in this
+folder. Full detail in AI_CONTEXT.md's STOP section and README.txt's header.
+
+IMPORTANT, before any command below: every speed number and every tuned
+default anywhere in this project was measured on ONE specific GPU, not a
+universal truth. This project's own history proves the gap can be huge -
+the same unmodified code went from ~4M to ~54-58M seeds/s (13x+) between
+two real GPUs already used here. On new hardware, re-measure with --bench
+and a short timed hunt before trusting or reusing any timing-based
+setting. See AI_CONTEXT.md's top section for the full explanation.
+
+================================================================================
+ STEP 1 - What is a slime chunk, and why do we care where they are
+================================================================================
+Minecraft's world is divided into 16x16-block "chunks." In every chunk, a
+per-chunk formula (seeded by the world seed + the chunk's coordinates)
+decides whether slimes are ALLOWED to spawn there underground: this makes it
+a "slime chunk." Roughly 1 in 10 chunks qualify, seemingly at random per
+world.
+
+A "slime farm" works by standing (AAFK) at one spot and letting slimes spawn
+in nearby slime chunks, then funneling/killing them automatically. More
+eligible chunks near your AFK spot = more slimes = a better farm. So the
+question this whole project answers is: **for a GIVEN world seed, which
+(x,z) block coordinate has the most slime-eligible area around it, and which
+SEED has the best such spot anywhere?**
+
+================================================================================
+ STEP 2 - Not every nearby chunk counts: the exclusion zone
+================================================================================
+Minecraft also has a rule: slimes cannot spawn within 24 blocks of a player.
+So the 4 chunks immediately touching your AFK spot are ALWAYS dead - the
+exclusion sphere covers them completely, no matter how "lucky" the seed is.
+A naive scoring method that draws a simple disc/square around the AFK point
+and counts all chunks inside is WRONG - it overstates every score by
+counting those 4 guaranteed-dead chunks.
+
+The correct eligible area is an ANNULUS (a ring, not a disc):
+
+    24^2 < distance^2 <= 128^2
+
+i.e. further than 24 blocks (outside the no-spawn sphere) but within 128
+blocks (game's own simulation-distance-style cutoff). This ring covers 222
+distinct chunk cells - THE fixed universe every score in this project is
+measured against. It was verified block-for-block, chunk-for-chunk, against
+the community-standard SlimeFinder.jar's own output (10/10 test rows).
+
+================================================================================
+ STEP 3 - The score itself: "cq"
+================================================================================
+cq = (eligible slime-spawnable BLOCKS within the annulus) / 256.
+
+Why /256? A chunk holds 256 blocks (16x16) at any given Y layer, so
+dividing by 256 expresses the score in "chunk equivalents" - a farm with
+70.00 cq is exactly as good as 70 PERFECT chunks, even though in practice
+no real farm hits 100% of any chunk (see step 4). This is more precise than
+just counting "how many chunks are slime chunks," because it also captures
+WHERE within each eligible chunk the good blocks land (a block near a
+chunk's near edge vs. far edge is not equally valuable once you factor in
+the distance-based annulus boundary cutting through it) - hence "blocks
+divided by 256" beats plain "chunk count" as the real objective.
+
+================================================================================
+ STEP 4 - Chunks vs. cq: a chunk COUNT is a leaky proxy for the real score
+================================================================================
+It would be simpler to just count "how many of the 222 candidate chunks are
+slime chunks" and rank by that. This project tried that first and learned
+it's misleading: a chunk that's only PARTIALLY inside the eligible annulus
+(near the ring's inner or outer edge) contributes fewer than 256 blocks even
+if it fully qualifies as a slime chunk - so two spots with the same chunk
+COUNT can differ by several cq depending on how well those chunks' USABLE
+AREA packs into the ring. This project calls that packing efficiency, and it
+falls the more chunks you have (see AI_CONTEXT.md's THE FRONTIER section for
+the exact numbers) - which is why "more slime chunks" is not automatically
+"a better farm," and why the real record search targets cq directly, not
+chunk count.
+
+================================================================================
+ STEP 5 - The three tools, and which question each one answers
+================================================================================
+  hotspot_scan   "WHERE should I even look?"
+                 Scans a wide area (thousands of candidate x,z spots) fast
+                 and cheap, ranks them, and tells you which ones are worth a
+                 real hunt. It does NOT know any real seeds yet - it works
+                 by SAMPLING many random seeds at each spot and measuring
+                 statistics (variance, hit rate) to guess which spots are
+                 likely to produce a good seed if you actually hunt them.
+
+  slime_gpu      "Brute-force search for an actual good SEED at one spot."
+                 Given one (x,z) spot, tries millions/billions of seeds per
+                 second on the GPU and records any that clear a minimum
+                 slime-chunk-count threshold. This is "the hunt" - the
+                 expensive, GPU-heavy step.
+
+  slime_refine   "Now that I have a candidate seed, what is it REALLY
+                 worth?" Computes the exact cq (down to individual blocks,
+                 not just chunk count) for a seed at a spot, and can also
+                 draw a picture (PNG) of the layout. This is the tool that
+                 replaced needing SlimeFinder.jar at all.
+
+Think of it as: hotspot_scan picks the neighborhood, slime_gpu knocks on a
+lot of doors fast, slime_refine tells you what's actually behind each door
+that answered.
+
+================================================================================
+ STEP 6 - Running the loop BY HAND, once, to see how the pieces connect
+================================================================================
+Build the three tools first (once per fresh checkout, or after any source
+change):
+
+    powershell -ExecutionPolicy Bypass -File build.ps1
+
+What it does: compiles hotspot_scan.cu, slime_gpu.cu, and slime_refine.cpp
+with nvcc, then runs every tool's --self-test and stops if any fails - so a
+build that "succeeds" but silently self-tested against stale binaries
+(a real gotcha this project hit once) can't slip through quietly.
+
+  1. WHERE - scan a wide area for promising spots:
+
+     hotspot_scan.exe --scan --center-x 0 --center-z 0 --range 10000 --z-all
+       --var-min 26 --gate-top 300 --score-t 68 --name hunt
+
+     What it does: samples many random seeds at thousands of candidate
+     (x,z) spots around (0,0) out to 10000, restricted to the hot Z-lattice
+     rows (--z-all, see step 8), and ranks them by how often a sample seed
+     clears --score-t (68) chunks. --gate-top 300 keeps the top 300
+     candidates from a coarse first pass before the more expensive ranking
+     pass runs on them. --var-min 26 is a cheap pre-filter, cutting spots
+     whose chunk-count variance is too low to ever be worth ranking.
+     -> writes main\commands\commands_hunt.csv, one hunt command per
+        candidate spot, best-ranked first, and PRINTS the exact commands
+        for steps 2 and 3 below, already filled in per spot.
+
+  2. HUNT - brute-force real seeds at one of those spots:
+
+     slime_gpu.exe --seed-count 0 --center-x 3680 --center-z 6992 --m-chunks 24
+       --fix-mask 0xFDE0F --fix-val 0x70802 --record-floor 70 --seeds-floor 70
+       --seeds-out main\seeds\3680_6992.csv
+
+     What it does: tries seeds on the GPU (--seed-count 0 means "until told
+     to stop / give up," not "zero seeds"), restricted to the family
+     --fix-mask/--fix-val derived for that spot by step 1 (see step 7),
+     and writes any seed that clears --seeds-floor (70) chunks to
+     --seeds-out. Do this once per spot from the commands CSV, or paste the
+     runner hotspot_scan printed for you, which loops the whole file.
+
+  3. WORTH - get the real, exact score for those candidate seeds:
+
+     slime_refine.exe --seeds main\seeds\3680_6992.csv --center-x 3680
+       --center-z 6992 --radius 6
+
+     What it does: for every seed in that file, computes the EXACT cq (down
+     to individual blocks, not just chunk count) AT THAT SAME (x,z) centre
+     the hunt used - refining at the wrong centre silently gives ~25
+     chunks, the random rate, with no error, so --center-x/--center-z must
+     match step 2 exactly. --radius 6 also checks nearby chunk-aligned
+     centres in case one scores slightly better than the exact spot hunted.
+     Results land together in main\scores\<x>_<z>\, as <seed>.txt and
+     <seed>.png - the score itself lives in the file content, not the
+     filename. Both main\scores\ and main\seeds\ are WORKING folders,
+     regenerated by any hunt/refine run - safe to delete anytime. Anything
+     that scored 64+ is already auto-filed into main\records\, which is
+     the only one of the two worth keeping around.
+
+That's the entire loop. Everything else in this project (record_cycle.ps1,
+hunt_pipeline.ps1, the ledger, the auto-abort logic, the climb step) is
+AUTOMATION and OPTIMIZATION of exactly these 3 steps - not new concepts.
+
+================================================================================
+ STEP 7 - A "family": narrowing the search with a bitmask
+================================================================================
+A Minecraft seed is a 48-bit number that also fully determines EVERY slime
+chunk in that world via a fixed formula (see slime_core.h). hotspot_scan's
+--check / --scan doesn't just measure a spot's overall promise - it can
+DERIVE which individual SEED BITS correlate with a high chunk count AT THAT
+SPOT specifically, by testing many random seeds and comparing.
+
+Fixing b of those bits to their derived "good" value carves out a FAMILY:
+a residue class of exactly 2^(48-b) seeds, and (this is the important part)
+NOTHING ELSE exists in that family. A tighter mask (more bits fixed) makes
+each seed you sample MORE LIKELY to be a good one (higher hit rate) - but
+also shrinks the total pool of seeds that could EVER be tried, exponentially
+(each extra bit HALVES the family). Both of this project's real records came
+from relatively loose 14-bit masks (2^34 = ~17 billion seeds), not the
+tightest possible mask - a tight mask feels faster but can search itself
+into a corner with nothing good left inside it. See README.txt's
+"WHAT THE NUMBERS MEAN" section for the exact "winners" formula used to
+reason about this trade-off precisely instead of by feel.
+
+================================================================================
+ STEP 8 - A genuine, exploitable geometric shortcut: the Z-lattice
+================================================================================
+It turns out real slime-chunk math (an artifact of how Minecraft computes
+it — a 32-bit integer truncation quirk on one axis but not the other, see
+AI_CONTEXT.md's THE COORDINATE LATTICE section for the actual code and the
+exact bug) means GOOD SPOTS ARE NOT UNIFORMLY LIKELY
+ACROSS THE MAP. Specifically, along the Z axis, only chunk-rows where
+`chunkZ mod 97` is 48 or 49 can ever host one of this project's good spots
+- that's 2 rows out of every 97, a ~48x reduction in the search space with
+ZERO loss of coverage. --z-all in hotspot_scan generates exactly these rows
+directly from the formula, so it can never "miss" the lattice by aiming at
+the wrong anchor. X has no equivalent regularity - it has to be searched
+directly.
+
+This is why the scan command always includes --z-all: it is not a
+convenience flag, it's the single most important structural fact this
+project has found about where to even look.
+
+================================================================================
+ STEP 9 - Squeezing more out of a seed you already have: the high-bit climb
+================================================================================
+Once slime_gpu finds a promising seed, there's a cheap trick to see if a
+CLOSE VARIANT of it scores even better, without hunting from scratch. It
+relies on how Minecraft's random-number generator actually works
+internally (a Linear Congruential Generator - LCG): flipping a HIGH bit of
+the seed only ever perturbs the TOP few bits of the generator's internal
+state (never the bottom ones - see AI_CONTEXT.md's THE HIGH-BIT CLIMB
+section for the exact mechanism). That means a seed differing only in its
+high bits renders an ALMOST-identical slime layout - not a fresh random
+roll.
+
+--climb-scan (fast, GPU, chunk-resolution) sweeps thousands of these
+high-bit neighbors of a known seed and finds the promising ones; --climb
+(slower, CPU, block-perfect) refines the best candidates to an exact score.
+This single trick is how BOTH of this project's records were actually
+found - not by hunting harder, but by climbing a known decent hit
+(64.64 cq climbed to 66.21 cq is the most dramatic example on record).
+
+Taken one step further, the TOP 16 bits of a 64-bit world seed turn out to
+have EXACTLY zero effect on slime chunk generation anywhere in that world -
+not "almost identical," genuinely identical. That means one known-good
+seed has exactly 65,536 true duplicates, free, with no hunting or climbing
+needed at all. Confirmed, not just theorized: refining the 66.21 record
+seed against 4 top-bit-flipped variants, each in a separate process, all
+landed on the exact same 16950 blocks / 66.21 cq / position - see
+AI_CONTEXT.md's EXACT SEED DUPLICATES section for the proof and why it
+matters.
+
+================================================================================
+ STEP 10 - Putting it all together: the automated record loop
+================================================================================
+record_cycle.ps1 is everything above (steps 6-9), automated and made
+resumable:
+
+    scan (step 6.1) -> triage-hunt every candidate spot (step 6.2, but
+      auto-killed early if a spot looks dead - see main\families.csv ledger
+      below) -> score with slime_refine (step 6.3) -> GPU-climb the best
+      hits (step 9) -> family sweep the most productive family found
+      (exhaustively checks if it's genuinely the best family AT that spot,
+      not just a lucky sample) -> push more seeds at the current best-known
+      family (keeps the anchor fresh) -> record everything.
+
+Two pieces of PERSISTENT STATE make repeat runs (across days/sessions)
+efficient instead of wasteful:
+  main\cycles.txt      one line per cycle: what ran, what it found
+  main\families.csv    the LEDGER - every (mask,val) family ever hunted, and
+                        how many times, so a family that's already been
+                        hunted twice with no improvement gets SKIPPED for
+                        free next time ("mined") instead of re-hunted
+
+Anything scoring 64+ cq gets auto-filed into main\records\ - one flat
+folder, every file named "<cq>_<seed>.{txt,png}" so the best results sort
+together - deduplicated by pattern so re-discovering the same layout from
+a different seed doesn't look like 20 separate "finds."
+
+The actual commands, in the order you'd use them:
+
+    powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Range 100000 -Repeat 100
+
+    What it does: runs the whole scan->hunt->score->climb->sweep->push loop
+    above up to 100 times back to back, over a window +/-100000 blocks from
+    the origin. Stops early ONLY on a genuine new best (see AI_CONTEXT.md's
+    GOTCHAS for a bug that used to make it stop on FALSE new-bests, since
+    fixed) - otherwise it just keeps going, skipping any family
+    main\families.csv already marked "mined." -Range must be passed
+    explicitly; the script's own default is 25000.
+
+    powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Status
+
+    What it does: prints current progress (cycle count, best cq found, an
+    odds-of-a-new-record estimate from the measured tail fit) WITHOUT
+    starting or touching anything - safe to run anytime, including while a
+    -Repeat batch is running in another window.
+
+    powershell -ExecutionPolicy Bypass -File stop_all.ps1
+
+    What it does: the ONLY correct way to stop a running search. Kills the
+    controlling script first, then any worker process, then VERIFIES the
+    GPU actually goes idle before returning - killing the visible script by
+    hand instead leaves a slime_gpu process orphaned on the GPU, which
+    breaks the NEXT run with "CUDA error: unknown error."
+
+================================================================================
+ STEP 11 - The last, hardest question: is the model even right?
+================================================================================
+Everything above (cq, the frontier, the lattice, climbing) is a MODEL. It's
+a very well-validated model - slime_refine's math is checked block-for-
+block against SlimeFinder.jar - but that is validation against another
+PROGRAM, not against Minecraft itself. There is one more tool for closing
+that last gap: perimeter_setup.
+
+Requires the Carpet mod (for /perimeterinfo) and WorldEdit (for the void
+step) both installed on the world being tested - neither is optional.
+
+The idea: build a physical rig, in the actual game, that makes the
+question answerable directly. Void a large box around the AFK spot, lay a
+single layer of obsidian at the world floor but ONLY in slime chunks
+(everywhere else stays void), turn off mob spawning so live mobs don't eat
+spawn positions, then read Carpet mod's `/perimeterinfo` - the game's own
+count of spawnable positions around the player. Since every spawnable
+surface in range is now slime-chunk floor by construction, that number IS
+the spot's real slime capacity, directly comparable to what slime_refine
+predicted for the same position.
+
+    perimeter_setup.exe --seed <s> --center-x <x> --center-z <z>
+      --y -64 --radius 200 --afk-y -40 --void-top -40
+
+    What it does: scans the same isSlimeChunk math already validated
+    elsewhere in this toolchain across a box around (center-x,center-z),
+    and prints the exact in-game commands to build the rig above - a
+    teleport/spawnpoint/gamerule setup, a WorldEdit void command, and a
+    slime-chunk floor. The floor alone typically needs 100+ /fill commands,
+    which is a real engineering problem on its own (chat and command blocks
+    both cap how much can be pasted in one shot) - solved with a classic
+    "one-command monolith" trick: one summon command that fires all the
+    fills at once via a falling block landing an activator rail on top of
+    itself, then deletes its own leftover blocks afterward.
+
+The genuinely useful part of this step is the LAST thing it teaches: a
+model prediction and an in-game measurement can legitimately disagree, and
+the reason is almost always AFK height, not a bug. The model is computed
+at y-offset 0 (standing level with the spawn surface) - but both the
+24-block exclusion sphere and the 128-block despawn sphere are 3D, so
+standing HIGHER than the floor shrinks the exclusion sphere's footprint
+dramatically (24.0 blocks at y-offset 0 down to 6.9 blocks at y-offset 23)
+while barely touching the despawn sphere. The two effects roughly cancel
+in total area, but change WHICH specific chunks qualify - and since slime
+chunks are scattered, not smooth, that's enough to flip a ranking between
+two spots separated by a fraction of a cq. Confirmed on the real records:
+the 66.04 spot measured 17,112 spawning spaces in game against a model
+prediction of 16,905; a 66.21-cq spot has measured WORSE in game than the
+66.04 one did. If a model number and an in-game number ever disagree, this
+is the first thing to check, not the last.
+
+================================================================================
+ WHERE TO GO NEXT
+================================================================================
+- README.txt: the actual command reference, kept current, read top-down.
+- FEATURES.txt: a scannable checklist of everything this toolchain can do.
+- AI_CONTEXT.md: every hard number, the exact code for the trickier finds,
+  and rejected ideas, no narrative - written to be sufficient on its own if
+  you (or an AI) only read one file.
+
+Faster than reading any of these end to end: if an AI coding assistant is
+available, just point it at this folder and ask it directly - it can read
+the source and every doc here and answer immediately.

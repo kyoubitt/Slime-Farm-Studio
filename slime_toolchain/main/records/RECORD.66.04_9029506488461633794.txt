@@ -1,0 +1,29 @@
+Slime refine result   (slime_refine, native)
+Seed 9029506488461633794   center (3680,6989)   radius 6 chunks   y-offset 0   block resolution (256x the jar)
+
+BEST BY BLOCKS: 16905 blocks (66.04 cq) / 70 chunks at (3680,6989)  y-offset 0  dist 0  /tp 3680 ~ 6989
+BEST BY CHUNKS: 73 chunks / 16383 blocks at (3687,6999)  y-offset 0  dist 12  /tp 3687 ~ 6999
+
+Top 10 by blocks:
+   16905 blocks  66.04 cq   94.3%   70 chunks  (3680,6989)  y0  dist 0
+   16900 blocks  66.02 cq   94.3%   70 chunks  (3680,6988)  y0  dist 1
+   16895 blocks     66 cq   94.3%   70 chunks  (3680,6990)  y0  dist 1
+   16895 blocks     66 cq   94.3%   70 chunks  (3681,6989)  y0  dist 1
+   16894 blocks  65.99 cq   94.3%   70 chunks  (3679,6989)  y0  dist 1
+   16891 blocks  65.98 cq   94.3%   70 chunks  (3681,6988)  y0  dist 1
+   16889 blocks  65.97 cq   94.2%   70 chunks  (3679,6988)  y0  dist 1
+   16886 blocks  65.96 cq   94.2%   70 chunks  (3679,6990)  y0  dist 1
+   16884 blocks  65.95 cq   94.2%   70 chunks  (3681,6990)  y0  dist 1
+   16884 blocks  65.95 cq   94.2%   70 chunks  (3680,6987)  y0  dist 2
+
+Top 10 by chunks:
+   73 chunks   16383 blocks  (3687,6999)  y0  dist 12
+   73 chunks   16396 blocks  (3688,6999)  y0  dist 13
+   73 chunks   16309 blocks  (3687,7000)  y0  dist 13
+   73 chunks   16324 blocks  (3688,7000)  y0  dist 14
+   73 chunks   16460 blocks  (3697,6990)  y0  dist 17
+   73 chunks   16405 blocks  (3698,6991)  y0  dist 18
+   73 chunks   16345 blocks  (3698,6993)  y0  dist 18
+   73 chunks   16378 blocks  (3698,6992)  y0  dist 18
+   73 chunks   16305 blocks  (3698,6994)  y0  dist 19
+   73 chunks   16260 blocks  (3698,6995)  y0  dist 19
