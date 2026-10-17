@@ -1,0 +1,124 @@
+# The phase model — every seed at a spot, exactly (groundwork, 2026-09-12)
+
+## The result in one paragraph
+
+Only the low 48 bits of a seed matter. Split them into **family** f (bits 0–19), **class** c
+(bits 20–34) and **top** v (bits 35–47). For one (family, class), changing the top 13 bits
+shifts every chunk's random number by the *same* amount. The 222 chunks of a farm therefore
+move in lockstep: each chunk has a fixed **phase** (0–4), and each top value selects a phase.
+The farm is simply "the possible chunks in that phase" (plus one wrap-around correction). So
+the best farm over all 8,192 seeds of a class is computed from 222 numbers, not by checking
+8,192 seeds. Every seed at a spot (2^35 classes × 8,192) costs about what today's *sampled*
+sweep (50,000 seeds per family, 0.02 % of the seeds) costs. Verified exact against Java.
+
+## Derivation
+
+Java: `new Random(seed + P(x,z) ^ 0x3ad8025f).nextInt(10) == 0`, P = chunk offset polynomial.
+
+- Random's scramble and first step: `st1 = ((seed + P) ^ C) * M + A mod 2^48`, with
+  `M = 0x5DEECE66D`, `A = 0xB`, `C = 0x3ad8025f ^ M`. **C < 2^35.**
+- `nextInt(10)` reads `B = st1 >> 17` (31 bits); slime ⟺ `B % 10 == 0` (bar a rejection case
+  hit by 8 values in 2^31).
+- Adding `v·2^35` to the seed adds `v·2^35` to `seed + P`; the xor cannot reach bit 35, so
+  `st1(v) = st1(0) + 2^35·M·v (mod 2^48)` ⇒ **`B(v) = B(0) + 2^18·w (mod 2^31)`**, with
+  `w = M·v mod 2^13` — a bijection of v, **the same for every chunk**.
+- Slime needs B even: bit 0 of B does not depend on w ⇒ a chunk is **possible** for the class
+  or never slime at all (depends on the low 18 bits of seed + P only — the old "family decides
+  which chunks can be slime").
+- Mod 5: `2^18 ≡ −1`, so `B(v) ≡ B(0) − w (mod 5)`. With **phase φ = B(0) mod 5**, a possible
+  chunk is slime exactly when `w ≡ φ (mod 5)` — until B wraps past 2^31 (at
+  `w ≥ thr = 8192 − (B(0) >> 18)`), after which `w ≡ φ + 2` (2^31 ≡ 3 mod 5).
+
+For top values w ≡ r (mod 5) the slime chunks are `{φ = r, w < thr} ∪ {φ = r − 2, w ≥ thr}`.
+Best farm of a class = max over r and over the ≤ 111 wrap thresholds: an event scan, no
+enumeration. Upper bound without the scan: `U = max_r (N_r + N_{r−2})`, N_r = possible chunks
+of phase r.
+
+## Checks (heat\PhaseModel.cs, heat\phase_test.ps1)
+
+| Check | Result |
+|---|---|
+| Model vs Java, all 8,192 top values × 222 chunks × 25 classes, two spots | 90,931,200 checks, **0 mismatches** |
+| Fast event-scan best vs full 8,192 scan, 300 classes | 0 mismatches |
+| The 68.28 (family 0x9E078, class 31989, top 2268) at its AFK chunk | Java 73 chunks; model 73. Possible chunks by phase: **47 / 25 / 22 / 46 / 18** (64 impossible). The record = phase 0 before the wrap + phase 3 after it. |
+| Exact exhaust of 0x9E078 (all 2^28 seeds) at that AFK chunk | **1.2 s on the CPU** (slime_gpu --enumerate: 37 s GPU). Best 73 (Java recount 73); 2,550 seeds ≥ 70; 544,251 ≥ 60 |
+| 12 random families, same chunk, exact | best 32–50; **zero** seeds ≥ 60 |
+| 200,000 random (family, class) pairs | best-of-class mean 31.9, **max 57** |
+
+## What "record-class family" means now
+
+A family is rich where many of its classes line up a large share of their possible chunks in
+one phase pair. It is a **tail** property:
+
+| At the 66.63 farm's AFK chunk | classes ≥ 60 | ≥ 64 | ≥ 66 | best | seeds ≥ 64 (exact) |
+|---|---|---|---|---|---|
+| 0xA2CEC (the record's family) | 1.9 % | 0.23 % | 0.07 % | 70 | 11,404 |
+| 0xA2E2C | 1.4 % | 0.08 % | 0 | 66 | 2,390 |
+| 0xA9735 | 1.0 % | 0.10 % | 0 | 66 | 1,556 |
+| random family | ~0 | 0 | 0 | ≤ 57 | 0 |
+
+Negative results (do not retry): the family's mean best-of-class separates rich families at
+only z ≈ 3.5 (shared by ~200 of 1,048,576 families — the same trap as the family mean); a
+screen of 16 sampled classes per family misses the record family. Only the exact tail finds
+it, i.e. **all classes of all families** — which is affordable:
+
+## The endgame: exact spot search (original design notes - the built version is below)
+
+Per class (2^35 per spot): compute B(0) for the union window of AFK positions (±3 X, ±2 Z:
+483 cells), build per-phase row bitmasks (possible chunks only), popcount N_r for each of the
+35 positions, prune on `U < T`, and run the exact event scan only for the survivors (bound
+≥ 66: ~4 % of random classes; tighter bounds possible). Emit every seed (class + the top
+values in the winning (r, threshold) interval) with ≥ T chunks for slime_refine to score.
+
+- Work: ~2^35 × (483 B(0) + 35 × 85 popcounts) ≈ 4×10^14 simple ops — the same order as the
+  current 50k-sample windowed sweep (141 s), but it covers **all 2^48 seeds**, every family,
+  every class, every position in the window. Estimate 2–4 min per spot on the laptop,
+  ~15–30 s on a PRO 6000. It replaces sweep + confirm + exhaust, and a spot's result is its
+  **proven** best farm (per AFK position in the window).
+- Validation plan: CPU reference = PhaseModel (already exact vs Java); GPU vs CPU on random
+  classes; re-find 68.28 / 66.63 / 66.84 and the 67.28, 66.73, 66.56, 66.61, 66.17 farms at
+  their spots; compare a spot's exact result with the best-family search's.
+
+## Open theory
+
+- Why a family is rich: its phases come from `B(0)` of `(s + P_i) ^ C` — without the xor
+  (C = 0) phase differences between chunks would not depend on the seed at all; the xor's
+  carry pattern is what makes alignment family- and class-specific. A structural rule for
+  which (f, c) align could skip even the exact enumeration.
+- Blocks, not chunks: the search counts chunks; cq (blocks) is scored afterwards by
+  slime_refine. A block-weighted version of the event scan is straightforward (weights per
+  chunk instead of 1).
+
+## Built: `hotspot_scan --phase-search` (2026-09-12)
+
+Per AFK position: possible-count family cut (top `--phase-top-pct`, default 3%) → bound pass
+(family-split B(0): per (family, chunk) K and Q>>20 computed once per tile of 256 classes, only
+the family's possible chunks looped; counts by phase × quarter of hb) → exact pass on survivors
+(chunks sorted by wrap threshold, one walk per phase) → live recount of every hit with
+slime_core.h. Positions: every 3rd AFK chunk within ±6 X / ±3 Z (15). Self-test [7].
+
+| Check | Result |
+|---|---|
+| Self-test [7]: model vs isSlimeChunk / class best vs brute force / bound ≥ best / GPU vs host | 0 / 0 / 0 / 0 differences |
+| 68.28 farm chunk, one position | record class re-found (73 chunks); 52 layouts ≥ 70 |
+| Full pipeline (search + slime_refine + archive) at the 5 known-farm spots | best = 68.28, 67.07, 66.84, 66.63, 66.17 — each the known farm at its exact position; ~75-90 s/spot with the GPU shared; +4 new 66+ farms |
+| Position stride: 67.07 spot, full 17 × 9 grid vs every 3rd X and Z | 397 of 397 classes with best ≥ 70 still reach 64 on the stride grid |
+| Family cut: one position, top 3% vs ALL families (281T seeds, 105 s) | identical: 1,494 / 199 / 20 classes ≥ 66 / 68 / 70. Their families: ≥ 66 from 40 families (possible ≥ 142 = the cut), ≥ 68 from 9 (≥ 149), ≥ 70 from 1 (≥ 153) |
+
+Speed history (one position, 1.17G classes, GPU shared with the running search): halves bound
++ O(n²) exact 35.3 s → quarters bound + sorted exact 6.3 s → possible-chunks-only loop 4.6 s.
+The bound pass is now the whole cost; its per-chunk bookkeeping (phase, quarter, packed counts)
+costs about as much as the multiply.
+
+
+Ranking by BLOCKS (2026-09-12): the exact walk also tracks each class's most-blocks layout (chunk
+weights = eligible blocks), and the CSV is sorted by blocks at the searched position. By chunk count
+the 67.07 (69 chunks at 97% packing) fell outside the top 1,000 layouts at its spot; by blocks, after
+merging duplicate layouts (16,984 rows = 3,403 distinct layouts), it ranks #5. phase_spots refines the
+top 400 distinct layouts. Self-test [7](b) checks best blocks against brute force; the live recount
+checks chunks AND blocks of every hit.
+FAMILY CUT WIDENED TO 5% (2026-09-12). Second all-families test, at the 68.54 farm's chunk: 3% found
+1,951 of 1,981 classes >= 66 (30 missed, from families ranked up to 27% for 66, 7% for 67, 4.31% for 68)
+and 161 of 161 >= 70 - but 3.75% of the 70+ layouts came from one family group ranked 3.58%, inside the
+3% cut only through ties. 5% covers every 68+ and 70+ layout seen in both tests; costs ~1.6x the bound
+pass. The first test (67.07 area) had every 70+ layout within 0.37%.

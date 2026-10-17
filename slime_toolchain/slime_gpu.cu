@@ -59,6 +59,8 @@
 #endif
 
 #include "slime_core.h"
+#include "portable_paths.h"
+#include "cuda_device.h"
 
 // CUDA_CHECK is defined in slime_core.h (shared with hotspot_scan.cu).
 
@@ -317,6 +319,36 @@ __device__ __forceinline__ void computeStripCounts(
     }
 }
 
+// scoreKernel's pruning bound: ONE popcount per row over the union of the row
+// windows of a thread's STRIP consecutive positions - width WD + STRIP - 1, at
+// most 17 + 7 = 24 bits, so it sits inside the same 64-bit V that
+// computeStripCounts reads (same words, same LO/WD row table as VROW above).
+// Every position's window lies inside that union, and the four excluded cells
+// computeStripCounts subtracts can only lower a count, so the sum is an upper
+// bound on counts[c] for every c in the strip. 17 popcounts instead of
+// computeStripCounts' 17*STRIP + 2*STRIP - and popcount throughput is what
+// bounds scoreKernel (measured: 29.7 of a full m=16000 tile's 38 ms).
+template <int STRIP>
+__device__ __forceinline__ int stripUpperBound(const uint32_t* __restrict__ stage, int lj0) {
+    constexpr int SST = ((STRIP * 255 + 8) >> 5) + 3;
+    int bound = 0;
+    #define UROW(K, LOK, WDK) {                                                  \
+        int p = lj0 + (LOK);                                                     \
+        uint32_t w0 = stage[(K) * SST + (p >> 5)];                               \
+        uint32_t w1 = stage[(K) * SST + (p >> 5) + 1];                           \
+        unsigned long long V = ((unsigned long long)w1 << 32) | w0;             \
+        bound += __popc((unsigned)(V >> (p & 31)) &                              \
+                        (unsigned)((1ull << ((WDK) + STRIP - 1)) - 1));           \
+    }
+    UROW(0,4,8)     UROW(1,2,12)    UROW(2,1,14)    UROW(3,1,14)
+    UROW(4,0,16)    UROW(5,0,16)    UROW(6,0,16)    UROW(7,0,16)
+    UROW(8,0,17)    UROW(9,0,16)    UROW(10,0,16)   UROW(11,0,16)
+    UROW(12,1,14)   UROW(13,1,14)   UROW(14,2,12)   UROW(15,4,8)
+    UROW(16,8,1)
+    #undef UROW
+    return bound;
+}
+
 // --climb-scan: exact BLOCKS (not chunk count) for STRIP consecutive
 // positions, from the SAME staged bitmap computeStripCounts reads - this is
 // the context where the README's original "9 popcounts" idea actually pays
@@ -445,10 +477,20 @@ __device__ __forceinline__ void stageRows(
     }
 }
 
+// prune (default on, --no-prune off): EXACT pruning. A thread whose
+// stripUpperBound is below the best score already in bests[s] skips its exact
+// counts: every one of its positions scores strictly less than a score already
+// found, so none can be the maximum or tie it - the (score, index) result and
+// its tie-break are identical to the unpruned kernel. bests[s] only grows
+// (atomicMax), so reading a stale value just prunes less. At a full tile the
+// best is ~6 sigma above a strip's ~35-chunk bound, so nearly every strip skips:
+// measured 31.4 -> 17.3 ms at m = 16000 (the bound's own 17 popcounts and the
+// row staging are what's left; scoring 8 rows per block to stage less was
+// tried and was no faster pruned, 3x slower unpruned).
 template <int STRIP>
 __global__ void __launch_bounds__(256, 5)
 scoreKernel(const uint32_t* __restrict__ bits,
-            int m, unsigned long long* __restrict__ bests) {
+            int m, unsigned long long* __restrict__ bests, bool prune) {
     // Adaptive strip length: the host picks STRIP (1..8) per launch so ~98%
     // of threads have real positions at every m (a fixed STRIP left 39-80%
     // idle whenever cside mod 2048 was small). __launch_bounds__(256,5)
@@ -456,6 +498,7 @@ scoreKernel(const uint32_t* __restrict__ bits,
     constexpr int SST = ((STRIP * 255 + 8) >> 5) + 3;   // per-STRIP shared stride
     __shared__ uint32_t stage[17 * SST];
     __shared__ unsigned long long warpMax[8];
+    __shared__ int floorS;                              // best score so far (pruning)
 
     int s = blockIdx.z;
     long long side = 2LL * m + 17;
@@ -469,18 +512,21 @@ scoreKernel(const uint32_t* __restrict__ bits,
         const uint32_t* rowsBase = bits + ((long long)s * side + rz) * rowWords + (J0 >> 5);
         stageRows<STRIP>(stage, rowsBase, rowWords);
     }
+    if (threadIdx.x == 0)
+        floorS = prune ? (int)(*(volatile unsigned long long*)&bests[s] >> 40) : 0;
     __syncthreads();
 
     int lj0 = STRIP * (int)threadIdx.x;   // local jx of this thread's first position
     int counts[STRIP] = {};
-    computeStripCounts<STRIP>(stage, lj0, counts);
+    bool skip = prune && stripUpperBound<STRIP>(stage, lj0) < floorS;
+    if (!skip) computeStripCounts<STRIP>(stage, lj0, counts);
 
     unsigned long long packed = 0;
     long long idxBase = rz * cside + J0 + lj0;   // hoisted: one 64-bit mul per thread
     long long jxBase = J0 + lj0;
     #pragma unroll
     for (int c = 0; c < STRIP; c++) {
-        if (jxBase + c < cside) {
+        if (!skip && jxBase + c < cside) {
             unsigned long long p =
                 ((unsigned long long)counts[c] << 40) | (unsigned long long)(idxBase + c);
             if (p > packed) packed = p;
@@ -760,6 +806,8 @@ static Best decodePackedBlocks(unsigned long long packed, int m) {
 }
 
 struct GpuEngine {
+    // run()'s exact pruning (see scoreKernel); --no-prune sets it false for one run
+    bool prune = true;
     uint32_t* bits = nullptr;
     long long* dSeeds = nullptr;
     unsigned long long* dBests = nullptr;
@@ -871,14 +919,14 @@ struct GpuEngine {
         int sthreads = pl.sthreads, G = pl.G, S = pl.S;
         dim3 grid2((unsigned)G, (unsigned)cside, (unsigned)count);
         switch (S) {
-            case 1: scoreKernel<1><<<grid2, sthreads>>>(bits, m, dBests); break;
-            case 2: scoreKernel<2><<<grid2, sthreads>>>(bits, m, dBests); break;
-            case 3: scoreKernel<3><<<grid2, sthreads>>>(bits, m, dBests); break;
-            case 4: scoreKernel<4><<<grid2, sthreads>>>(bits, m, dBests); break;
-            case 5: scoreKernel<5><<<grid2, sthreads>>>(bits, m, dBests); break;
-            case 6: scoreKernel<6><<<grid2, sthreads>>>(bits, m, dBests); break;
-            case 7: scoreKernel<7><<<grid2, sthreads>>>(bits, m, dBests); break;
-            default: scoreKernel<8><<<grid2, sthreads>>>(bits, m, dBests); break;
+            case 1: scoreKernel<1><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
+            case 2: scoreKernel<2><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
+            case 3: scoreKernel<3><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
+            case 4: scoreKernel<4><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
+            case 5: scoreKernel<5><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
+            case 6: scoreKernel<6><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
+            case 7: scoreKernel<7><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
+            default: scoreKernel<8><<<grid2, sthreads>>>(bits, m, dBests, prune); break;
         }
         CUDA_CHECK(cudaGetLastError());
 
@@ -1222,12 +1270,16 @@ static bool selfTest(GpuEngine& eng) {
         for (int t = 0; t < 3; t++) {
             long long seed = (long long)rng();
             int ccx = centers[t][0], ccz = centers[t][1];
-            Best g;
+            Best g, gu;                       // pruned (the default) and --no-prune
+            eng.prune = false;
+            eng.run(&seed, 1, m, ccx, ccz, &gu);
+            eng.prune = true;
             eng.run(&seed, 1, m, ccx, ccz, &g);
             Best c = cpuBestPacked(seed, m, ccx, ccz);
-            bool match = (c.score == g.score && c.cx == g.cx && c.cz == g.cz);
-            printf("  m=%3d center(%d,%d) seed %lld: CPU %d @(%d,%d) | GPU %d @(%d,%d) -> %s\n",
-                   m, ccx, ccz, seed, c.score, c.cx, c.cz, g.score, g.cx, g.cz,
+            bool match = (c.score == g.score && c.cx == g.cx && c.cz == g.cz) &&
+                         (gu.score == g.score && gu.cx == g.cx && gu.cz == g.cz);
+            printf("  m=%3d center(%d,%d) seed %lld: CPU %d @(%d,%d) | GPU %d @(%d,%d), unpruned %d @(%d,%d) -> %s\n",
+                   m, ccx, ccz, seed, c.score, c.cx, c.cz, g.score, g.cx, g.cz, gu.score, gu.cx, gu.cz,
                    match ? "OK" : "MISMATCH");
             fflush(stdout);
             if (!match) ok = false;
@@ -1511,6 +1563,9 @@ struct HuntArgs {
     // same role as --no-fused - if the streamed path ever misbehaves, this
     // falls back to the proven synchronous runHitsGen loop with no rebuild.
     bool noStream = false;
+    // --no-prune: score every position of a bare --seed position search (scoreKernel's exact
+    // pruning off). Escape hatch like --no-fused / --no-stream, and the A/B for the self-test.
+    bool prune = true;
 };
 
 struct ModeFlags {
@@ -1560,6 +1615,7 @@ static bool parseOneArg(int argc, char** argv, int& i, HuntArgs& a, ModeFlags& m
     else if (!strcmp(s, "--fused"))           { a.useFused = true; }
     else if (!strcmp(s, "--no-fused"))        { a.noFused  = true; }
     else if (!strcmp(s, "--no-stream"))       { a.noStream = true; }
+    else if (!strcmp(s, "--no-prune"))        { a.prune    = false; }
     else if (!strcmp(s, "--time-limit-ms"))   { if (!(v = need(s))) return false; a.timeLimitMs = atoll(v); }
     else if (!strcmp(s, "--self-test"))       { m.runSelfTest = true; }
     else if (!strcmp(s, "--climb-scan"))      { m.climbScan = true; }
@@ -1999,12 +2055,42 @@ static bool runClimbScan(GpuEngine& eng, const HuntArgs& args, const ModeFlags& 
 // reported to stderr and does NOT tear down the worker - unlike the CLI
 // path (which exits on a bad flag), one bad spot must not kill every spot
 // queued after it in the same cycle.
+// The fixed-seed position search ("slime_gpu --seed S --m-chunks M --center-x X --center-z Z"):
+// best chunk count over every centre within +-M chunks, one Best line. Extracted from main() like
+// runHunt()/runClimbScan() so --worker can run it too: slime_studio.py's whole-world scan sends one
+// bare --seed line per tile (13,924 tiles at +-30M blocks), paying the CUDA start-up once instead of
+// ~0.3 s per tile - the start-up, not the search, is nearly all of a tile's time. Same contract:
+// never exit()s, returns false with `err` set.
+static bool runSingleSeed(GpuEngine& eng, const HuntArgs& args, const ModeFlags& mode, std::string& err) {
+    if (args.mChunks < 1 || args.mChunks > 16000) {
+        err = "--m-chunks must be between 1 and 16000";
+        return false;
+    }
+    int ccx = (args.centerBlockX >= 0) ? args.centerBlockX / 16 : -(((-args.centerBlockX) + 15) / 16);
+    int ccz = (args.centerBlockZ >= 0) ? args.centerBlockZ / 16 : -(((-args.centerBlockZ) + 15) / 16);
+    if ((long long)(ccx < 0 ? -ccx : ccx) + args.mChunks + 8 > 1874000 ||
+        (long long)(ccz < 0 ? -ccz : ccz) + args.mChunks + 8 > 1874000) {
+        err = "center +/- m-chunks exceeds the world border";
+        return false;
+    }
+    long long seed = mode.fixedSeed;
+    Best b;
+    eng.prune = args.prune;
+    eng.run(&seed, 1, args.mChunks, ccx, ccz, &b);
+    eng.prune = true;
+    printf("Best: score=%d at x=%d z=%d (chunk %d,%d)\n",
+           b.score, 16 * (b.cx + ccx), 16 * (b.cz + ccz), b.cx + ccx, b.cz + ccz);
+    fflush(stdout);
+    return true;
+}
+
 static void runWorkerLoop(GpuEngine& eng) {
     printf("WORKER READY\n");
     fflush(stdout);
     std::string line;
     while (std::getline(std::cin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        slimeFixPath(line);   // spot lines built by the .ps1 scripts may carry "\" paths
         // Defensive: some stdin writers (e.g. .NET's StreamWriter, which is
         // what a PowerShell-driven Process.StandardInput uses) emit a UTF-8
         // BOM preamble on the very first write, which would otherwise get
@@ -2040,15 +2126,17 @@ static void runWorkerLoop(GpuEngine& eng) {
         for (int i = 1; i < (int)fargv.size() && ok; i++) {
             if (!parseOneArg((int)fargv.size(), fargv.data(), i, a, m, perr)) ok = false;
         }
-        // A plain hunt or a --climb-scan (which needs its own --seed) are the
-        // only two valid spot-line shapes; --self-test/--worker/a bare --seed
-        // single-check are CLI-only.
-        if (ok && (m.runSelfTest || m.workerMode || (m.haveFixedSeed && !m.climbScan))) {
-            perr = "spot command must be a plain hunt or a --climb-scan "
-                   "(no --self-test/--worker/bare --seed check)";
+        // A plain hunt, a --climb-scan (which needs its own --seed) or a bare
+        // --seed position search are the valid spot-line shapes;
+        // --self-test/--worker are CLI-only.
+        if (ok && (m.runSelfTest || m.workerMode)) {
+            perr = "spot command must be a plain hunt, a --climb-scan or a bare --seed "
+                   "position search (no --self-test/--worker)";
             ok = false;
         }
-        if (ok) ok = m.climbScan ? runClimbScan(eng, a, m, perr) : runHunt(eng, a, perr);
+        if (ok) ok = m.climbScan ? runClimbScan(eng, a, m, perr)
+                   : m.haveFixedSeed ? runSingleSeed(eng, a, m, perr)
+                   : runHunt(eng, a, perr);
         if (!ok) {
             fprintf(stderr, "[WORKER] %s\n", perr.c_str());
             fflush(stderr);
@@ -2059,6 +2147,8 @@ static void runWorkerLoop(GpuEngine& eng) {
 }
 
 int main(int argc, char** argv) {
+    slimeFixArgv(argc, argv);       // "\" -> "/" off Windows (portable_paths.h)
+    selectCudaDevice(argc, argv);   // consumes --device N / SLIME_DEVICE
     HuntArgs args;
     ModeFlags mode;
     for (int i = 1; i < argc; i++) {
@@ -2150,10 +2240,8 @@ int main(int argc, char** argv) {
     if (mode.haveFixedSeed) {
         printf("Single seed %lld, m-chunks %d, center chunk (%d,%d)\n",
                mode.fixedSeed, args.mChunks, ccx, ccz);
-        Best b;
-        eng.run(&mode.fixedSeed, 1, args.mChunks, ccx, ccz, &b);
-        printf("Best: score=%d at x=%d z=%d (chunk %d,%d)\n",
-               b.score, 16 * (b.cx + ccx), 16 * (b.cz + ccz), b.cx + ccx, b.cz + ccz);
+        std::string serr;
+        runSingleSeed(eng, args, mode, serr);   // the checks above already passed
         printf("Compare with: java -jar SlimeFinder.jar --seed %lld --m-chunks %d\n",
                mode.fixedSeed, args.mChunks);
         eng.release();
@@ -2175,7 +2263,7 @@ int main(int argc, char** argv) {
             "            Persistent command-loop mode: keeps one CUDA context alive and\n"
             "            reads spot hunt commands from stdin, one per line, until --quit\n"
             "            or EOF. Each line takes the same flags as a normal hunt\n"
-            "            invocation (minus slime_gpu.exe itself, plus --time-limit-ms);\n"
+            "            invocation (minus the slime_gpu name itself, plus --time-limit-ms);\n"
             "            prints ===SPOT-DONE=== after each.\n");
         return 1;
     }

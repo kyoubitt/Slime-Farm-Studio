@@ -1,0 +1,85 @@
+# REWRITE PLAN - output-identical speed-ups after the 2026-10-01 audit
+
+## STATUS: both surviving items IMPLEMENTED and VERIFIED 2026-10-03
+
+| item | before | after | identity check |
+|---|---|---|---|
+| 1. y39_rank cache | 84.3 s per call | **2.5 s** warm | `y39_all.csv` same md5 (cold run byte-identical to the pre-change file except the `ingame` cell for the farm measured that day) |
+| 2. in-process index | 0.49 s per dup check | **0.000029 s** (16,800x), 0.70 s index build once per process | 1,370-case old-vs-new equivalence test, **0 mismatches**; one-spot re-search filed 0 duplicates, `index.csv` and `over66.csv` unchanged |
+
+Also fixed while implementing item 2: `heat\phase_spots.ps1:42` and `:187` and `heat\best_family.ps1:41`
+copy a NAMED LIST of functions into their runspaces, so `Ensure-Index`/`Add-IndexEntry` had to be added
+there or `ArchiveResult` would have thrown inside the filing worker on the next section.
+Reference copies of the pre-change files and outputs: `main\work\fixverify\`.
+
+Source: multi-agent audit, run `wf_858a6998-710`. 4 component maps (hotspot_scan.cu, phase_prepass.cu,
+CPU/refine, orchestration), 8 hunting dimensions, 1 adversarial verifier per finding attacking identity,
+gain and already-closed. 14 candidates, **5 survived, 9 refuted**. A later resume returned
+"0 survived" - that is an artifact of every verifier failing on the account spend limit, NOT a reversal.
+
+Baseline: a section = 2,646 s (screen 600 s, exact search 990 s, second pass 1,056 s).
+
+## HEADLINE: the GPU is done; what is left is host bookkeeping
+
+Every kernel-, math- and estimator-level idea was refuted. A rewrite aimed at the `.cu` files is wasted
+effort. All surviving gain is host-side work done while the GPU sits idle.
+
+## 1. y39_rank re-scans the whole archive, twice per section  (small effort)
+
+`y39_rank.ps1:21` reads every farm in `over66.csv`; `:27` runs `afk_rescan.exe` over all of them.
+It is called twice a section - `heat\compartment_finish.ps1:23` and `heat\second_pass.ps1:57`.
+
+- Cost now: 0.0103 s/farm x 6,537 farms = 67 s per call, 134-227 s per section, single-threaded with
+  15 cores and the GPU 100% idle.
+- Change: cache the per-farm `afk_rescan` result keyed by seed+x+z; scan only farms absent from the cache
+  (~1,000 from the compartment, ~150 from the second pass). Drop the `Add-Member` reflection in the
+  rank loop at `:40` (rebuild rows as plain objects). Optionally thread `afk_rescan`'s per-farm loop,
+  order-preserved.
+- Identity: `afk_rescan` is a pure function of (seed, x, z, --dy, --window). Same inputs, same output;
+  the cache key includes the flags. Row order and ranking are recomputed from the full set as now.
+- Saving: 134-227 s -> ~12-25 s. **~135-210 s/section**, and it stops growing - at 20,000 farms the
+  current code costs ~410 s/section, the cached version still ~12 s.
+- Verify: run `y39_rank.ps1 -Top 0` before and after on the current archive, diff `y39_all.csv` byte for byte.
+
+## 2. ArchiveResult re-reads index.csv for every filed farm  (medium effort)
+
+`hunt_pipeline.ps1:452-460`, per filed farm: a `Select-String` over `index.csv` (`:453`), a second
+`Select-String` (`:459`), and a full `Import-Csv` of `index.csv` (`:460`) whenever the cq matches.
+
+- Cost now: 0.38 s + 3 x 0.012 s per farm; at 4.42 farms/spot that is ~1.8 s/spot. Measured 3.31 s/farm at
+  65k index rows = 14.6 s/spot, i.e. 3.5x the GPU cost - an O(spots^2) term.
+- Change: build the dup index once per filing process into a hashtable keyed by `seed,x,z` and by cq,
+  update it in memory as farms are filed, and append to the CSVs without re-reading.
+- Identity: the dup test is exact-match on the same keys the `Select-String` patterns use; an in-memory
+  index built from the same file answers identically as long as every append also updates it.
+- Saving: filing 4.77 -> ~2.9 s/spot, which drops it below the 4.21 s GPU wait, so the filing queue stops
+  growing: the 157 s Test-Cut drain stall and the ~120 s final drain both disappear.
+  **~280-330 s/section (11-12%)**, growing with the archive.
+- Verify: re-file a saved compartment's farms into a copy of the records tree, diff `index.csv`,
+  `over66.csv` and `y39_all.csv` against the originals.
+
+## Total
+
+~420-540 s off 2,646 s, **16-20%**, all of it host time with the GPU idle. No change to any search
+kernel, so no identity risk to the search itself.
+
+## REFUTED - do not re-propose
+
+- `phaseBoundBSKernel` shared-load/`masks()` LDS rewrite (claimed load-bound, not adder-bound)
+- `phaseBoundBSQKernel` 5-plane -> 4-plane counters for 128 registers / 4 blocks per SM
+- pre-rotated `uint4` mask rows + wide interval table
+- per-phase entry index lists in `bestOfClassWarp`
+- build the records-index dup set once per filing *process* (superseded by item 2)
+- split the filing worker into N prepare runspaces + one in-order commit runspace
+- raise the screen bound floor T=60 -> 64
+- bound-first (branch-and-bound) family probe
+- take Test-Cut off the critical path via the filing runspace
+
+## NOT EXAMINED - the audit did not get here
+
+- **Build/toolchain dimension never ran** (killed by the limit): nvcc flags, `-maxrregcount`, LTO, PGO, and
+  the asymmetry that `--use_fast_math` is on for `hotspot_scan` but not `phase_prepass`.
+- **Estimator dimension unadjudicated**: its two findings (T=60->64 floor, branch-and-bound probe) are
+  listed as refuted from the first run, but the resume's verifiers died, so they rest on a single vote.
+- Findings ranked 3rd+ in each dimension were dropped unverified by design (top 2 per dimension only).
+- The whole **strategy** axis - where GPU hours should go - never ran: run `wf_717de66b-bd5` when budget allows.

@@ -1,0 +1,76 @@
+# Second pass - findings (tier 1 run from 2026-09-22)
+
+The second pass (`heat\second_pass.ps1`) re-screens spots the fast screen put at 68-73 with the stage-2 screen
+(probe 8, exhaust 128, top 1%), richest first by first-screen pairs68, and exact-searches every one reaching 74+.
+Separate from the main search. Analysis script: `main\work\second_pass_study\section1.py`.
+
+## Section 1 (30,000 tier-1 spots screened, 2026-09-22)
+
+| | main search | second pass |
+|---|---|---|
+| spots | 30,000 screened, 232 at 74+ (0.77%) | 17,336 at 68-73, 2,097 raised, **56 at 74+** |
+| exact best 74 / 75 / 76 / 77+ | 137 / 59 / 20 / 16 | 35 / 14 / 7 / 0 |
+| spots at 75+ (record-capable count) | 95 | **21 (+22% on top of the main search)** |
+| spot best 70+ cq | 43 | 7 |
+| best at -39 | 19,015 (cq 72.57, 78 chunks) | 18,505 (cq 71.48, 76 chunks) |
+| time | ~7 min screen + 17.6 min search/finish | 14.8 min (9.8 screen + searches) |
+
+Second-pass facts worth keeping:
+- **The first screen can be far off**: exact minus first-screen count ran 1-8 for the hits (median ~4). One spot
+  screened at 68 is really 76. The earlier study (random sample, 0 risers of 999 at 68) under-counted: 6 of the 56
+  hits came from 68, 7 from 69, 11 from 70, 13 from 71, 12 from 72, 7 from 73.
+- **Stage 2 was exact on every hit**: exact best count = stage-2 count for all 56 (the stage-2 screen found the
+  true best each time), so stage 2 + exact search of its 74+ loses nothing it sees.
+- **pairs68 orders the work well but cannot filter**: first-screen pairs68 of the hits median 27 vs 5 for all
+  68-73 spots, but one hit had 1. Ordered by it, 44 of the 56 hits came in the first 5,000 of 17,336 spots.
+- Below 68 pairs68 is 0 by definition (it counts layouts at 68+), so it cannot steer a lower floor. 66-67 in this
+  section: 10,738 spots (~5.7 min of stage 2); fam66 does not separate either (hits min 3, 5,942 of them pass).
+- Main search: the screen was exact at 202 of 232 candidates, 1-3 under at the other 30.
+- Only 3 farms were filed in section 1: after the restart most farms found were already in main\records, so the
+  duplicate check (correctly) did not file them again. "Best new farm" in the log is therefore not the section's best.
+
+## Floor test 65-67 (section 1, 2026-09-22) - keep the floor at 68
+
+12,166 section-1 spots screened 65-67 (8 min): stage 2 raised 4,415 of them, but only **3 reached 74, all first
+screened 67, all exactly 74 after the exact search** (cq 65.4-66.2 - weak, not record-capable); 66 and 65 gave none.
+At 68 the same section gave 6 hits including 75+. The drop below 68 is real (in tier 1's hottest section), so the
+floor stays 68 - 67 would add ~3.5 min a section for no record-grade spots.
+
+## Section 2 (44,000 tier-1 spots, heat ~24-26, 2026-09-22)
+
+| | main search | second pass |
+|---|---|---|
+| exact-searched | 196 at 74+ (0.45%) | 23,128 at 68-73, 2,423 raised, 36 at 74+ |
+| exact best 74 / 75 / 76 / 77+ | 120 / 47 / 13 / 16 | 26 / 7 / 3 / 0 |
+| 75+ | 76 | 10 (+13%) |
+| best at -39 | **19,734 (cq 76.38) - NEW ARCHIVE #1, above the 19,103 record (estimate)** | 18,598 |
+
+Second-pass hits by first count: 68:5, 69:4, 70:9, 71:5, 72:8, 73:5 - again spread over the whole 68-73 range and
+concentrated early by pairs68 (27 of 36 in the first 5,000). Yield per 75+ smaller than section 1 (cooler heat).
+Section time: 44.8 min (screen 10 + finish 16.5 + second pass 17.6).
+
+## Config test 2026-09-30 - stage 2 is already minimal (do not water it down)
+
+95 known second-pass hits (sections 1-2, stage-2 best = exact best) + 2,000 controls, each config run over all of them
+(`main\work\coverage\cfg_test.ps1`): current stage 2 (probe 8, exhaust 128, top 1%, 0.04 s/spot) found 95 of 95.
+exhaust 64 -> 82; probe 4 -> 81; top 0.5% -> 61; exhaust 96 + top 0.5% -> 58; the fast first screen -> 0 of 95.
+top-pct is the dominant term. No cheaper setting is lossless, so the pass keeps probe 8 / exhaust 128 / top 1%.
+
+Selector test (40,464 labelled spots at 68-73, 92 hits): no cheap filter is safe either - pairs68 >= 2 already loses
+3 hits, >= 5 loses 10%; fam66 >= 5 loses 8. pairs68 stays an ORDERING only. Every 68-73 spot gets the pass.
+
+## Optimization review 2026-09-30 (before section 3) - what is closed
+
+Section time: screen 600 s (23%), exact search + finish 990 s (37%), second pass 1,056 s (40%).
+- **AFK position cut in the exact search: REJECTED.** Over 507 searched spots the winning layout (by -39 blocks) sits
+  at the screen's best position only 72% of the time, within +-3 chunks 96%. Any cut loses farms; 10 positions stay.
+  (`main\work\coverage\positions.py`. Winners: (0,0) 230, (+3,0) 73, (-3,0) 53, (0,+3) 40, (+-6,0) 45.)
+- **Heat at 1,024 classes as a first stage: ~20% on band runs, adopt for the queue.** 1M spots in 8 s (vs 53 s at
+  16,384); keep read >= 8 retains all 75 known 22+ of the 10-12 band sample but that is 67% of spots, so band 10-12
+  goes ~8 h -> ~6.5 h. Threshold 8 has thin margin (lowest true-22+ read was 8.67) - recheck before a final run.
+- **Lower chunk thresholds as a cheap filter: FAILED.** T=36/1,024, T=34/512, T=32/256 all cost 17 s per 1M and would
+  keep 84-99.6% of spots to retain the 75 hits - the heat40 tail is what selects 22+.
+- **Bit-sliced (32 consecutive classes per thread) heat estimator: CLOSED.** It needs many classes of one family, and
+  family correlation is what already killed heatFamKernel; the samples add little information.
+- Open, ~15% of the second pass: fuse the two screen tiers in phase_prepass so a 68-73 spot's setup and its first
+  0.25% family probes are reused instead of recomputed (~150 s a section, needs to reproduce today's numbers exactly).

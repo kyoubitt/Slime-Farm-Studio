@@ -31,8 +31,8 @@
 //   one spawn position per column.
 //
 // THE MONOLITH
-//   A slime-chunk floor needs one /fill per slime chunk (~100+ commands for
-//   radius 200). Getting that many commands into the game in one shot is
+//   A slime-chunk floor needs one /fill per slime chunk (~70-90 commands for
+//   radius 152). Getting that many commands into the game in one shot is
 //   the actual engineering problem here - chat caps at 256 characters and
 //   one line per send, a single command block executes exactly ONE
 //   command regardless of how much text it holds, and semicolon-separated
@@ -45,10 +45,11 @@
 //
 // AFK-HEIGHT CAVEAT - read before trusting a game/model mismatch
 //   slime_core.h computes at y-offset 0 (player level with the spawn
-//   surface); its own header says so explicitly. --afk-y here defaults to
-//   100 and is independently settable BECAUSE real rigs often stand well
-//   above the floor - and since both the exclusion and despawn spheres are
-//   3D, height changes the horizontal footprint substantially:
+//   surface); its own header says so explicitly. --afk-y (the /tp height)
+//   defaults to -50, 14 above the -64 floor (the author's rig, 2026-09-12),
+//   and is settable BECAUSE real rigs stand above the floor - and since both
+//   the exclusion and despawn spheres are 3D, height changes the horizontal
+//   footprint substantially:
 //       y-offset  0: exclusion radius 24.0 blocks, despawn radius 128.0
 //       y-offset 23: exclusion radius  6.9 blocks, despawn radius 125.9
 //   The two effects roughly cancel in TOTAL area but change WHICH chunks
@@ -70,6 +71,7 @@
 #include <string>
 #include <vector>
 #include "slime_core.h"
+#include "portable_paths.h"
 
 static long long floorDiv16(long long v) {
     long long q = v / 16;
@@ -77,22 +79,39 @@ static long long floorDiv16(long long v) {
     return q;
 }
 
+// DEFAULTS = the author's real rig (2026-09-12). Change them HERE, not by passing flags - the old
+// defaults (radius 200, void-top 120) kept coming back because the fix only ever lived in a
+// command line (--void-top -40), never in the code.
 struct Args {
     long long seed = 0;
     bool haveSeed = false;
     long long centerX = 0, centerZ = 0;
     long long y = -64;
-    long long radius = 200;
+    long long radius = 152;       // 3 chunks in from the old 200 on every side (the author's rig); still 24 blocks past the 128-block despawn sphere
     std::string block = "obsidian";
-    long long voidTop = 120;
-    long long afkY = 100;
+    long long voidTop = -40;      // superflat world: nothing above y=-40 to clear
+    long long afkY = -50;         // the /tp height (reference rig: 14 above the floor)
+    // --game-version: the command syntax that changes between versions. 1.21.11 renamed the
+    // gamerule (doMobSpawning -> spawn_mobs; a 1.21.11 server rejects the old name - checked on a
+    // real server by vanilla_world_test.py), 1.20.5 replaced /give's BlockEntityTag NBT with item
+    // components, and before 1.18 the world floor is y 0 rather than -64.
+    int ver[3] = {1, 21, 11};
+    bool haveY = false, haveVoidTop = false, haveAfkY = false;
 };
+
+static bool versionAtLeast(const int v[3], int a, int b, int c) {
+    if (v[0] != a) return v[0] > a;
+    if (v[1] != b) return v[1] > b;
+    return v[2] >= c;
+}
 
 static void usage() {
     std::fprintf(stderr,
         "usage: perimeter_setup --seed <s> --center-x <x> --center-z <z>\n"
-        "                       [--y -64] [--radius 200] [--block obsidian]\n"
-        "                       [--void-top 120] [--afk-y 100]\n");
+        "                       [--y -64] [--radius 152] [--block obsidian]\n"
+        "                       [--void-top -40] [--afk-y -50] [--game-version 1.21.11]\n"
+        "  --game-version picks the gamerule name and /give syntax for your Minecraft\n"
+        "  version, and the floor height before 1.18 (y 0 instead of -64).\n");
 }
 
 static bool parseArgs(int argc, char** argv, Args& a) {
@@ -105,21 +124,35 @@ static bool parseArgs(int argc, char** argv, Args& a) {
         if (k == "--seed") { a.seed = std::atoll(next("--seed").c_str()); a.haveSeed = true; }
         else if (k == "--center-x") a.centerX = std::atoll(next("--center-x").c_str());
         else if (k == "--center-z") a.centerZ = std::atoll(next("--center-z").c_str());
-        else if (k == "--y") a.y = std::atoll(next("--y").c_str());
+        else if (k == "--y") { a.y = std::atoll(next("--y").c_str()); a.haveY = true; }
         else if (k == "--radius") a.radius = std::atoll(next("--radius").c_str());
         else if (k == "--block") a.block = next("--block");
-        else if (k == "--void-top") a.voidTop = std::atoll(next("--void-top").c_str());
-        else if (k == "--afk-y") a.afkY = std::atoll(next("--afk-y").c_str());
+        else if (k == "--void-top") { a.voidTop = std::atoll(next("--void-top").c_str()); a.haveVoidTop = true; }
+        else if (k == "--afk-y") { a.afkY = std::atoll(next("--afk-y").c_str()); a.haveAfkY = true; }
+        else if (k == "--game-version") {
+            std::string v = next("--game-version");
+            int n = std::sscanf(v.c_str(), "%d.%d.%d", &a.ver[0], &a.ver[1], &a.ver[2]);
+            if (n < 2) { std::fprintf(stderr, "--game-version wants e.g. 1.21.11 or 26.1.2\n"); std::exit(1); }
+            if (n == 2) a.ver[2] = 0;
+        }
         else if (k == "--help" || k == "-h") { usage(); std::exit(0); }
         else { std::fprintf(stderr, "unknown argument: %s\n", k.c_str()); usage(); std::exit(1); }
     }
     if (!a.haveSeed) { std::fprintf(stderr, "--seed is required\n"); usage(); std::exit(1); }
+    // before 1.18 the world bottom is y 0: move the reference rig's defaults with it
+    // (afk 14 above the floor, void top 24 above it) unless they were given explicitly
+    if (!versionAtLeast(a.ver, 1, 18, 0)) {
+        if (!a.haveY) a.y = 0;
+        if (!a.haveAfkY) a.afkY = a.y + 14;
+        if (!a.haveVoidTop) a.voidTop = a.y + 24;
+    }
     return true;
 }
 
 struct Chunk { long long cx, cz; };
 
 int main(int argc, char** argv) {
+    slimeFixArgv(argc, argv);       // "\" -> "/" off Windows (portable_paths.h)
     Args a;
     parseArgs(argc, argv, a);
 
@@ -139,8 +172,9 @@ int main(int argc, char** argv) {
     long long floorBlocks = (long long)slimeChunks.size() * 256;
 
     std::printf("=== perimeter_setup ===\n");
-    std::printf("seed %lld  center (%lld,%lld)  y=%lld  radius=%lld  block=%s  void-top=%lld  afk-y=%lld\n",
-                 a.seed, a.centerX, a.centerZ, a.y, a.radius, a.block.c_str(), a.voidTop, a.afkY);
+    std::printf("seed %lld  center (%lld,%lld)  y=%lld  radius=%lld  block=%s  void-top=%lld  afk-y=%lld  game %d.%d.%d\n",
+                 a.seed, a.centerX, a.centerZ, a.y, a.radius, a.block.c_str(), a.voidTop, a.afkY,
+                 a.ver[0], a.ver[1], a.ver[2]);
     std::printf("%lld slime chunks of %lld scanned (%.1f%%), %lld blocks of floor\n\n",
                  (long long)slimeChunks.size(), scanned,
                  100.0 * (double)slimeChunks.size() / (double)scanned, floorBlocks);
@@ -148,45 +182,29 @@ int main(int argc, char** argv) {
     // ---- Section 0: SEED ----
     std::printf("--- 0. SEED ---\n%lld\n\n", a.seed);
 
-    // ---- Section 1: TELEPORT + SPAWNPOINT ----
-    std::printf("--- 1. TELEPORT + SPAWNPOINT ---\n");
+    // ---- Section 1: TELEPORT (no /spawnpoint - removed 2026-09-12, not used) ----
+    std::printf("--- 1. TELEPORT ---\n");
     std::printf("/tp @p %lld %lld %lld\n", a.centerX, a.afkY, a.centerZ);
-    std::printf("/spawnpoint @p %lld %lld %lld\n", a.centerX, a.afkY, a.centerZ);
-    std::printf("/gamerule doMobSpawning false\n");
+    std::printf("/gamerule %s false\n", versionAtLeast(a.ver, 1, 21, 11) ? "spawn_mobs" : "doMobSpawning");
     std::printf("/seed\n\n");
 
     // ---- Section 2: VOID THE AREA (WorldEdit) ----
-    std::printf("--- 2. VOID THE AREA (WorldEdit) ---\n");
-    std::printf("//fast\n");
-    std::printf("//pos1 %lld,%lld,%lld\n", a.centerX - a.radius, a.y, a.centerZ - a.radius);
-    std::printf("//pos2 %lld,%lld,%lld\n", a.centerX + a.radius, a.voidTop, a.centerZ + a.radius);
-    std::printf("//set air\n\n");
+    std::printf("--- 2. VOID THE AREA (WorldEdit) ---\n");   // no //fast (removed 2026-09-12, not used)
+    // CHUNK-BORDERED (project owner, 2026-09-13): the box covers exactly the chunks the floor is built in (cxMin..cxMax,
+    // czMin..czMax) - a box of +-radius blocks cut through chunks, leaving part of an edge slime chunk under terrain.
+    std::printf("//pos1 %lld,%lld,%lld\n", cxMin * 16, a.y, czMin * 16);
+    std::printf("//pos2 %lld,%lld,%lld\n", cxMax * 16 + 15, a.voidTop, czMax * 16 + 15);
+    std::printf("//replace air\n\n");   // only touches non-air blocks: much faster than //set air
 
-    // ---- Section 3: SLIME CHUNK FLOOR ----
-    std::printf("--- 3a. SLIME CHUNK FLOOR - chain-command-block form (re-triggerable) ---\n");
-    std::printf("Place at y=%lld starting at (%lld,%lld), marching +X. First block IMPULSE\n", a.afkY, a.centerX, a.centerZ);
-    std::printf("with a button (press once); the rest CHAIN, facing=east, Always Active.\n");
+    // ---- Section 3: SLIME CHUNK FLOOR (command minecarts - the only form built with;
+    //      the old chain-command-block form "3a" was removed 2026-09-12) ----
+    std::printf("--- 3. SLIME CHUNK FLOOR - command minecarts (paste into ONE command block) ---\n");
     {
-        long long bx = a.centerX;
-        long long idx = 0;
-        for (auto& c : slimeChunks) {
-            char cmd[256];
-            std::snprintf(cmd, sizeof cmd, "fill %lld %lld %lld %lld %lld %lld %s",
-                          c.cx * 16, a.y, c.cz * 16, c.cx * 16 + 15, a.y, c.cz * 16 + 15, a.block.c_str());
-            const char* type = (idx == 0) ? "command_block" : "chain_command_block";
-            const char* auto_flag = (idx == 0) ? "" : ",auto:1b";
-            std::printf("setblock %lld %lld %lld minecraft:%s[facing=east]{Command:\"%s\"%s}\n",
-                         bx, a.afkY, a.centerZ, type, cmd, auto_flag);
-            bx++; idx++;
-        }
-        std::printf("setblock %lld %lld %lld minecraft:chain_command_block[facing=east]{Command:\"setblock ~ ~ ~ air\",auto:1b}\n", bx, a.afkY, a.centerZ); bx++;
-        std::printf("setblock %lld %lld %lld minecraft:chain_command_block[facing=east]{Command:\"setblock ~ ~-1 ~ air\",auto:1b}\n", bx, a.afkY, a.centerZ);
-    }
-    std::printf("\n");
-
-    std::printf("--- 3b. SLIME CHUNK FLOOR - one-command monolith (paste into ONE command block) ---\n");
-    {
+        // The Health:0 armor stand between the redstone and the rail is what makes the rail land on
+        // 1.13 - 1.17 (without it a real 1.16.5 server fires no minecart at all); newer versions build
+        // the same either way, so one form serves every version.
         std::string mono = "summon falling_block ~ ~1 ~ {BlockState:{Name:\"minecraft:redstone_block\"},Time:1,"
+                            "Passengers:[{id:\"minecraft:armor_stand\",Health:0f,"
                             "Passengers:[{id:\"minecraft:falling_block\",BlockState:{Name:\"minecraft:activator_rail\"},Time:1,"
                             "Passengers:[";
         for (auto& c : slimeChunks) {
@@ -197,17 +215,28 @@ int main(int argc, char** argv) {
             mono += cmd;
             mono += "\"},";
         }
-        mono += "{id:\"minecraft:command_block_minecart\",Command:\"setblock ~ ~ ~ air\"},";
-        mono += "{id:\"minecraft:command_block_minecart\",Command:\"setblock ~ ~-1 ~ air\"},";
+        // TEARDOWN - order is load-bearing, and the old order did not work: its first cart removed
+        // the rail, so the carts after it were no longer on an activator rail and never fired -
+        // the redstone block and every minecart stayed behind (seen on a real 1.21.11 server,
+        // vanilla_world_test.py). Now: one cart places an auto command block ABOVE the rail that
+        // clears itself, the rail and the redstone block on the next tick; the last cart kills
+        // the minecarts while the rail is still there. The command block you pasted into stays.
+        mono += "{id:\"minecraft:command_block_minecart\",Command:\"setblock ~ ~1 ~ command_block{auto:1b,Command:\\\"fill ~ ~ ~ ~ ~-2 ~ air\\\"}\"},";
         mono += "{id:\"minecraft:command_block_minecart\",Command:\"kill @e[type=command_block_minecart,distance=..3]\"}";
-        mono += "]}]}";
+        mono += "]}]}]}";
         std::printf("%s\n\n", mono.c_str());
         std::printf("(%zu characters, %zu fills)\n\n", mono.size(), slimeChunks.size());
     }
 
-    // ---- Section 4: MEASURE ----
-    std::printf("--- 4. MEASURE ---\n");
-    std::printf("/perimeterinfo\n");
+    // ---- Section 4: MEASURE - a /give for the measuring block (repeating, unconditional, always
+    //      active, running perimeterinfo at the player). Fits in chat, unlike the section-3 command.
+    //      1.20.5+ uses the item-component form, older versions the BlockEntityTag NBT form. ----
+    std::printf("--- 4. MEASURE - repeating command block, unconditional, always active ---\n");
+    if (versionAtLeast(a.ver, 1, 20, 5))
+        std::printf("/give @p repeating_command_block[block_entity_data={id:\"minecraft:command_block\","
+                    "Command:\"execute at @p run perimeterinfo\",auto:1b}]\n");
+    else
+        std::printf("/give @p minecraft:repeating_command_block{BlockEntityTag:{Command:\"execute at @p run perimeterinfo\",auto:1b}}\n");
 
     return 0;
 }

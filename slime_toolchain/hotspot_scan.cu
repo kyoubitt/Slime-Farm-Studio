@@ -1,4 +1,4 @@
-﻿// hotspot_scan.cu
+// hotspot_scan.cu
 // ===========================================================================
 // WHY THE SCORING AND DERIVATION WORK THE WAY THEY DO
 // ---------------------------------------------------------------------------
@@ -53,12 +53,13 @@
 //         residual layout count 2^(48-bits) is reported so reach is visible.
 //
 // GEOMETRY (measured, and it shrinks the scan a lot):
-//   Z is periodic with EXACT period 97 chunks. Variance autocorrelation along
-//   Z peaks at 97/194/291/388. Peaks sit in 3-chunk-wide bands on lattice
-//   points ...49,146,243,340,437,534,631,728,825,922,1019,1116... Use
-//   --z-period 97 --z-band 1 (or --z-all, which derives every hot line in
-//   range from this closed form directly) to scan only the lattice: ~30x
-//   fewer locations, no loss.
+//   Z is periodic with period 96.875 chunks (1550 blocks) - NOT exactly 97, as
+//   this comment used to say. Near spawn the two are indistinguishable (the
+//   autocorrelation peaks at 97/194/291/388 and bands sit at ...49,146,243,340,
+//   437,534...), but 97 drifts 2 blocks per line off the true band centre
+//   48.5 + 96.875 n (checked with an exact Java model out to Z = 30M). Use
+//   --z-all, which derives every hot line from the corrected form (3 rows per
+//   line); --z-period 97 is only valid within ~+-15k blocks of Z = 0.
 //   X is QUASI-periodic, ~32.7 chunks (autocorr 0.968 at lag 33). Not an
 //   integer, so it drifts instead of tiling -- do not decimate X, but know
 //   that short-lag X neighbours are near-duplicates.
@@ -107,11 +108,15 @@
 #include <cstdint>
 #include <cmath>
 #include <vector>
+#include <map>
+#include <tuple>
 #include <algorithm>
 #include <string>
 #include <chrono>
 #include <cuda_runtime.h>
 #include "slime_core.h"
+#include "portable_paths.h"
+#include "cuda_device.h"
 #ifdef _WIN32
 #include <direct.h>
 #define HS_MKDIR(d) _mkdir(d)
@@ -121,6 +126,14 @@
 #endif
 
 // CUDA_CHECK is defined in slime_core.h (shared with slime_gpu.cu).
+
+// Shell named in the printed NEXT/THEN one-liners: the .ps1 tooling runs under
+// Windows PowerShell on Windows and PowerShell 7 (pwsh) on Linux (see LINUX.md).
+#ifdef _WIN32
+#define HS_PS "powershell"
+#else
+#define HS_PS "pwsh"
+#endif
 
 // Low bits eligible to be forced. 24 covers everything we have ever seen bias
 // in (your working mask is 14 bits inside this window; the measured extension
@@ -171,10 +184,23 @@ __host__ __device__ __forceinline__ bool slimeFromOffset(long long worldSeed, ui
     uint64_t st = ((((uint64_t)worldSeed + P) ^ 0x3ad8025fULL) ^ M) & MK;
     st = (st * M + A) & MK;
     uint32_t ub = (uint32_t)(st >> 17);
-    uint32_t uv = ub % 10u;
-    int32_t bits = (int32_t)ub, val = (int32_t)uv;
-    if (bits - val + 9 >= 0) return val == 0;          // taken ~always
-    for (;;) {                                          // ~4.7e-9 of the time
+    // FAST PATH. bits is in [0, 2^31-1] and val = bits % 10, so bits - val is
+    // bits rounded down to a multiple of 10, and bits - val + 9 can only
+    // overflow int32 when bits - val == 2147483640, i.e. ub in
+    // [0x7FFFFFF8, 0x7FFFFFFF] -- 8 values in 2^31. Below that the rejection
+    // guard is unconditionally true, so all that is needed is "ub % 10 == 0",
+    // via modular-inverse divisibility (mul + rotate + compare, 3 SASS ops)
+    // instead of magic-divide + multiply-back + subtract + compare (5 ops):
+    //     n % 10 == 0  <=>  ROTR32(n * 0xCCCCCCCD, 1) <= 0x19999999
+    // since 10 = 2^1 * 5, 5^-1 mod 2^32 = 0xCCCCCCCD, (2^32-1)/10 = 0x19999999.
+    if (ub < 0x7FFFFFF8u) {
+        uint32_t t = ub * 0xCCCCCCCDu;
+        t = (t >> 1) | (t << 31);
+        return t <= 0x19999999u;
+    }
+    int32_t bits = (int32_t)ub, val = (int32_t)(ub % 10u);
+    if (bits - val + 9 >= 0) return val == 0;
+    for (;;) {                                          // ~3.7e-9 of the time
         st = (st * M + A) & MK;
         bits = (int32_t)(st >> 17);
         val = bits % 10;
@@ -194,7 +220,7 @@ __host__ __device__ __forceinline__ int countAll(const uint64_t* P, int n, long 
     // unroll 2, not more: a wider unroll holds more slimeFromOffset calls
     // in-flight and pushes register use up (measured: unroll 4 -> 31 regs,
     // 47% occupancy). unroll 2 keeps most of the throughput at 62%+ occupancy.
-    #pragma unroll 2
+    #pragma unroll 4
     for (int i = 0; i < n; i++) c += (int)slimeFromOffset(w, P[i]);
     return c;
 }
@@ -205,24 +231,36 @@ __host__ __device__ __forceinline__ int countAll(const uint64_t* P, int n, long 
 // after ~40-60 cells instead of all 226. Measured ~3-10x saving depending on
 // T, and it is exactly equivalent for the >=T predicate (the bailed seeds are
 // provably below T and are never counted).
+// TAIL_BATCH: how many cells run between early-exit tests. The bound
+// c + (n-1-i) is non-increasing, so testing it every K-th cell returns -1 on
+// exactly the same seeds for any K -- K only trades branch count against how
+// many cells a doomed seed wastes past the bail point. Swept empirically.
+#ifndef TAIL_BATCH
+#define TAIL_BATCH 8   // swept: 2=0.995, 4=0.923, 8=0.888, 16=0.890 s/loc
+#endif
 __host__ __device__ __forceinline__ int countTail(const uint64_t* P, int n, long long w, int T) {
-    int c = 0;
-    for (int i = 0; i < n; i++) {
+    int c = 0, i = 0;
+    for (; i + TAIL_BATCH <= n; i += TAIL_BATCH) {
+        #pragma unroll
+        for (int k = 0; k < TAIL_BATCH; k++) c += (int)slimeFromOffset(w, P[i + k]);
+        if (c + (n - TAIL_BATCH - i) < T) return -1;
+    }
+    for (; i < n; i++) {
         c += (int)slimeFromOffset(w, P[i]);
         if (c + (n - 1 - i) < T) return -1;
     }
     return c;
 }
-
-// Same early-exit tail count as countTail, but also accumulates the exact
-// eligible-block weight (cellWeight[i], from slime_core.h buildBlockWeights)
-// of every hit cell. Early exit is still driven by the chunk-count bound only
-// -- a seed that cannot reach T chunks is discarded regardless of its blocks,
-// so blocksOut is only meaningful when the return value is >= T.
 __host__ __device__ __forceinline__ int countAndBlocksTail(const uint64_t* P, const int* cellW,
                                                             int n, long long w, int T, int& blocksOut) {
-    int c = 0, blocks = 0;
-    for (int i = 0; i < n; i++) {
+    int c = 0, blocks = 0, i = 0;
+    for (; i + TAIL_BATCH <= n; i += TAIL_BATCH) {
+        #pragma unroll
+        for (int k = 0; k < TAIL_BATCH; k++)
+            if (slimeFromOffset(w, P[i + k])) { c++; blocks += cellW[i + k]; }
+        if (c + (n - TAIL_BATCH - i) < T) return -1;
+    }
+    for (; i < n; i++) {
         if (slimeFromOffset(w, P[i])) { c++; blocks += cellW[i]; }
         if (c + (n - 1 - i) < T) return -1;
     }
@@ -297,6 +335,160 @@ familySweepKernel(long long cx, long long cz, uint64_t seedBase, long long N, in
         outHits[blockIdx.x]      = sHits;
         outEffSum[blockIdx.x]    = sEff;
         outMaxBlocks[blockIdx.x] = sMax;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WINDOWED FAMILY SWEEP (--sweep-rx RX --sweep-rz RZ): familySweepKernel, but a
+// seed is a hit when the farm reaches the floor at ANY AFK chunk within +-RX,
+// +-RZ chunks of the spot, not only at the spot centre.
+//
+// Why: record farms sit 0-3 chunks from the spot a list names, and a family is
+// only rich AT its farm. At the 66.63 spot its family 0xA2CEC scored 1 hit at
+// the centre (rank 5, lost in noise) but ranked #1 of all 1,048,576 20-bit
+// families (+755 sd) at the farm's real position 2 chunks away. Scoring every
+// family at its best position in the window is what lets a sweep FIND them.
+//
+// Per seed: evaluate the union window once ((17+2RZ) rows x (17+2RX) columns),
+// row by row; each row is packed into a bitmask and added to every position
+// whose 17-row mask covers it (popcount against the spawn-mask row), so all
+// (2RX+1)(2RZ+1) positions cost one pass over the window. No early exit: the
+// last position is only complete on the last row. Hits recompute the exact
+// block weight at the best position (rare), so best_cq means what it always
+// meant. Same seed stream as familySweepKernel: with RX = RZ = 0 the hit counts
+// are identical (checked in --self-test).
+// famOff: first family of this launch (big sweeps are split across launches).
+// outBest packs (blocks << 8) | position index of the best hit.
+// ---------------------------------------------------------------------------
+__constant__ uint32_t cSpawnRow[17];   // spawn-mask row k (dz = k - 8), bit dx + 8
+__constant__ int cRemAfter[17];        // spawn cells in mask rows k+1..16 (0 for k = 16)
+
+template <int RX, int RZ>
+__global__ void __launch_bounds__(256, 3)
+familySweepWinKernel(long long cx, long long cz, uint64_t seedBase, long long N, int floorCount,
+                     uint64_t mask, long long famOff, const uint64_t* __restrict__ vals,
+                     unsigned long long* __restrict__ outHits,
+                     double* __restrict__ outEffSum,
+                     int* __restrict__ outBest) {
+    constexpr int NX = 2 * RX + 1, NZ = 2 * RZ + 1, NC = 17 + 2 * RX, NR = 17 + 2 * RZ;
+    __shared__ uint64_t P[NR * NC];
+    __shared__ unsigned long long sHits;
+    __shared__ double sEff;
+    __shared__ int sBest;
+    for (int i = threadIdx.x; i < NR * NC; i += blockDim.x)
+        P[i] = posOffset(cx - 8 - RX + (i % NC), cz - 8 - RZ + (i / NC));
+    if (threadIdx.x == 0) { sHits = 0; sEff = 0.0; sBest = 0; }
+    __syncthreads();
+
+    const long long fam = famOff + blockIdx.x;
+    const uint64_t val = vals[fam] & mask;
+    unsigned long long lh = 0; double lsum = 0.0; int lbest = 0;
+    uint64_t base = seedBase + ((uint64_t)fam * 0x9E3779B97F4A7C15ULL);
+    for (long long j = threadIdx.x; j < N; j += blockDim.x) {
+        uint64_t w64 = splitmix64(base + (uint64_t)j);
+        w64 = (w64 & ~mask) | val;
+        const long long w = (long long)w64;
+        int cnt[NX * NZ];
+        #pragma unroll
+        for (int p = 0; p < NX * NZ; p++) cnt[p] = 0;
+        for (int r = 0; r < NR; r++) {
+            uint32_t b = 0;
+            #pragma unroll
+            for (int c = 0; c < NC; c++) b |= (uint32_t)slimeFromOffset(w, P[r * NC + c]) << c;
+            #pragma unroll
+            for (int pz = 0; pz < NZ; pz++) {
+                const int k = r - pz;                        // mask row this data row is for
+                if ((unsigned)k > 16u) continue;             // uniform across the warp
+                const uint32_t m = cSpawnRow[k];
+                #pragma unroll
+                for (int px = 0; px < NX; px++) cnt[pz * NX + px] += __popc((b >> px) & m);
+            }
+            // EARLY EXIT, exact: once every position's count plus all the cells it has
+            // left is below the floor, no position can be a hit - stop reading rows. Only
+            // the last few rows can trigger it (the last position starts on row 2RZ and
+            // needs ~12 of its 17 rows before a floor of 55-64 is out of reach).
+            if (r >= NR - 5 && r < NR - 1) {
+                bool alive = false;
+                #pragma unroll
+                for (int pz = 0; pz < NZ; pz++) {
+                    const int k = r - pz;
+                    const int rem = (k < 0) ? 1000 : (k >= 16 ? 0 : cRemAfter[k]);
+                    #pragma unroll
+                    for (int px = 0; px < NX; px++) alive |= (cnt[pz * NX + px] + rem >= floorCount);
+                }
+                if (!alive) break;
+            }
+        }
+        int best = cnt[0], bestPos = 0;
+        #pragma unroll
+        for (int p = 1; p < NX * NZ; p++) if (cnt[p] > best) { best = cnt[p]; bestPos = p; }
+        if (best >= floorCount) {
+            const int pz = bestPos / NX, px = bestPos % NX;
+            int blocks = 0;
+            for (int i = 0; i < cMaskN; i++)
+                if (slimeFromOffset(w, P[(pz + cMaskDZ[i] + 8) * NC + (px + cMaskDX[i] + 8)])) blocks += cCellW[i];
+            lh++;
+            lsum += (blocks / 256.0) / (double)best;
+            const int packed = (blocks << 8) | bestPos;
+            if (packed > lbest) lbest = packed;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        lh   += __shfl_down_sync(0xFFFFFFFFu, lh,   off);
+        lsum += __shfl_down_sync(0xFFFFFFFFu, lsum, off);
+        int o = __shfl_down_sync(0xFFFFFFFFu, lbest, off);
+        if (o > lbest) lbest = o;
+    }
+    if ((threadIdx.x & 31) == 0) {
+        if (lh) atomicAdd(&sHits, lh);
+        if (lsum != 0.0) atomicAdd(&sEff, lsum);
+        atomicMax(&sBest, lbest);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        outHits[fam]   = sHits;
+        outEffSum[fam] = sEff;
+        outBest[fam]   = sBest;
+    }
+}
+typedef void (*WinSweepFn)(int, long long, long long, uint64_t, long long, int, uint64_t, long long,
+                           const uint64_t*, unsigned long long*, double*, int*);
+template <int RX, int RZ>
+static void launchWinSweep(int blocks, long long cx, long long cz, uint64_t seedBase, long long N, int floorC,
+                           uint64_t mask, long long famOff, const uint64_t* vals,
+                           unsigned long long* hits, double* eff, int* best) {
+    familySweepWinKernel<RX, RZ><<<blocks, 256>>>(cx, cz, seedBase, N, floorC, mask, famOff, vals, hits, eff, best);
+}
+#define WIN_SWEEP_ROW(rx) launchWinSweep<rx, 0>, launchWinSweep<rx, 1>, launchWinSweep<rx, 2>, \
+                          launchWinSweep<rx, 3>, launchWinSweep<rx, 4>
+static const WinSweepFn kWinSweep[25] = { WIN_SWEEP_ROW(0), WIN_SWEEP_ROW(1), WIN_SWEEP_ROW(2),
+                                          WIN_SWEEP_ROW(3), WIN_SWEEP_ROW(4) };
+static void uploadSpawnRows() {
+    uint8_t mask[17 * 17];
+    buildSpawnMask(mask);
+    uint32_t rows[17];
+    for (int k = 0; k < 17; k++) {
+        rows[k] = 0;
+        for (int c = 0; c < 17; c++) if (mask[k * 17 + c]) rows[k] |= 1u << c;
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(cSpawnRow, rows, sizeof(rows)));
+    int rem[17]; int acc = 0;
+    for (int k = 16; k >= 0; k--) { rem[k] = acc; for (int c = 0; c < 17; c++) acc += (rows[k] >> c) & 1; }   // (no __builtin_popcount under MSVC)
+    CUDA_CHECK(cudaMemcpyToSymbol(cRemAfter, rem, sizeof(rem)));
+}
+// Runs the windowed sweep over F families, split into launches of <= 32768
+// blocks so no single launch runs long enough to trip the display watchdog.
+static void runWinSweep(int rx, int rz, long long cx, long long cz, uint64_t seedBase, long long N, int floorC,
+                        uint64_t mask, long long F, const uint64_t* dVals,
+                        unsigned long long* dHits, double* dEff, int* dBest) {
+    uploadSpawnRows();
+    const long long CH = 32768;
+    for (long long off = 0; off < F; off += CH) {
+        int nb = (int)std::min<long long>(CH, F - off);
+        kWinSweep[rx * 5 + rz](nb, cx, cz, seedBase, N, floorC, mask, off, dVals, dHits, dEff, dBest);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
     }
 }
 
@@ -634,6 +826,1166 @@ static void buildMaskOffsets() {
     CUDA_CHECK(cudaMemcpyToSymbol(cCellW, g_w.data(), n * sizeof(int)));
 }
 
+// ---------------------------------------------------------------------------
+// HEAT SURVEY (--heat-survey): heat40 of every X column on one chunk row, on the GPU.
+// heat40 = P(>= 40 slime chunks in the r = 8 disc (197 chunks) | random seed) / 2.1e-5 - the same
+// definition as heat\SlimeModel.cs DiscPairs and main\theory\heat\x_rescore.csv, so the values
+// line up. One block per column; seeds sampled with splitmix64; countTail's exact early exit.
+// ---------------------------------------------------------------------------
+__constant__ int cDiscDX[197], cDiscDZ[197];
+__global__ void __launch_bounds__(256)
+heatSurveyKernel(long long cx0, long long cz, int nCols, long long N, int T, uint64_t seedBase, unsigned long long* __restrict__ outHits) {
+    const int col = blockIdx.x; if (col >= nCols) return;
+    __shared__ uint64_t P[197];
+    __shared__ unsigned long long sH;
+    for (int i = threadIdx.x; i < 197; i += blockDim.x) P[i] = posOffset(cx0 + col + cDiscDX[i], cz + cDiscDZ[i]);
+    if (threadIdx.x == 0) sH = 0;
+    __syncthreads();
+    const uint64_t base = seedBase + (uint64_t)(cx0 + col) * 0x9E3779B97F4A7C15ULL;
+    unsigned long long h = 0;
+    for (long long j = threadIdx.x; j < N; j += blockDim.x)
+        if (countTail(P, 197, (long long)splitmix64(base + (uint64_t)j), T) >= T) h++;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) h += __shfl_down_sync(0xFFFFFFFFu, h, off);
+    if ((threadIdx.x & 31) == 0 && h) atomicAdd(&sH, h);
+    __syncthreads();
+    if (threadIdx.x == 0) outHits[col] = sH;
+}
+// SPOT SURVEY (--heat-spots file of "cx,cz" chunk pairs): heat40 of each spot measured directly. The
+// product model F(X) x G(Z) mis-ranks the top: among the 150 hottest X columns of line 10617 their heat
+// on lines 9950 / 4850 correlated at only r = 0.3, so candidate spots are measured, not predicted.
+// Same seed stream as --heat-rows for the same (cx, row).
+__global__ void __launch_bounds__(256)
+heatSpotsKernel(const int* __restrict__ cxs, const int* __restrict__ czs, int n, long long N, int T, uint64_t seedBase, unsigned long long* __restrict__ outHits) {
+    const int sp = blockIdx.x; if (sp >= n) return;
+    __shared__ uint64_t P[197];
+    __shared__ unsigned long long sH;
+    const long long cx = cxs[sp], cz = czs[sp];
+    for (int i = threadIdx.x; i < 197; i += blockDim.x) P[i] = posOffset(cx + cDiscDX[i], cz + cDiscDZ[i]);
+    if (threadIdx.x == 0) sH = 0;
+    __syncthreads();
+    const uint64_t base = (seedBase ^ ((uint64_t)cz * 0xD6E8FEB86659FD93ULL)) + (uint64_t)cx * 0x9E3779B97F4A7C15ULL;
+    unsigned long long h = 0;
+    for (long long j = threadIdx.x; j < N; j += blockDim.x)
+        if (countTail(P, 197, (long long)splitmix64(base + (uint64_t)j), T) >= T) h++;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) h += __shfl_down_sync(0xFFFFFFFFu, h, off);
+    if ((threadIdx.x & 31) == 0 && h) atomicAdd(&sH, h);
+    __syncthreads();
+    if (threadIdx.x == 0) outHits[sp] = sH;
+}
+static void heatSpots(const std::string& spotsFile, long long N, int T, uint64_t seedBase, const std::string& outPath) {
+    int dx[197], dz[197], k = 0;
+    for (int a = -8; a <= 8; a++) for (int b = -8; b <= 8; b++) if (a * a + b * b <= 64) { dx[k] = a; dz[k] = b; k++; }
+    CUDA_CHECK(cudaMemcpyToSymbol(cDiscDX, dx, sizeof(dx))); CUDA_CHECK(cudaMemcpyToSymbol(cDiscDZ, dz, sizeof(dz)));
+    std::vector<int> cx, cz; { FILE* sf = fopen(spotsFile.c_str(), "r"); if (!sf) { fprintf(stderr, "cannot read %s\n", spotsFile.c_str()); exit(1); }
+        int a, b; while (fscanf(sf, "%d,%d", &a, &b) == 2) { cx.push_back(a); cz.push_back(b); } fclose(sf); }
+    const int n = (int)cx.size(), CH = 65536;
+    int *dX, *dZ; unsigned long long* dH;
+    CUDA_CHECK(cudaMalloc(&dX, CH * sizeof(int))); CUDA_CHECK(cudaMalloc(&dZ, CH * sizeof(int))); CUDA_CHECK(cudaMalloc(&dH, CH * sizeof(unsigned long long)));
+    std::vector<unsigned long long> hH(CH);
+    FILE* f = fopen(outPath.c_str(), "w"); fprintf(f, "cx,cz,heat%d,samples\n", T);
+    auto t0 = std::chrono::steady_clock::now();
+    for (int b0 = 0; b0 < n; b0 += CH) {
+        const int m = std::min(CH, n - b0);
+        CUDA_CHECK(cudaMemcpy(dX, cx.data() + b0, m * sizeof(int), cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(dZ, cz.data() + b0, m * sizeof(int), cudaMemcpyHostToDevice));
+        heatSpotsKernel<<<m, 256>>>(dX, dZ, m, N, T, seedBase, dH);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(hH.data(), dH, m * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < m; i++) fprintf(f, "%d,%d,%.3f,%lld\n", cx[b0 + i], cz[b0 + i], hH[i] / (double)N / 2.1e-5, N);
+        printf("  %d / %d spots  (%.0f s)\n", b0 + m, n, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); fflush(stdout);
+    }
+    fclose(f); cudaFree(dX); cudaFree(dZ); cudaFree(dH);
+    printf("spot survey: %d spots x %lld seeds in %.1f s -> %s\n", n, N, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), outPath.c_str());
+}
+// LINE SURVEY (--heat-rows file): the same heat40 for many chunk rows over one X range, one output
+// line per row (mean and max heat over the columns). Ranks Z lines by measured heat, not a proxy.
+static void heatRows(const std::string& rowsFile, long long cxFrom, long long cxTo, long long N, int T, uint64_t seedBase, const std::string& outPath) {
+    int dx[197], dz[197], k = 0;
+    for (int a = -8; a <= 8; a++) for (int b = -8; b <= 8; b++) if (a * a + b * b <= 64) { dx[k] = a; dz[k] = b; k++; }
+    CUDA_CHECK(cudaMemcpyToSymbol(cDiscDX, dx, sizeof(dx))); CUDA_CHECK(cudaMemcpyToSymbol(cDiscDZ, dz, sizeof(dz)));
+    std::vector<long long> rows; { FILE* rf = fopen(rowsFile.c_str(), "r"); if (!rf) { fprintf(stderr, "cannot read %s\n", rowsFile.c_str()); exit(1); }
+        long long r; while (fscanf(rf, "%lld", &r) == 1) rows.push_back(r); fclose(rf); }
+    const int n = (int)(cxTo - cxFrom + 1);
+    unsigned long long* dH; CUDA_CHECK(cudaMalloc(&dH, n * sizeof(unsigned long long))); std::vector<unsigned long long> hH(n);
+    FILE* f = fopen(outPath.c_str(), "w"); fprintf(f, "row,mean_heat%d,max_heat%d,columns,samples\n", T, T);
+    auto t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < rows.size(); i++) {
+        heatSurveyKernel<<<n, 256>>>(cxFrom, rows[i], n, N, T, seedBase ^ ((uint64_t)rows[i] * 0xD6E8FEB86659FD93ULL), dH);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(hH.data(), dH, n * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        double sum = 0, mx = 0; for (int c = 0; c < n; c++) { const double hv = hH[c] / (double)N / 2.1e-5; sum += hv; if (hv > mx) mx = hv; }
+        fprintf(f, "%lld,%.3f,%.3f,%d,%lld\n", rows[i], sum / n, mx, n, N);
+        if (i % 20000 == 0) { printf("  %zu / %zu rows  (%.0f s)\n", i, rows.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); fflush(stdout); }
+    }
+    fclose(f); cudaFree(dH);
+    printf("line survey: %zu rows x %d columns x %lld seeds in %.1f s -> %s\n", rows.size(), n, N,
+           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), outPath.c_str());
+}
+static void heatSurvey(long long cxFrom, long long cxTo, long long cz, long long N, int T, uint64_t seedBase, const std::string& outPath, double minHeat = 0) {
+    int dx[197], dz[197], k = 0;
+    for (int a = -8; a <= 8; a++) for (int b = -8; b <= 8; b++) if (a * a + b * b <= 64) { dx[k] = a; dz[k] = b; k++; }
+    if (k != 197) { fprintf(stderr, "disc has %d cells, expected 197\n", k); exit(1); }
+    CUDA_CHECK(cudaMemcpyToSymbol(cDiscDX, dx, sizeof(dx))); CUDA_CHECK(cudaMemcpyToSymbol(cDiscDZ, dz, sizeof(dz)));
+    const long long nAll = cxTo - cxFrom + 1; const int CH = 4096;
+    unsigned long long* dH; CUDA_CHECK(cudaMalloc(&dH, CH * sizeof(unsigned long long)));
+    std::vector<unsigned long long> hH(CH);
+    FILE* f = fopen(outPath.c_str(), "w"); if (!f) { fprintf(stderr, "cannot write %s\n", outPath.c_str()); exit(1); }
+    fprintf(f, "cx,hits,samples,heat%d\n", T);
+    auto t0 = std::chrono::steady_clock::now();
+    for (long long c = 0; c < nAll; c += CH) {
+        const int n = (int)std::min<long long>(CH, nAll - c);
+        heatSurveyKernel<<<n, 256>>>(cxFrom + c, cz, n, N, T, seedBase, dH);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(hH.data(), dH, n * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < n; i++) { const double hv = hH[i] / (double)N / 2.1e-5; if (hv >= minHeat) fprintf(f, "%lld,%llu,%lld,%.3f\n", cxFrom + c + i, hH[i], N, hv); }
+        if (((c / CH) % 50) == 0) { const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            printf("  %lld / %lld columns  (%.0f s)\n", c + n, nAll, sec); fflush(stdout); }
+    }
+    fclose(f); cudaFree(dH);
+    printf("heat survey: %lld columns x %lld seeds in %.1f s -> %s\n", nAll, N,
+           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), outPath.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// PHASE SEARCH (--phase-search). docs\PHASE_MODEL.txt has the derivation.
+// seed = f (bits 0-19) + 2^20 c (20-34) + 2^35 v (35-47). For one (f, c), every chunk's
+// nextInt bits are B(v) = B(0) + 2^18 w (mod 2^31), w = M v mod 2^13 - the SAME w for all
+// chunks. Possible iff B(0) even; phase = B(0) mod 5; slime when w = phase (mod 5), or
+// phase + 2 once B has wrapped past 2^31 (w >= thr = 8192 - (B(0) >> 18)). So the best farm
+// over all 8,192 top values of a class comes from the 222 values B(0) - no enumeration.
+// ---------------------------------------------------------------------------
+#define PH_M  0x5DEECE66DULL
+#define PH_MK ((1ULL << 48) - 1)
+__host__ __device__ __forceinline__ uint32_t phaseB0(uint64_t s35, uint64_t P) {
+    uint64_t t = (((s35 + P) ^ 0x3ad8025fULL) ^ PH_M) & PH_MK;
+    return (uint32_t)((((t * PH_M) + 0xBULL) & PH_MK) >> 17);
+}
+// Exact best chunk count over all 8,192 top values of class s35, and the w that gives it.
+// For w = r (mod 5) the slime chunks are {phase r, w < thr} + {phase r+3, w >= thr}; the count
+// only changes at those thresholds. Chunks are sorted by thr once (insertion sort, ~111 of
+// them), then each r is one walk: start at N_r, apply -1 / +1 as w passes each threshold, and
+// evaluate at w = r and at the first w = r at or after each relevant threshold.
+// Every layout of a class that reaches T (one per (phase, wrap segment) of the walk), appended
+// to a global list: a class can hold several good layouts and only the best was kept before -
+// that lost 67.28 / 66.73 (at the 68.28 spot) and 66.97 / 66.14 (67.07 spot) which the old
+// family exhausts had found.
+struct PhaseEmit { unsigned int* n; unsigned int cap; unsigned int src; unsigned int* q; int* w; int* cnt; int* blk; int T; };
+// W (optional): eligible-block weight per chunk (same order as P). With W the walk also tracks
+// the layout with the most BLOCKS - what cq is made of - and returns its w and chunk count:
+// ranking by chunks alone missed the 67.07 (69 chunks at 97% packing) among 70-chunk layouts.
+__host__ __device__ inline int phaseBestOfClass(const uint64_t* P, int n, uint64_t s35, int* wOut,
+                                                const int* W = nullptr, int* blocksOut = nullptr, int* wBlocksOut = nullptr, int* cntAtBlocksOut = nullptr,
+                                                const PhaseEmit* em = nullptr) {
+    uint32_t e[226]; int m = 0; int N[5] = {0, 0, 0, 0, 0}; int WS[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < n; i++) {
+        uint32_t b = phaseB0(s35, P[i]);
+        if (b & 1) continue;
+        uint32_t ph = b % 5; e[m++] = ((8192u - (b >> 18)) << 11) | (ph << 8) | (uint32_t)i; N[ph]++;
+        if (W) WS[ph] += W[i];
+    }
+    for (int i = 1; i < m; i++) { uint32_t x = e[i]; int j = i - 1; while (j >= 0 && e[j] > x) { e[j + 1] = e[j]; j--; } e[j + 1] = x; }
+    int best = -1, bestW = 0, bestB = -1, bestBW = 0, cntAtB = 0;
+    for (int r = 0; r < 5; r++) {
+        const uint32_t r3 = (r + 3) % 5;
+        int cnt = N[r], blk = WS[r], p = 0, w = r;
+        for (;;) {
+            while (p < m && (int)(e[p] >> 11) <= w) {
+                const uint32_t ph = (e[p] >> 8) & 7; const int idx = (int)(e[p] & 0xFF);
+                if (ph == (uint32_t)r) { cnt--; if (W) blk -= W[idx]; } else if (ph == r3) { cnt++; if (W) blk += W[idx]; }
+                p++;
+            }
+            if (cnt > best) { best = cnt; bestW = w; }
+            if (W && blk > bestB) { bestB = blk; bestBW = w; cntAtB = cnt; }
+#ifdef __CUDA_ARCH__
+            if (em && cnt >= em->T) {
+                const unsigned int k = atomicAdd(em->n, 1u);
+                if (k < em->cap) { em->q[k] = em->src; em->w[k] = w; em->cnt[k] = cnt; em->blk[k] = blk; }
+            }
+#endif
+            while (p < m && ((e[p] >> 8) & 7) != (uint32_t)r && ((e[p] >> 8) & 7) != r3) p++;
+            if (p >= m) break;
+            const int t = (int)(e[p] >> 11), nw = t + (((r - t) % 5) + 5) % 5;
+            if (nw >= 8192) break;
+            w = nw;
+        }
+    }
+    *wOut = bestW;
+    if (W) { *blocksOut = bestB; *wBlocksOut = bestBW; *cntAtBlocksOut = cntAtB; }
+    return best;
+}// Upper bound on phaseBestOfClass without the scan: counts by phase x quarter of hb (q = hb >> 11,
+// 5 x 4 counts, one byte each in c0..c3). For top values w in quarter j a phase-r chunk can only
+// count if q < 4 - j and a phase-(r+3) chunk only if q >= 3 - j. (Quarters, not halves: among the
+// top-3% families 0.85% of classes passed the halves bound at 64, and the exact pass took ~90% of
+// the time.)
+__host__ __device__ __forceinline__ void phaseAccumulate(uint32_t b, uint64_t& c0, uint64_t& c1, uint64_t& c2, uint64_t& c3) {
+    if (b & 1) return;
+    const uint64_t inc = 1ULL << (8 * (b % 5)); const uint32_t q = b >> 29;   // bits 29-30 of B(0) = top 2 bits of hb
+    c0 += (q == 0) ? inc : 0; c1 += (q == 1) ? inc : 0; c2 += (q == 2) ? inc : 0; c3 += (q == 3) ? inc : 0;
+}
+__host__ __device__ __forceinline__ int phaseBoundFrom(uint64_t c0, uint64_t c1, uint64_t c2, uint64_t c3) {
+    int U = 0;
+    #pragma unroll
+    for (int r = 0; r < 5; r++) {
+        const int r3 = (r + 3) % 5;
+        const int a0 = (int)((c0 >> (8 * r)) & 0xFF), a1 = (int)((c1 >> (8 * r)) & 0xFF), a2 = (int)((c2 >> (8 * r)) & 0xFF), a3 = (int)((c3 >> (8 * r)) & 0xFF);
+        const int b0 = (int)((c0 >> (8 * r3)) & 0xFF), b1 = (int)((c1 >> (8 * r3)) & 0xFF), b2 = (int)((c2 >> (8 * r3)) & 0xFF), b3 = (int)((c3 >> (8 * r3)) & 0xFF);
+        const int u0 = a0 + a1 + a2 + a3 + b3, u1 = a0 + a1 + a2 + b2 + b3, u2 = a0 + a1 + b1 + b2 + b3, u3 = a0 + b0 + b1 + b2 + b3;
+        U = max(U, max(max(u0, u1), max(u2, u3)));
+    }
+    return U;
+}
+// CLASS HEAT (--heat-class): the same heat40 as --heat-spots, but one sample is a 35-bit class (seed
+// bits 0-34) and counts EXACTLY how many of its 8,192 top values put >= T of the disc chunks slime - the
+// phase model above, so no seed of the class is sampled. Same expectation as plain seed sampling (it is
+// plain sampling averaged exactly within each class); the quarter bound rules out almost every class.
+// Chunk of phase ph is slime at w = ph (mod 5) while w < thr, at w = ph + 2 once w >= thr, so one walk
+// over the sorted thresholds counts all five residues.
+__host__ __device__ inline int heatClassHits(const uint64_t* P, int n, uint64_t s35, int T) {
+    uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (int i = 0; i < n; i++) phaseAccumulate(phaseB0(s35, P[i]), c0, c1, c2, c3);
+    if (phaseBoundFrom(c0, c1, c2, c3) < T) return 0;
+    uint32_t e[226]; int m = 0; int N[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < n; i++) {
+        const uint32_t b = phaseB0(s35, P[i]);
+        if (b & 1) continue;
+        const uint32_t ph = b % 5; e[m++] = ((8192u - (b >> 18)) << 3) | ph; N[ph]++;
+    }
+    for (int i = 1; i < m; i++) { uint32_t x = e[i]; int j = i - 1; while (j >= 0 && e[j] > x) { e[j + 1] = e[j]; j--; } e[j + 1] = x; }
+    int total = 0, prev = 0;
+    for (int k = 0; k <= m; k++) {
+        const int t = (k < m) ? (int)(e[k] >> 3) : 8192;
+        if (t > prev) {
+            #pragma unroll
+            for (int r = 0; r < 5; r++)
+                if (N[r] >= T) total += ((t > r) ? (t - r + 4) / 5 : 0) - ((prev > r) ? (prev - r + 4) / 5 : 0);
+            prev = t;
+        }
+        if (k < m) { const int ph = (int)(e[k] & 7); N[ph]--; N[(ph + 2) % 5]++; }
+    }
+    return total;
+}
+#ifndef HEAT_BINS
+#define HEAT_BINS 8
+#endif
+__host__ __device__ __forceinline__ uint32_t heatResidueMask(const uint64_t* P, int n, uint64_t s35, int T, int* Nr) {
+    uint64_t p0 = 0, p1 = 0, p2 = 0, p3 = 0, p4 = 0;
+    for (int i = 0; i < n; i++) {
+        const uint32_t b = phaseB0(s35, P[i]);
+        if (b & 1) continue;
+        const uint64_t inc = 1ULL << (8 * (b >> (31 - (HEAT_BINS == 8 ? 3 : 2)))); const uint32_t ph = b % 5;
+        p0 += (ph == 0) ? inc : 0; p1 += (ph == 1) ? inc : 0; p2 += (ph == 2) ? inc : 0; p3 += (ph == 3) ? inc : 0; p4 += (ph == 4) ? inc : 0;
+    }
+    const uint64_t pp[5] = {p0, p1, p2, p3, p4};
+    uint32_t mask = 0;
+    #pragma unroll
+    for (int r = 0; r < 5; r++) {
+        const uint64_t A = pp[r], B = pp[(r + 3) % 5];
+        int sufB = 0, totA = 0;
+        #pragma unroll
+        for (int q = 0; q < HEAT_BINS; q++) totA += (int)((A >> (8 * q)) & 0xFF);
+        int preA = totA, u = 0;
+        #pragma unroll
+        for (int k = HEAT_BINS - 1; k >= 0; k--) {
+            sufB += (int)((B >> (8 * k)) & 0xFF);
+            u = max(u, preA + sufB);
+            preA -= (int)((A >> (8 * k)) & 0xFF);
+        }
+        if (u >= T) mask |= 1u << r;
+        if (Nr) Nr[r] = totA;
+    }
+    return mask;
+}
+__host__ __device__ inline int heatClassExact(const uint64_t* P, int n, uint64_t s35, int T, uint32_t mask) {
+    uint32_t rel = 0;
+    for (int r = 0; r < 5; r++) if (mask >> r & 1) rel |= (1u << r) | (1u << ((r + 3) % 5));
+    uint32_t e[226]; int m = 0; int N[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < n; i++) {
+        const uint32_t b = phaseB0(s35, P[i]);
+        if (b & 1) continue;
+        const uint32_t ph = b % 5; N[ph]++;
+        if (rel >> ph & 1) e[m++] = ((8192u - (b >> 18)) << 3) | ph;
+    }
+    for (int i = 1; i < m; i++) { uint32_t x = e[i]; int j = i - 1; while (j >= 0 && e[j] > x) { e[j + 1] = e[j]; j--; } e[j + 1] = x; }
+    int total = 0, prev = 0;
+    for (int k = 0; k <= m; k++) {
+        const int t = (k < m) ? (int)(e[k] >> 3) : 8192;
+        if (t > prev) {
+            #pragma unroll
+            for (int r = 0; r < 5; r++)
+                if ((mask >> r & 1) && N[r] >= T) total += ((t > r) ? (t - r + 4) / 5 : 0) - ((prev > r) ? (prev - r + 4) / 5 : 0);
+            prev = t;
+        }
+        if (k < m) { const int ph = (int)(e[k] & 7); N[ph]--; N[(ph + 2) % 5]++; }
+    }
+    return total;
+}
+__global__ void __launch_bounds__(256)
+heatClassKernel(const int* __restrict__ cxs, const int* __restrict__ czs, int n, long long N, int T, uint64_t seedBase,
+                unsigned long long* __restrict__ outSum, unsigned long long* __restrict__ outSq, unsigned long long* __restrict__ outBound) {
+    const int sp = blockIdx.x; if (sp >= n) return;
+    __shared__ uint64_t P[197];
+    __shared__ uint64_t Qs[512];
+    __shared__ int qn;
+    __shared__ unsigned long long sS, sQ, sB;
+    const long long cx = cxs[sp], cz = czs[sp];
+    for (int i = threadIdx.x; i < 197; i += blockDim.x) P[i] = posOffset(cx + cDiscDX[i], cz + cDiscDZ[i]);
+    if (threadIdx.x == 0) { sS = 0; sQ = 0; sB = 0; qn = 0; }
+    __syncthreads();
+    const uint64_t base = (seedBase ^ ((uint64_t)cz * 0xD6E8FEB86659FD93ULL)) + (uint64_t)cx * 0x9E3779B97F4A7C15ULL;
+    unsigned long long s = 0, q = 0, nb = 0;
+    for (long long j0 = 0; j0 < N; j0 += blockDim.x) {
+        const long long j = j0 + threadIdx.x;
+        if (j < N) {
+            const uint64_t s35 = splitmix64(base + (uint64_t)j) & ((1ULL << 35) - 1);
+            const uint32_t mask = heatResidueMask(P, 197, s35, T, nullptr);
+            if (mask) { const int k = atomicAdd(&qn, 1); Qs[k] = s35 | ((uint64_t)mask << 40); nb++; }
+        }
+        __syncthreads();
+        const int have = qn;
+        if (have >= 256 || j0 + blockDim.x >= N) {
+            for (int k = threadIdx.x; k < have; k += blockDim.x) {
+                const uint64_t it = Qs[k];
+                const int h = heatClassExact(P, 197, it & ((1ULL << 35) - 1), T, (uint32_t)(it >> 40));
+                if (h) { s += (unsigned long long)h; q += (unsigned long long)h * (unsigned long long)h; }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) qn = 0;
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_down_sync(0xFFFFFFFFu, s, off); q += __shfl_down_sync(0xFFFFFFFFu, q, off); nb += __shfl_down_sync(0xFFFFFFFFu, nb, off);
+    }
+    if ((threadIdx.x & 31) == 0 && (s || nb)) { atomicAdd(&sS, s); atomicAdd(&sQ, q); atomicAdd(&sB, nb); }
+    __syncthreads();
+    if (threadIdx.x == 0) { outSum[sp] = sS; outSq[sp] = sQ; outBound[sp] = sB; }
+}
+__global__ void heatFamKernel(const int* __restrict__ cxs, const int* __restrict__ czs, int n, long long tiles, int T, uint64_t seedBase,
+                              unsigned long long* __restrict__ outSum, unsigned long long* __restrict__ outSq, unsigned long long* __restrict__ outBound);
+static void heatClassSpots(const std::string& spotsFile, long long N, int T, uint64_t seedBase, const std::string& outPath, bool fam = false) {
+    int dx[197], dz[197], k = 0;
+    for (int a = -8; a <= 8; a++) for (int b = -8; b <= 8; b++) if (a * a + b * b <= 64) { dx[k] = a; dz[k] = b; k++; }
+    CUDA_CHECK(cudaMemcpyToSymbol(cDiscDX, dx, sizeof(dx))); CUDA_CHECK(cudaMemcpyToSymbol(cDiscDZ, dz, sizeof(dz)));
+    std::vector<int> cx, cz; { FILE* sf = fopen(spotsFile.c_str(), "r"); if (!sf) { fprintf(stderr, "cannot read %s\n", spotsFile.c_str()); exit(1); }
+        int a, b; while (fscanf(sf, "%d,%d", &a, &b) == 2) { cx.push_back(a); cz.push_back(b); } fclose(sf); }
+    const int n = (int)cx.size(), CH = 65536;
+    if (n) {
+        uint64_t P[197]; for (int i = 0; i < 197; i++) P[i] = posOffset(cx[0] + dx[i], cz[0] + dz[i]);
+        long long bad = 0, tot = 0;
+        for (int tt : {28, 32, T}) for (int c = 0; c < 12; c++) {
+            const uint64_t s35 = splitmix64(seedBase + 7919ULL * c + tt) & ((1ULL << 35) - 1);
+            int brute = 0;
+            for (uint64_t v = 0; v < 8192; v++) { int cnt = 0; for (int i = 0; i < 197; i++) cnt += slimeFromOffset((long long)(s35 | (v << 35)), P[i]); brute += cnt >= tt; }
+            const uint32_t mk = heatResidueMask(P, 197, s35, tt, nullptr);
+            const int fast = mk ? heatClassExact(P, 197, s35, tt, mk) : 0; tot += brute; if (fast != brute || fast != heatClassHits(P, 197, s35, tt)) bad++;
+        }
+        printf("class check vs brute force (36 classes, T = 28/32/%d, %lld seeds hit): %lld mismatch(es)\n", T, tot, bad); fflush(stdout);
+        if (bad) { fprintf(stderr, "class heat disagrees with the slime test - stopping\n"); exit(1); }
+    }
+    int *dX, *dZ; unsigned long long *dS, *dQ, *dB;
+    CUDA_CHECK(cudaMalloc(&dX, CH * sizeof(int))); CUDA_CHECK(cudaMalloc(&dZ, CH * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dS, CH * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dQ, CH * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dB, CH * sizeof(unsigned long long)));
+    std::vector<unsigned long long> hS(CH), hQ(CH), hB(CH);
+    FILE* f = fopen(outPath.c_str(), "w"); fprintf(f, "cx,cz,heat%d,classes,sd,hit_classes\n", T);
+    auto t0 = std::chrono::steady_clock::now();
+    const double scale = 1.0 / (8192.0 * 2.1e-5);
+    for (int b0 = 0; b0 < n; b0 += CH) {
+        const int m = std::min(CH, n - b0);
+        CUDA_CHECK(cudaMemcpy(dX, cx.data() + b0, m * sizeof(int), cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(dZ, cz.data() + b0, m * sizeof(int), cudaMemcpyHostToDevice));
+        if (fam) heatFamKernel<<<m, 256>>>(dX, dZ, m, N / 256, T, seedBase, dS, dQ, dB);
+        else heatClassKernel<<<m, 256>>>(dX, dZ, m, N, T, seedBase, dS, dQ, dB);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(hS.data(), dS, m * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hQ.data(), dQ, m * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hB.data(), dB, m * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < m; i++) {
+            const double mean = hS[i] / (double)N, var = std::max(0.0, hQ[i] / (double)N - mean * mean);
+            fprintf(f, "%d,%d,%.3f,%lld,%.4f,%llu\n", cx[b0 + i], cz[b0 + i], mean * scale, N, sqrt(var / N) * scale, hB[i]);
+        }
+        printf("  %d / %d spots  (%.0f s)\n", b0 + m, n, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); fflush(stdout);
+    }
+    fclose(f); cudaFree(dX); cudaFree(dZ); cudaFree(dS); cudaFree(dQ); cudaFree(dB);
+    printf("class survey: %d spots x %lld classes in %.1f s -> %s\n", n, N, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), outPath.c_str());
+}
+// PLAN RUN (--heat-plan file): the catalog pass. The plan is binary int32: nCols, the column list
+// (strongest predicted first), nRows, then (cz, from, to) per row - row cz is measured at list
+// entries [from, to), so a later band of the same list never repeats a pair. Pairs are generated on the host per batch, so a billion-pair run needs
+// no spot file. Only spots reading >= --heat-min are written; --heat-start skips pairs already done.
+static void heatPlanRun(const std::string& planPath, long long N, int T, uint64_t seedBase, const std::string& outPath, double minHeat, long long start) {
+    int dx[197], dz[197], k = 0;
+    for (int a = -8; a <= 8; a++) for (int b = -8; b <= 8; b++) if (a * a + b * b <= 64) { dx[k] = a; dz[k] = b; k++; }
+    CUDA_CHECK(cudaMemcpyToSymbol(cDiscDX, dx, sizeof(dx))); CUDA_CHECK(cudaMemcpyToSymbol(cDiscDZ, dz, sizeof(dz)));
+    FILE* pf = fopen(planPath.c_str(), "rb"); if (!pf) { fprintf(stderr, "cannot read %s\n", planPath.c_str()); exit(1); }
+    int nc = 0, nr = 0; if (fread(&nc, 4, 1, pf) != 1) exit(1);
+    std::vector<int> colList(nc); if (fread(colList.data(), 4, nc, pf) != (size_t)nc) exit(1);
+    if (fread(&nr, 4, 1, pf) != 1) exit(1);
+    std::vector<int> rz(nr), rc(nr), r0(nr); for (int i = 0; i < nr; i++) { int v[3]; if (fread(v, 4, 3, pf) != 3) exit(1); rz[i] = v[0]; r0[i] = v[1]; rc[i] = v[2] - v[1]; }
+    fclose(pf);
+    long long total = 0; for (int i = 0; i < nr; i++) total += rc[i];
+    const int CH = 65536;
+    int *dX, *dZ; unsigned long long *dS, *dQ, *dB;
+    CUDA_CHECK(cudaMalloc(&dX, CH * sizeof(int))); CUDA_CHECK(cudaMalloc(&dZ, CH * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dS, CH * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dQ, CH * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dB, CH * sizeof(unsigned long long)));
+    std::vector<unsigned long long> hS(CH), hQ(CH); std::vector<int> bx(CH), bz(CH);
+    FILE* f = fopen(outPath.c_str(), start > 0 ? "a" : "w"); if (!f) { fprintf(stderr, "cannot write %s\n", outPath.c_str()); exit(1); }
+    if (start == 0) fprintf(f, "cx,cz,heat%d,classes,sd\n", T);
+    printf("plan: %d columns, %d rows, %lld pairs, starting at %lld\n", nc, nr, total, start); fflush(stdout);
+    const double scale = 1.0 / (8192.0 * 2.1e-5);
+    auto t0 = std::chrono::steady_clock::now();
+    long long pos = 0, kept = 0; int ri = 0; long long within = 0;
+    while (ri < nr && pos + (rc[ri] - within) <= start) { pos += rc[ri] - within; ri++; within = 0; }
+    within = start - pos; pos = start;
+    long long lastReport = 0;
+    while (pos < total) {
+        int m = 0;
+        while (m < CH && ri < nr) {
+            if (within >= rc[ri]) { ri++; within = 0; continue; }
+            bx[m] = colList[r0[ri] + within]; bz[m] = rz[ri]; m++; within++;
+        }
+        if (!m) break;
+        CUDA_CHECK(cudaMemcpy(dX, bx.data(), m * sizeof(int), cudaMemcpyHostToDevice)); CUDA_CHECK(cudaMemcpy(dZ, bz.data(), m * sizeof(int), cudaMemcpyHostToDevice));
+        heatClassKernel<<<m, 256>>>(dX, dZ, m, N, T, seedBase, dS, dQ, dB);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(hS.data(), dS, m * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hQ.data(), dQ, m * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < m; i++) {
+            const double mean = hS[i] / (double)N, hv = mean * scale;
+            if (hv >= minHeat) { fprintf(f, "%d,%d,%.3f,%lld,%.4f\n", bx[i], bz[i], hv, N, sqrt(std::max(0.0, hQ[i] / (double)N - mean * mean) / N) * scale); kept++; }
+        }
+        pos += m;
+        if (pos - lastReport >= 20000000 || pos >= total) {
+            fflush(f); lastReport = pos;
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            printf("  %lld / %lld pairs (%.2f%%), kept %lld, %.0f s, %.0f pairs/s, DONE_THROUGH %lld\n", pos, total, 100.0 * pos / total, kept, sec, (pos - start) / sec, pos); fflush(stdout);
+        }
+    }
+    fclose(f); cudaFree(dX); cudaFree(dZ); cudaFree(dS); cudaFree(dQ); cudaFree(dB);
+    printf("plan run: %lld pairs, %lld kept (>= %.2f) in %.1f s -> %s\n", total - start, kept, minHeat, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), outPath.c_str());
+}
+// possible chunks for every low-18-bit residue (parity depends on the low 18 bits only)
+__global__ void phasePossibleKernel(const uint64_t* __restrict__ P, int n, uint8_t* __restrict__ outN) {
+    int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= (1 << 18)) return;
+    int c = 0;
+    for (int i = 0; i < n; i++) c += !(phaseB0((uint64_t)f, P[i]) & 1);
+    outN[f] = (uint8_t)c;
+}
+// Pass 1: bound every (family, class); queue the ones that could reach T.
+// FAMILY-SPLIT B(0): with s35 = f + 2^20 c and Q = (f + P) mod 2^48, the low 20 bits of
+// seed + P are fixed by the family and bits 20-47 are (Q >> 20) + c, so with C = 0x3ad8025f ^ M:
+//     st1 = K + ((((Q >> 20) + c) mod 2^28 ^ (C >> 20)) * M mod 2^28) << 20    (mod 2^48)
+//     K   = ((Q mod 2^20) ^ (C mod 2^20)) * M + A                               (mod 2^48)
+// K and Q >> 20 are per (family, chunk): a block computes them once per tile of 256 classes of
+// one family, and each class then costs a 32-bit multiply instead of a 48-bit one.
+#define PH_C   (0x3ad8025fULL ^ PH_M)
+__global__ void __launch_bounds__(256)
+phaseBoundKernel(const uint64_t* __restrict__ Pg, int n, const uint32_t* __restrict__ fams,
+                 long long itemBase, long long items, int T,
+                 unsigned long long* __restrict__ queue, unsigned int* __restrict__ qCount, unsigned int qCap) {
+    // 32-BIT INNER LOOP (2026-09-13): b = ((K + (y << 20)) mod 2^48) >> 17 equals ((K >> 17) + (y << 3))
+    // mod 2^31 - y << 20 has no bits below 20, so K's low 20 bits never carry, and (K_hi + y) mod 2^28
+    // times 8 is exactly the mod 2^31 of the 32-bit sum (K >> 17 < 2^31, y << 3 < 2^31: no overflow).
+    // So only K >> 17 is kept, and the per-class loop has no 64-bit add or shift.
+    // K >> 17 and H0 of one chunk side by side (uint2): the loop's two broadcast loads become one
+    // 64-bit load - the loop is bound by shared-memory transactions (4 per step), not by arithmetic.
+    __shared__ __align__(16) uint2 KH[228];              // .x = K >> 17, .y = H0 (16-byte aligned: read two at a time)
+    __shared__ int nPoss;
+    __shared__ uint32_t SC[20 * 256];                    // per-thread (quarter, phase) counters, [bin][thread]
+    const long long tiles = items >> 8;                   // items and itemBase are multiples of 256
+    for (long long tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+        const long long g0 = itemBase + (tile << 8);
+        const uint64_t fam = fams[g0 >> 15];
+        __syncthreads();                                  // previous tile's readers are done
+        if (threadIdx.x == 0) nPoss = 0;
+        __syncthreads();
+        // Only the family's POSSIBLE chunks are kept: parity is bit 17 of st1, which lies in K
+        // (y << 20 cannot reach it), so it is known per family - ~145 of 222 chunks for the top
+        // families - and the per-class loop needs no parity test. Order is irrelevant (counts).
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const uint64_t Q = (fam + Pg[i]) & PH_MK;
+            const uint64_t k = (((Q & 0xFFFFF) ^ (PH_C & 0xFFFFF)) * PH_M + 0xBULL) & PH_MK;
+            if (!((k >> 17) & 1)) { const int j = atomicAdd(&nPoss, 1); KH[j] = make_uint2((uint32_t)((k >> 17) << 1), (uint32_t)(Q >> 20)); }
+        }
+        __syncthreads();
+        const int m = nPoss;
+        const long long g = g0 + threadIdx.x;
+        const uint32_t c = (uint32_t)(g & 0x7FFF);
+        // Counts by (quarter, phase) in SHARED memory, one 32-bit counter per bin per thread, laid
+        // out [bin][thread] so a warp's 32 threads always hit 32 different banks. Per chunk: one
+        // load-add-store instead of a 64-bit shift and four predicated 64-bit adds.
+        // (byte counters, 4 per word - less shared memory, more occupancy - measured 0.91x: the extra
+        // shifts cost more than the occupancy gains. 32-bit counters stay.)
+        #define PH_INC(bb) { SC[(((bb) >> 30) * 5 + (bb) % 5) * 256 + threadIdx.x]++; }
+        #pragma unroll
+        for (int k = 0; k < 20; k++) SC[k * 256 + threadIdx.x] = 0;
+        // b in ONE multiply-add: ((K >> 17) + (y << 3)) mod 2^31 with y = x * M mod 2^28, x = ((H0 + c) mod 2^28) ^ C'
+        // equals ((((H0 + c) ^ C') * 8M) + (K >> 17)) mod 2^31 in plain uint32 arithmetic: dropping the two mod 2^28
+        // masks changes x or x * M only by multiples of 2^28, i.e. the product times 8 by multiples of 2^31, which
+        // the final & 0x7FFFFFFF removes (C' < 2^28, so the xor never touches those bits).
+        const uint32_t M8 = (uint32_t)(PH_M << 4), CX = (uint32_t)(PH_C >> 20);
+        // two chunks per 128-bit broadcast load (one shared transaction for two steps)
+        const uint4* KH4 = reinterpret_cast<const uint4*>(KH);
+        int i0 = 0;
+        for (; i0 + 3 < m; i0 += 4) {
+            const uint4 ka = KH4[i0 >> 1], kb = KH4[(i0 >> 1) + 1];
+            const uint32_t b0 = ((ka.y + c) ^ CX) * M8 + ka.x, b1 = ((ka.w + c) ^ CX) * M8 + ka.z;
+            const uint32_t b2 = ((kb.y + c) ^ CX) * M8 + kb.x, b3 = ((kb.w + c) ^ CX) * M8 + kb.z;
+            PH_INC(b0); PH_INC(b1); PH_INC(b2); PH_INC(b3);
+        }
+        for (int i = i0; i + 1 < m; i += 2) {
+            const uint4 kh = KH4[i >> 1];
+            const uint32_t b0 = ((kh.y + c) ^ CX) * M8 + kh.x, b1 = ((kh.w + c) ^ CX) * M8 + kh.z;
+            PH_INC(b0); PH_INC(b1);                               // b is even here
+        }
+        if (m & 1) {                                              // odd count: the last chunk alone
+            const uint2 kh = KH[m - 1];
+            const uint32_t b = ((kh.y + c) ^ CX) * M8 + kh.x;
+            PH_INC(b);
+        }
+#undef PH_INC
+        auto cnt = [&](int bin) -> uint64_t { return SC[bin * 256 + threadIdx.x]; };
+        uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        #pragma unroll
+        for (int r = 0; r < 5; r++) {
+            const int d = (2 * r) % 5;
+            c0 |= cnt(0 * 5 + d) << (8 * r); c1 |= cnt(1 * 5 + d) << (8 * r);
+            c2 |= cnt(2 * 5 + d) << (8 * r); c3 |= cnt(3 * 5 + d) << (8 * r);
+        }
+        if (phaseBoundFrom(c0, c1, c2, c3) >= T) {
+            unsigned int q = atomicAdd(qCount, 1u);
+            if (q < qCap) queue[q] = (unsigned long long)g;
+        }
+    }
+}
+// BIT-SLICED BOUND (2026-09-22). A thread takes 32 CONSECUTIVE classes c = base + j (base = 0 mod 32) of one family.
+// For one chunk, with A = H0 + base and a = H0 mod 32, (A + j) is (A - a) + (a + j) or, once a + j >= 32, (A - a + 32)
+// + (a + j - 32); so x_j = X_k + e_j with X_k = (A - a + 32k) ^ (C' & ~31), k = carry, e_j = ((a + j) mod 32) ^ (C' mod 32),
+// and b2_j = 2 B(0) = (X_k 16M + 2 (K >> 17)) + e_j 16M = Bk + D(e_j) (mod 2^32). With beta = Bk mod 5 and a wrap
+// w = [Bk + D >= 2^32] (2^32 = 1 mod 5): b2_j mod 5 = beta + (D mod 5) - w, and the half is bit 31 of Bk + D. Both
+// are fixed for every e between the 64 breakpoints -D and 2^31 - D, so one table row (interval of Bk) gives, for all
+// 32 classes at once, a mask per residue and the half mask - indexed by p = (a + j) mod 32, i.e. rotated right by a.
+// Masks add into 8-plane bit-sliced counters of the HALVES bound max_r max(N_r + hi_r+3, lo_r + N_r+3), which is
+// >= the quarter bound, so every class phaseBoundKernel queues is queued here too (the exact pass decides).
+#define BS_NI 72
+__device__ __forceinline__ void bsAdd2(uint32_t (&c)[8], uint32_t a, uint32_t b) {
+    uint32_t k = (c[0] & a) | (c[0] & b) | (a & b); c[0] ^= a ^ b;
+    #pragma unroll
+    for (int i = 1; i < 8; i++) { const uint32_t t = c[i] & k; c[i] ^= k; k = t; }
+}
+__device__ __forceinline__ void bsAdd1(uint32_t (&c)[8], uint32_t a) {
+    uint32_t k = a;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { const uint32_t t = c[i] & k; c[i] ^= k; k = t; }
+}
+__device__ __forceinline__ uint32_t bsGe(const uint32_t (&c)[8], int T) {
+    if (T <= 0) return 0xFFFFFFFFu;
+    if (T > 255) return 0u;
+    uint32_t gt = 0, eq = 0xFFFFFFFFu;
+    #pragma unroll
+    for (int i = 7; i >= 0; i--) { if ((T >> i) & 1) eq &= c[i]; else { gt |= eq & c[i]; eq &= ~c[i]; } }
+    return gt | eq;
+}
+__device__ uint32_t gBsV10[BS_NI * 10], gBsHM[BS_NI], gBsBP[BS_NI];
+__device__ __align__(16) uint8_t gBsBK[4096];
+__device__ int gBsNBP;
+// the tables depend only on M and C': built once on the host, copied into each block's shared memory
+static void bsEnsureTables() {
+    static bool done = false; if (done) return; done = true;
+    const uint32_t M16 = (uint32_t)(PH_M << 4), CX = (uint32_t)(PH_C >> 20), CXL = CX & 31u;
+    std::vector<uint32_t> bp;
+    for (int e = 0; e < 32; e++) { const uint32_t D = (uint32_t)e * M16; bp.push_back(0u - D); bp.push_back(0x80000000u - D); }
+    std::sort(bp.begin(), bp.end()); bp.erase(std::unique(bp.begin(), bp.end()), bp.end());
+    const int nbp = (int)bp.size();
+    std::vector<uint32_t> BP(BS_NI, 0xFFFFFFFFu), V10(BS_NI * 10, 0), HM(BS_NI, 0); std::vector<uint8_t> BK(4096);
+    for (int i = 0; i < nbp; i++) BP[i] = bp[i];
+    for (int I = 0; I <= nbp; I++) {
+        const uint32_t s0 = I ? BP[I - 1] : 0u; uint32_t v[5] = {0, 0, 0, 0, 0}, h = 0;
+        for (int p = 0; p < 32; p++) {
+            const uint32_t D = (p ^ CXL) * M16, sum = s0 + D, k = (sum % 5u + 5u - s0 % 5u) % 5u;
+            v[k] |= 1u << p; if (sum >> 31) h |= 1u << p;
+        }
+        for (int q = 0; q < 10; q++) V10[I * 10 + q] = v[q % 5];
+        HM[I] = h;
+    }
+    for (int k = 0; k < 4096; k++) { const uint32_t x = (uint32_t)k << 20; int c = 0; while (c < nbp && BP[c] <= x) c++; BK[k] = (uint8_t)c; }
+    CUDA_CHECK(cudaMemcpyToSymbol(gBsV10, V10.data(), V10.size() * 4)); CUDA_CHECK(cudaMemcpyToSymbol(gBsHM, HM.data(), HM.size() * 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(gBsBP, BP.data(), BP.size() * 4)); CUDA_CHECK(cudaMemcpyToSymbol(gBsBK, BK.data(), 4096));
+    CUDA_CHECK(cudaMemcpyToSymbol(gBsNBP, &nbp, sizeof(int)));
+}
+__global__ void __launch_bounds__(256, 2)
+phaseBoundBSKernel(const uint64_t* __restrict__ Pg, int n, const uint32_t* __restrict__ fams,
+                   long long itemBase, long long items, int T,
+                   unsigned long long* __restrict__ queue, unsigned int* __restrict__ qCount, unsigned int qCap) {
+    __shared__ uint32_t V10[BS_NI * 10], HM[BS_NI], BP[BS_NI];
+    __shared__ __align__(16) uint8_t BK[4096];
+    __shared__ __align__(16) uint4 CH[228];
+    __shared__ int nPoss, nBP, nS;
+    __shared__ uint16_t sL[1024];
+    const uint32_t M16 = (uint32_t)(PH_M << 4), CX = (uint32_t)(PH_C >> 20), CXH = CX & ~31u;
+    for (int k = threadIdx.x; k < BS_NI * 10; k += blockDim.x) V10[k] = gBsV10[k];
+    for (int k = threadIdx.x; k < BS_NI; k += blockDim.x) { HM[k] = gBsHM[k]; BP[k] = gBsBP[k]; }
+    for (int k = threadIdx.x; k < 1024; k += blockDim.x) reinterpret_cast<uint32_t*>(BK)[k] = reinterpret_cast<const uint32_t*>(gBsBK)[k];
+    if (threadIdx.x == 0) nBP = gBsNBP;
+    __syncthreads();
+    const int nbp = nBP;
+    const long long tiles = items >> 13;
+    for (long long tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+        const long long g0 = itemBase + (tile << 13);
+        const uint64_t fam = fams[g0 >> 15];
+        __syncthreads();
+        if (threadIdx.x == 0) { nPoss = 0; nS = 0; }
+        __syncthreads();
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const uint64_t Q = (fam + Pg[i]) & PH_MK;
+            const uint64_t k = (((Q & 0xFFFFF) ^ (PH_C & 0xFFFFF)) * PH_M + 0xBULL) & PH_MK;
+            if (!((k >> 17) & 1)) {
+                const int j = atomicAdd(&nPoss, 1); const uint32_t H0 = (uint32_t)(Q >> 20), a = H0 & 31u;
+                CH[j] = make_uint4((uint32_t)((k >> 17) << 1), H0 & ~31u, a, (1u << a) - 1u);
+            }
+        }
+        __syncthreads();
+        const int m = nPoss;
+        const uint32_t cbase = (uint32_t)((g0 & 0x7FFF) + 32 * threadIdx.x);
+        uint32_t cA[5][8], cB[5][8];
+        #pragma unroll
+        for (int r = 0; r < 5; r++) {
+            #pragma unroll
+            for (int i = 0; i < 8; i++) { cA[r][i] = 0; cB[r][i] = 0; }
+        }
+        auto masks = [&](const uint4 ch, uint32_t (&P)[5], uint32_t& Hm) {
+            const uint32_t t = ch.y + cbase;
+            const uint32_t b0 = (t ^ CXH) * M16 + ch.x, b1 = ((t + 32u) ^ CXH) * M16 + ch.x;
+            int I0 = BK[b0 >> 20]; while (BP[I0] <= b0 && I0 < nbp) I0++;
+            int I1 = BK[b1 >> 20]; while (BP[I1] <= b1 && I1 < nbp) I1++;
+            const uint32_t be0 = b0 % 5u, be1 = b1 % 5u;
+            const int o0 = I0 * 10 + (be0 ? 5 - (int)be0 : 0), o1 = I1 * 10 + (be1 ? 5 - (int)be1 : 0);
+            const uint32_t pm = ch.w, sh = ch.z;
+            #pragma unroll
+            for (int q = 0; q < 5; q++) { const uint32_t x = (V10[o0 + q] & ~pm) | (V10[o1 + q] & pm); P[q] = __funnelshift_r(x, x, sh); }
+            const uint32_t hx = (HM[I0] & ~pm) | (HM[I1] & pm); Hm = __funnelshift_r(hx, hx, sh);
+        };
+        int i = 0;
+        for (; i + 1 < m; i += 2) {
+            uint32_t P0[5], P1[5], H0m, H1m;
+            masks(CH[i], P0, H0m); masks(CH[i + 1], P1, H1m);
+            #pragma unroll
+            for (int ph = 0; ph < 5; ph++) {
+                const int ra = (2 * ph) % 5, rb = (2 * ((ph + 3) % 5)) % 5;
+                bsAdd2(cA[ph], P0[ra] | (P0[rb] & H0m), P1[ra] | (P1[rb] & H1m));
+                bsAdd2(cB[ph], (P0[ra] & ~H0m) | P0[rb], (P1[ra] & ~H1m) | P1[rb]);
+            }
+        }
+        if (i < m) {
+            uint32_t P0[5], H0m; masks(CH[i], P0, H0m);
+            #pragma unroll
+            for (int ph = 0; ph < 5; ph++) {
+                const int ra = (2 * ph) % 5, rb = (2 * ((ph + 3) % 5)) % 5;
+                bsAdd1(cA[ph], P0[ra] | (P0[rb] & H0m)); bsAdd1(cB[ph], (P0[ra] & ~H0m) | P0[rb]);
+            }
+        }
+        uint32_t surv = 0;
+        #pragma unroll
+        for (int ph = 0; ph < 5; ph++) surv |= bsGe(cA[ph], T) | bsGe(cB[ph], T);
+        // Survivors of the halves bound (~0.1%) get the QUARTER bound of phaseBoundKernel, one warp each: the queue
+        // is then the same set phaseBoundKernel writes. Rounds of up to 1024 when a tile has more.
+        const int lane = threadIdx.x & 31;
+        while (__syncthreads_or(surv != 0)) {
+            if (threadIdx.x == 0) nS = 0;
+            __syncthreads();
+            while (surv) {
+                const int j = __ffs(surv) - 1;
+                const int s = atomicAdd(&nS, 1);
+                if (s >= 1024) break;
+                sL[s] = (uint16_t)(32 * threadIdx.x + j); surv &= surv - 1;
+            }
+            __syncthreads();
+            const int ns = min(nS, 1024);
+            for (int s = threadIdx.x >> 5; s < ns; s += 8) {
+                const uint32_t cs = (uint32_t)((g0 & 0x7FFF) + sL[s]);
+                uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                for (int k = lane; k < m; k += 32) {
+                    const uint4 ch = CH[k];
+                    phaseAccumulate((((ch.y + ch.z + cs) ^ CX) * M16 + ch.x) >> 1, c0, c1, c2, c3);
+                }
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    c0 += __shfl_xor_sync(0xFFFFFFFFu, c0, off); c1 += __shfl_xor_sync(0xFFFFFFFFu, c1, off);
+                    c2 += __shfl_xor_sync(0xFFFFFFFFu, c2, off); c3 += __shfl_xor_sync(0xFFFFFFFFu, c3, off);
+                }
+                if (lane == 0 && phaseBoundFrom(c0, c1, c2, c3) >= T) {
+                    const unsigned int q = atomicAdd(qCount, 1u);
+                    if (q < qCap) queue[q] = (unsigned long long)(g0 + sL[s]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+// CLASS HEAT, family-split: a tile is one random family (seed bits 0-19) x 256 of its classes, so the
+// per-chunk 48-bit work (K, H0, parity) is done once per tile and each class costs one 32-bit
+// multiply-add per POSSIBLE chunk - the phaseBoundKernel arithmetic. Survivors of the quarter bound get
+// heatClassHits. The tile is the independent sample: outSq sums squared tile totals.
+__global__ void __launch_bounds__(256)
+heatFamKernel(const int* __restrict__ cxs, const int* __restrict__ czs, int n, long long tiles, int T, uint64_t seedBase,
+              unsigned long long* __restrict__ outSum, unsigned long long* __restrict__ outSq, unsigned long long* __restrict__ outBound) {
+    const int sp = blockIdx.x; if (sp >= n) return;
+    __shared__ uint64_t P[197];
+    __shared__ __align__(16) uint2 KH[198];
+    __shared__ int nPoss;
+    __shared__ unsigned long long tS;
+    __shared__ uint32_t SC[20 * 256];
+    const long long cx = cxs[sp], cz = czs[sp];
+    for (int i = threadIdx.x; i < 197; i += blockDim.x) P[i] = posOffset(cx + cDiscDX[i], cz + cDiscDZ[i]);
+    const uint64_t base = (seedBase ^ ((uint64_t)cz * 0xD6E8FEB86659FD93ULL)) + (uint64_t)cx * 0x9E3779B97F4A7C15ULL;
+    unsigned long long S = 0, Q = 0, NB = 0;
+    const uint32_t M8 = (uint32_t)(PH_M << 3), CX = (uint32_t)(PH_C >> 20);
+    for (long long t = 0; t < tiles; t++) {
+        const uint64_t rnd = splitmix64(base + (uint64_t)t);
+        const uint64_t fam = rnd & 0xFFFFF;
+        const uint32_t c = (uint32_t)(((rnd >> 20) + threadIdx.x) & 0x7FFF);
+        __syncthreads();
+        if (threadIdx.x == 0) { nPoss = 0; tS = 0; }
+        __syncthreads();
+        for (int i = threadIdx.x; i < 197; i += blockDim.x) {
+            const uint64_t Qv = (fam + P[i]) & PH_MK;
+            const uint64_t k = (((Qv & 0xFFFFF) ^ (PH_C & 0xFFFFF)) * PH_M + 0xBULL) & PH_MK;
+            if (!((k >> 17) & 1)) { const int j = atomicAdd(&nPoss, 1); KH[j] = make_uint2((uint32_t)(k >> 17), (uint32_t)(Qv >> 20)); }
+        }
+        __syncthreads();
+        const int m = nPoss;
+        #pragma unroll
+        for (int k = 0; k < 20; k++) SC[k * 256 + threadIdx.x] = 0;
+        for (int i = 0; i < m; i++) {
+            const uint2 kh = KH[i];
+            const uint32_t b = (((kh.y + c) ^ CX) * M8 + kh.x) & 0x7FFFFFFFu;
+            SC[((b >> 29) * 5 + b % 5) * 256 + threadIdx.x]++;
+        }
+        uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+        #pragma unroll
+        for (int r = 0; r < 5; r++) {
+            c0 |= (uint64_t)SC[(0 * 5 + r) * 256 + threadIdx.x] << (8 * r); c1 |= (uint64_t)SC[(1 * 5 + r) * 256 + threadIdx.x] << (8 * r);
+            c2 |= (uint64_t)SC[(2 * 5 + r) * 256 + threadIdx.x] << (8 * r); c3 |= (uint64_t)SC[(3 * 5 + r) * 256 + threadIdx.x] << (8 * r);
+        }
+        if (m >= T && phaseBoundFrom(c0, c1, c2, c3) >= T) {
+            const int h = heatClassHits(P, 197, fam | ((uint64_t)c << 20), T);
+            NB++;
+            if (h) atomicAdd(&tS, (unsigned long long)h);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) { S += tS; Q += tS * tS; }
+    }
+    if (threadIdx.x == 0) { outSum[sp] = S; outSq[sp] = Q; }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) NB += __shfl_down_sync(0xFFFFFFFFu, NB, off);
+    __syncthreads();
+    if (threadIdx.x == 0) tS = 0;
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0) atomicAdd(&tS, NB);
+    __syncthreads();
+    if (threadIdx.x == 0) outBound[sp] = tS;
+}// Pass 2: exact best of each queued class.
+__global__ void phaseExactKernel(const uint64_t* __restrict__ Pg, int n, const uint32_t* __restrict__ fams,
+                                 const unsigned long long* __restrict__ queue, unsigned int nq,
+                                 int* __restrict__ outBest, int* __restrict__ outW,
+                                 const int* __restrict__ Wg = nullptr, int* __restrict__ outBlocks = nullptr,
+                                 int* __restrict__ outWB = nullptr, int* __restrict__ outCntB = nullptr,
+                                 int T = 1 << 30, unsigned int* eN = nullptr, unsigned int eCap = 0,
+                                 unsigned int* eQ = nullptr, int* eW = nullptr, int* eCnt = nullptr, int* eBlk = nullptr) {
+    unsigned int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nq) return;
+    const long long g = (long long)queue[q];
+    const uint64_t s35 = (uint64_t)fams[g >> 15] | ((uint64_t)(g & 0x7FFF) << 20);
+    int w, bl = 0, wb = 0, cb = 0;
+    PhaseEmit em = { eN, eCap, q, eQ, eW, eCnt, eBlk, T };
+    outBest[q] = phaseBestOfClass(Pg, n, s35, &w, Wg, &bl, &wb, &cb, eN ? &em : nullptr); outW[q] = w;
+    if (Wg) { outBlocks[q] = bl; outWB[q] = wb; outCntB[q] = cb; }
+}
+static uint32_t phaseMinv13() {                 // M^-1 mod 2^13 (M is odd)
+    uint64_t inv = 1; for (int i = 0; i < 6; i++) inv *= 2 - PH_M * inv;
+    return (uint32_t)(inv & 0x1FFF);
+}
+static void phaseOffsets(long long cx, long long cz, std::vector<uint64_t>& P) {
+    P.resize(g_dx.size());
+    for (size_t i = 0; i < g_dx.size(); i++) P[i] = posOffset(cx + g_dx[i], cz + g_dz[i]);
+}
+static std::vector<int> phaseWeights() {                // eligible blocks per spawn cell, g_dx order
+    int wt[17 * 17]; buildBlockWeights(wt); std::vector<int> w(g_dx.size());
+    for (size_t i = 0; i < g_dx.size(); i++) w[i] = wt[(g_dz[i] + 8) * 17 + (g_dx[i] + 8)];
+    return w;
+}
+// families kept at one AFK position: low-18-bit residues whose possible count is in the top
+// topPct percent (ties kept), x4 for bits 18-19. Every known record family ranks in the top 1.6%.
+static void phaseFamilies(const uint64_t* dP, int n, double topPct, std::vector<uint32_t>& fams, int& cutN,
+                          std::vector<uint8_t>* possOut = nullptr, std::vector<double>* pctOut = nullptr) {
+    uint8_t* dN; CUDA_CHECK(cudaMalloc(&dN, 1 << 18));
+    phasePossibleKernel<<<(1 << 18) / 256, 256>>>(dP, n, dN);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<uint8_t> hN(1 << 18);
+    CUDA_CHECK(cudaMemcpy(hN.data(), dN, 1 << 18, cudaMemcpyDeviceToHost)); cudaFree(dN);
+    long long hist[256] = {0}; for (int i = 0; i < (1 << 18); i++) hist[hN[i]]++;
+    long long want = (long long)std::ceil((topPct / 100.0) * (1 << 18)), acc = 0; cutN = 255;
+    for (int v = 255; v >= 0; v--) { acc += hist[v]; cutN = v; if (acc >= want) break; }
+    fams.clear();
+    for (int k = 0; k < 4; k++) for (int i = 0; i < (1 << 18); i++) if (hN[i] >= cutN) fams.push_back((uint32_t)(i + (k << 18)));
+    if (possOut) *possOut = hN;
+    if (pctOut) {   // pct[v] = share of families with a possible count of v or more (the family's rank, in %)
+        pctOut->assign(256, 0.0); long long a = 0;
+        for (int v = 255; v >= 0; v--) { a += hist[v]; (*pctOut)[v] = 100.0 * a / (double)(1 << 18); }
+    }
+}
+// ADAPTIVE POSITIONS: number of families with >= thr possible chunks at AFK chunk (cx, cz). Around
+// one spot this predicted where the big layouts are (r = 0.81); searching only the top 10 of 15
+// positions by it kept every spot's best layout in a 36-spot test.
+static long long phasePositionScore(long long cx, long long cz, int thr) {
+    std::vector<uint64_t> P; phaseOffsets(cx, cz, P); const int n = (int)P.size();
+    uint64_t* dP; CUDA_CHECK(cudaMalloc(&dP, n * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpy(dP, P.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    uint8_t* dN; CUDA_CHECK(cudaMalloc(&dN, 1 << 18));
+    phasePossibleKernel<<<(1 << 18) / 256, 256>>>(dP, n, dN);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<uint8_t> hN(1 << 18);
+    CUDA_CHECK(cudaMemcpy(hN.data(), dN, 1 << 18, cudaMemcpyDeviceToHost));
+    cudaFree(dN); cudaFree(dP);
+    long long c = 0; for (int i = 0; i < (1 << 18); i++) c += hN[i] >= thr;
+    return c * 4;                                        // bits 18-19 of the family do not change parity
+}
+struct PhaseHit { long long seed; int count, dx, dz; uint32_t fam, cls; int blocks, blocks39, bestCount, possible; double rankPct; };
+// The RAISED-AFK weighting (feet at y -39 over the -64 floor, dy = 24): 24^2 <= a^2 + b^2 + dy^2 <= 128^2 becomes
+// 0 <= a^2 + b^2 <= 15808 - no inner no-spawn circle, outer radius 125.73 (afk_rescan makeRing; a full floor reads
+// 49,669, exactly the in-game number). This is what /perimeterinfo actually counts at the player's AFK spot, and it
+// ranks farms far better than either the chunk count or the cq blocks: against the true -39 number of 303 filed
+// farms, corr +0.74 vs +0.37 (cq blocks) and +0.21 (chunks) - docs\PREDICTION.txt section 10.
+// The four chunks touching the AFK column are NOT in the spawn mask: at dy = 0 they lie entirely inside
+// the 24-block exclusion sphere, so g_dx has 222 cells, not 226. At dy = 24 they are the first thing the
+// game counts - each is a full 256-column square well inside the circle. Scoring only the mask would read
+// 48,645 for a full floor instead of 49,669 and would make two layouts that differ only in the middle tie,
+// which is the exact difference the raised AFK exists to see (the 69.30's 4 middle chunks, +3.8% in game).
+// So the -39 score is the 222 mask cells PLUS those four, added from their own offsets.
+static std::vector<int> phaseWeights39() {
+    std::vector<int> w(g_dx.size()); long long tot = 0;
+    for (size_t i = 0; i < g_dx.size(); i++) { int c = 0;
+        for (int a0 = 0; a0 < 16; a0++) for (int b0 = 0; b0 < 16; b0++) {
+            const long long a = 16LL * g_dx[i] + a0, b = 16LL * g_dz[i] + b0;
+            if (a * a + b * b <= 15808LL) c++; }
+        w[i] = c; tot += c; }
+    if (tot + 4LL * 256 != 49669) {
+        fprintf(stderr, "y-39 weights sum to %lld + 1024, not the in-game 49669, aborting\n", tot); exit(1); }
+    return w;
+}
+static void phaseMidOffsets39(long long cx, long long cz, uint64_t out[SLIME_EXCLUDED_N]) {
+    for (int i = 0; i < SLIME_EXCLUDED_N; i++) { int ex, ez; excludedCell(i, ex, ez);
+        out[i] = posOffset(cx + ex, cz + ez); }
+}
+static void bsVerify(const uint64_t* dP, const std::vector<uint64_t>& P, int n, const uint32_t* dF, const std::vector<uint32_t>& fams,
+                     long long base, long long items, int T, const unsigned long long* dQ, unsigned int nq) {
+    std::vector<unsigned long long> bs(nq); CUDA_CHECK(cudaMemcpy(bs.data(), dQ, nq * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    std::sort(bs.begin(), bs.end());
+    const unsigned int cap = 1u << 24; unsigned long long* dQ2; unsigned int* dN2;
+    CUDA_CHECK(cudaMalloc(&dQ2, cap * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dN2, sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(dN2, 0, sizeof(unsigned int)));
+    phaseBoundKernel<<<20 * 48, 256>>>(dP, n, dF, base, items, T, dQ2, dN2, cap);
+    CUDA_CHECK(cudaGetLastError());
+    unsigned int n2 = 0; CUDA_CHECK(cudaMemcpy(&n2, dN2, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    std::vector<unsigned long long> q4(n2); CUDA_CHECK(cudaMemcpy(q4.data(), dQ2, n2 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    cudaFree(dQ2); cudaFree(dN2);
+    std::sort(q4.begin(), q4.end()); long long missing = (q4 == bs) ? 0 : 1;
+    long long fams2 = 0, bad = 0, cpuPass = 0;
+    for (long long g0 = base; g0 < base + items && fams2 < 2; g0 += 32768, fams2++) {
+        const uint64_t fam = fams[g0 >> 15];
+        for (int c = 0; c < 32768; c++) {
+            int N[5] = {0}, H[5] = {0};
+            const uint64_t s35 = fam | ((uint64_t)c << 20);
+            for (int i = 0; i < n; i++) { const uint32_t b = phaseB0(s35, P[i]); if (b & 1) continue; N[b % 5]++; H[b % 5] += (b >> 30) & 1; }
+            int U = 0; for (int r = 0; r < 5; r++) { const int r3 = (r + 3) % 5; U = std::max(U, std::max(N[r] + H[r3], N[r] - H[r] + N[r3])); }
+            const bool pass = U >= T && std::binary_search(q4.begin(), q4.end(), (unsigned long long)(g0 + c)), got = std::binary_search(bs.begin(), bs.end(), (unsigned long long)(g0 + c));
+            cpuPass += pass; bad += pass != got;
+        }
+    }
+    printf("    BS CHECK: new queue %u, old quarter queue %u, sets differ %lld; CPU halves bound AND old quarter on %lld families: %lld pass, %lld mismatches -> %s\n",
+           nq, n2, missing, fams2, cpuPass, bad, (missing || bad) ? "FAIL" : "OK");
+    if (missing || bad) exit(1);
+}
+// Every class of the kept families at AFK chunk (cx, cz): returns classes whose best >= T.
+static void phaseSearchPosition(long long cx, long long cz, int dx, int dz, int T, double topPct,
+                                std::vector<PhaseHit>& hits, long long& classesDone, long long& survivors, int& cutN, size_t& famCount) {
+    std::vector<uint64_t> P; phaseOffsets(cx, cz, P); const int n = (int)P.size();
+    static const std::vector<int> W39 = phaseWeights39();     // g_dx is fixed for the whole run
+    uint64_t Pmid[SLIME_EXCLUDED_N]; phaseMidOffsets39(cx, cz, Pmid);
+    uint64_t* dP; CUDA_CHECK(cudaMalloc(&dP, n * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpy(dP, P.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    std::vector<uint32_t> fams; std::vector<uint8_t> poss; std::vector<double> pct;
+    phaseFamilies(dP, n, topPct, fams, cutN, &poss, &pct); famCount = fams.size();
+    uint32_t* dF; CUDA_CHECK(cudaMalloc(&dF, fams.size() * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(dF, fams.data(), fams.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    const unsigned int qCap = 1u << 22;
+    const unsigned int eCap = 1u << 23;
+    // The fixed-size work buffers (~200 MB) are allocated ONCE per process and reused by every position:
+    // they were allocated and freed at each of the ~10 positions of a spot. Same contents are written before
+    // they are read at every position (counters reset by cudaMemset), so results cannot depend on reuse.
+    static unsigned long long* dQ = nullptr; static unsigned int *dQN = nullptr, *dEN = nullptr, *dEQ = nullptr;
+    static int *dB = nullptr, *dW = nullptr, *dBl = nullptr, *dWB = nullptr, *dCB = nullptr, *dWt = nullptr, *dEW = nullptr, *dEC = nullptr, *dEB = nullptr;
+    if (!dQ) {
+        CUDA_CHECK(cudaMalloc(&dQ, qCap * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dQN, sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&dB, qCap * sizeof(int))); CUDA_CHECK(cudaMalloc(&dW, qCap * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&dBl, qCap * sizeof(int))); CUDA_CHECK(cudaMalloc(&dWB, qCap * sizeof(int))); CUDA_CHECK(cudaMalloc(&dCB, qCap * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&dEN, sizeof(unsigned int))); CUDA_CHECK(cudaMalloc(&dEQ, eCap * sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc(&dEW, eCap * sizeof(int))); CUDA_CHECK(cudaMalloc(&dEC, eCap * sizeof(int))); CUDA_CHECK(cudaMalloc(&dEB, eCap * sizeof(int)));
+        const std::vector<int> wts0 = phaseWeights();
+        CUDA_CHECK(cudaMalloc(&dWt, wts0.size() * sizeof(int))); CUDA_CHECK(cudaMemcpy(dWt, wts0.data(), wts0.size() * sizeof(int), cudaMemcpyHostToDevice));
+    }
+    std::vector<unsigned int> hEQ; std::vector<int> hEW, hEC, hEB;
+    const uint32_t minv = phaseMinv13();
+    const long long total = (long long)fams.size() << 15;
+    long long chunk = 1LL << 27;                          // items per launch (~0.5 s): no display-watchdog risk
+    std::vector<unsigned long long> hQ; std::vector<int> hB, hW, hBl, hWB, hCB;
+    for (long long base = 0; base < total; ) {
+        long long items = std::min(chunk, total - base);
+        CUDA_CHECK(cudaMemset(dQN, 0, sizeof(unsigned int)));
+        static const int bsMode = getenv("PH_BS") ? atoi(getenv("PH_BS")) : 1, bsCheck = getenv("PH_BS_CHECK") ? atoi(getenv("PH_BS_CHECK")) : 0;
+        if (bsMode) bsEnsureTables(), phaseBoundBSKernel<<<20 * 48, 256>>>(dP, n, dF, base, items, T, dQ, dQN, qCap);
+        else phaseBoundKernel<<<20 * 48, 256>>>(dP, n, dF, base, items, T, dQ, dQN, qCap);
+        CUDA_CHECK(cudaGetLastError());
+        unsigned int nq = 0; CUDA_CHECK(cudaMemcpy(&nq, dQN, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        if (nq > qCap) { chunk /= 4; if (chunk < 32768) { fprintf(stderr, "phase search: survivor queue overflow\n"); exit(1); } continue; }  // redo smaller
+        if (bsCheck && bsMode) bsVerify(dP, P, n, dF, fams, base, items, T, dQ, nq);
+        survivors += nq;
+        if (nq) {
+            CUDA_CHECK(cudaMemset(dEN, 0, sizeof(unsigned int)));
+            phaseExactKernel<<<(nq + 127) / 128, 128>>>(dP, n, dF, dQ, nq, dB, dW, dWt, dBl, dWB, dCB, T, dEN, eCap, dEQ, dEW, dEC, dEB);
+            CUDA_CHECK(cudaGetLastError());
+            unsigned int ne = 0; CUDA_CHECK(cudaMemcpy(&ne, dEN, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+            if (ne > eCap) { fprintf(stderr, "phase search: layout list overflow (%u > %u) - raise eCap\n", ne, eCap); exit(1); }
+            hEQ.resize(ne); hEW.resize(ne); hEC.resize(ne); hEB.resize(ne);
+            if (ne) {
+                CUDA_CHECK(cudaMemcpy(hEQ.data(), dEQ, ne * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hEW.data(), dEW, ne * sizeof(int), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hEC.data(), dEC, ne * sizeof(int), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hEB.data(), dEB, ne * sizeof(int), cudaMemcpyDeviceToHost));
+            }
+            hQ.resize(nq); hB.resize(nq); hW.resize(nq); hBl.resize(nq); hWB.resize(nq); hCB.resize(nq);
+            CUDA_CHECK(cudaMemcpy(hQ.data(), dQ, nq * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hB.data(), dB, nq * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hBl.data(), dBl, nq * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hWB.data(), dWB, nq * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hCB.data(), dCB, nq * sizeof(int), cudaMemcpyDeviceToHost));
+            // one hit per emitted LAYOUT (every segment of a class reaching T), not per class
+            for (unsigned int k = 0; k < ne; k++) {
+                const unsigned int q = hEQ[k];
+                const long long g = (long long)hQ[q];
+                PhaseHit h; h.fam = fams[g >> 15]; h.cls = (uint32_t)(g & 0x7FFF);
+                const uint64_t v = ((uint64_t)hEW[k] * minv) & 0x1FFF;
+                h.seed = (long long)((uint64_t)h.fam | ((uint64_t)h.cls << 20) | (v << 35));
+                h.count = hEC[k]; h.blocks = hEB[k]; h.bestCount = hB[q]; h.dx = dx; h.dz = dz;
+                { int b39 = 0;                                                // the -39 blocks of this layout, on the host
+                  for (int i = 0; i < n; i++) if (slimeFromOffset(h.seed, P[i])) b39 += W39[i];
+                  for (int i = 0; i < SLIME_EXCLUDED_N; i++) if (slimeFromOffset(h.seed, Pmid[i])) b39 += 256;
+                  h.blocks39 = b39; }
+                h.possible = poss[h.fam & 0x3FFFF]; h.rankPct = pct[h.possible]; hits.push_back(h);
+            }
+        }
+        base += items; classesDone += items;
+    }
+    cudaFree(dP); cudaFree(dF);                          // the shared work buffers stay for the next position
+}
+// ---------------------------------------------------------------------------
+// UNION-WINDOW PHASE SEARCH (--phase-union). The SAME result as phaseSearchPosition at every grid
+// position, with less work: neighbouring positions (3 chunks apart) share most of their chunks and
+// most of their kept families, and a chunk's B(0) depends only on (family, class, chunk) - not on
+// the position. So each family is taken ONCE over the union of the windows of the positions that
+// keep it: every B(0) is computed once and added to the (quarter, phase) counter of each of those
+// positions whose window holds the chunk. Per position the counters are exactly the old ones, so
+// the bound, the queued (class, position) pairs and the exact pass are unchanged (self-test [8]).
+// Counters: one byte per (position, bin), packed four to a 32-bit word that only its own thread
+// touches ([word][thread] - no bank conflicts); a count never exceeds 222 < 256.
+// MEASURED 2026-09-13 (laptop-class GPU, 10 positions): identical output on 5 real spots, but SLOWER -
+// 27.4 s vs 16.7 s per spot. The union cuts the B(0) work ~2.6x (509 chunks for 10 positions, each
+// family kept at ~4 of them), yet the per-position counters (200 B per thread) drop occupancy to 12
+// warps/SM (old kernel: 32), and the extra increments then cost ~15 s (probe with one increment per
+// chunk: 12.2 s). Off by default; may pay on a GPU with more shared memory per SM.
+// ---------------------------------------------------------------------------
+#define PU_MAXPOS  16
+#define PU_THREADS 128
+__global__ void __launch_bounds__(PU_THREADS)
+phaseUnionBoundKernel(const uint64_t* __restrict__ PU, const uint16_t* __restrict__ membU, int nU,
+                      const uint32_t* __restrict__ fams, const uint16_t* __restrict__ famMask,
+                      long long itemBase, long long items, int T,
+                      unsigned long long* __restrict__ queue, unsigned int* __restrict__ qCount, unsigned int qCap) {
+    extern __shared__ uint32_t shU[];
+    uint32_t* K17 = shU;                                             // [nU]  K >> 17 per possible chunk (32-bit loop, see phaseBoundKernel)
+    uint32_t* H0 = K17 + nU;                                         // [nU]
+    uint16_t* MB = (uint16_t*)(H0 + nU);                             // [nU]  positions (of this family) holding the chunk
+    uint32_t* SC = (uint32_t*)(((uintptr_t)(MB + nU) + 15) & ~(uintptr_t)15);   // [pos * 5 + word][thread]
+    __shared__ int nPoss;
+    const long long tiles = items / PU_THREADS;                     // items and itemBase: multiples of 32768
+    for (long long tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+        const long long g0 = itemBase + tile * PU_THREADS;
+        const long long fi = g0 >> 15;
+        const uint64_t fam = fams[fi]; const uint32_t fmask = famMask[fi];
+        __syncthreads();                                             // previous tile's readers are done
+        if (threadIdx.x == 0) nPoss = 0;
+        __syncthreads();
+        // the family's possible chunks in the union of ITS positions' windows (parity = bit 17 of K)
+        for (int u = threadIdx.x; u < nU; u += blockDim.x) {
+            const uint32_t mb = membU[u] & fmask; if (!mb) continue;
+            const uint64_t Q = (fam + PU[u]) & PH_MK;
+            const uint64_t k = (((Q & 0xFFFFF) ^ (PH_C & 0xFFFFF)) * PH_M + 0xBULL) & PH_MK;
+            if (!((k >> 17) & 1)) { const int j = atomicAdd(&nPoss, 1); K17[j] = (uint32_t)(k >> 17); H0[j] = (uint32_t)(Q >> 20); MB[j] = (uint16_t)mb; }
+        }
+        __syncthreads();
+        const int m = nPoss;
+        const long long g = g0 + threadIdx.x;
+        const uint32_t c = (uint32_t)(g & 0x7FFF);
+        for (uint32_t pm = fmask; pm; pm &= pm - 1) { const int p = __ffs(pm) - 1;
+            #pragma unroll
+            for (int w = 0; w < 5; w++) SC[(p * 5 + w) * PU_THREADS + threadIdx.x] = 0; }
+        #pragma unroll 4
+        for (int i = 0; i < m; i++) {
+            const uint32_t x = ((H0[i] + c) & 0xFFFFFFFu) ^ (uint32_t)(PH_C >> 20);
+            const uint32_t y = (x * (uint32_t)PH_M) & 0xFFFFFFFu;
+            const uint32_t b = (K17[i] + (y << 3)) & 0x7FFFFFFFu;
+            const uint32_t bin = (b >> 29) * 5 + b % 5;                  // quarter * 5 + phase (b is even)
+            const uint32_t inc = 1u << ((bin & 3) * 8), wofs = bin >> 2;
+            for (uint32_t mb = MB[i]; mb; mb &= mb - 1) SC[((__ffs(mb) - 1) * 5 + wofs) * PU_THREADS + threadIdx.x] += inc;
+        }
+        for (uint32_t pm = fmask; pm; pm &= pm - 1) { const int p = __ffs(pm) - 1;
+            uint64_t cq0 = 0, cq1 = 0, cq2 = 0, cq3 = 0;
+            #pragma unroll
+            for (int bin = 0; bin < 20; bin++) {
+                const uint64_t v = (SC[(p * 5 + (bin >> 2)) * PU_THREADS + threadIdx.x] >> ((bin & 3) * 8)) & 0xFF;
+                const uint64_t sh = v << (8 * (bin % 5));
+                if (bin < 5) cq0 |= sh; else if (bin < 10) cq1 |= sh; else if (bin < 15) cq2 |= sh; else cq3 |= sh;
+            }
+            if (phaseBoundFrom(cq0, cq1, cq2, cq3) >= T) {
+                const unsigned int q = atomicAdd(qCount, 1u);
+                if (q < qCap) queue[q] = (unsigned long long)g | ((unsigned long long)p << 48);
+            }
+        }
+    }
+}
+// exact pass on queued (class, position) pairs: phaseBestOfClass on that position's 222 offsets
+__global__ void phaseExactUnionKernel(const uint64_t* __restrict__ Pall, int n, const uint32_t* __restrict__ fams,
+                                      const unsigned long long* __restrict__ queue, unsigned int nq, int* __restrict__ outBest,
+                                      const int* __restrict__ Wg, int T, unsigned int* eN, unsigned int eCap,
+                                      unsigned int* eQ, int* eW, int* eCnt, int* eBlk) {
+    const unsigned int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= nq) return;
+    const unsigned long long e = queue[q];
+    const long long g = (long long)(e & ((1ULL << 48) - 1)); const int p = (int)(e >> 48);
+    const uint64_t s35 = (uint64_t)fams[g >> 15] | ((uint64_t)(g & 0x7FFF) << 20);
+    int w, bl = 0, wb = 0, cb = 0;
+    PhaseEmit em = { eN, eCap, q, eQ, eW, eCnt, eBlk, T };
+    outBest[q] = phaseBestOfClass(Pall + (size_t)p * n, n, s35, &w, Wg, &bl, &wb, &cb, &em);
+}
+// Every grid position of one spot at once. Fills hits exactly like phaseSearchPosition called per
+// position (same fields; order differs - callers sort), plus per-position statistics.
+static void phaseSearchUnion(long long pcx, long long pcz, const std::vector<std::pair<int, int>>& grid, int T, double topPct,
+                             std::vector<PhaseHit>& hits, long long& classesDone, long long& survivors,
+                             std::vector<int>& cutOut, std::vector<size_t>& famOut, std::vector<long long>& survOut,
+                             std::vector<size_t>& hitOut, int& nUOut, size_t& nFamOut) {
+    const int nPos = (int)grid.size(), n = (int)g_dx.size();
+    if (nPos < 1 || nPos > PU_MAXPOS) { fprintf(stderr, "phase union: 1..%d positions, got %d\n", PU_MAXPOS, nPos); exit(1); }
+    // per position: offsets (g_dx order - the exact pass and the weights use it), possible counts, cut
+    std::vector<uint64_t> Pall((size_t)nPos * n);
+    std::vector<std::vector<uint8_t>> poss(nPos); std::vector<std::vector<double>> pct(nPos);
+    cutOut.assign(nPos, 0); famOut.assign(nPos, 0); survOut.assign(nPos, 0); hitOut.assign(nPos, 0);
+    for (int p = 0; p < nPos; p++) {
+        std::vector<uint64_t> P; phaseOffsets(pcx + grid[p].first, pcz + grid[p].second, P);
+        std::copy(P.begin(), P.end(), Pall.begin() + (size_t)p * n);
+        uint64_t* dP1; CUDA_CHECK(cudaMalloc(&dP1, n * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpy(dP1, P.data(), n * sizeof(uint64_t), cudaMemcpyHostToDevice));
+        std::vector<uint32_t> fp; phaseFamilies(dP1, n, topPct, fp, cutOut[p], &poss[p], &pct[p]); famOut[p] = fp.size();
+        cudaFree(dP1);
+    }
+    // union of the windows: absolute chunk -> index; bit p = the chunk is in position p's window
+    std::map<std::pair<long long, long long>, int> uidx; std::vector<uint64_t> PU; std::vector<uint16_t> memb;
+    for (int p = 0; p < nPos; p++) for (int i = 0; i < n; i++) {
+        const long long ax = pcx + grid[p].first + g_dx[i], az = pcz + grid[p].second + g_dz[i];
+        auto it = uidx.find({ax, az}); int u;
+        if (it == uidx.end()) { u = (int)PU.size(); uidx[{ax, az}] = u; PU.push_back(posOffset(ax, az)); memb.push_back(0); } else u = it->second;
+        memb[u] |= (uint16_t)(1u << p);
+    }
+    const int nU = (int)PU.size(); nUOut = nU;
+    // families: every low-18-bit residue kept (top topPct) at one or more positions, with the mask of
+    // those positions; x4 for bits 18-19 (same residue order as phaseFamilies)
+    std::vector<uint32_t> fams; std::vector<uint16_t> fmask;
+    {   std::vector<uint16_t> rm(1 << 18, 0);
+        for (int p = 0; p < nPos; p++) for (int r = 0; r < (1 << 18); r++) if (poss[p][r] >= cutOut[p]) rm[r] |= (uint16_t)(1u << p);
+        for (int k = 0; k < 4; k++) for (int r = 0; r < (1 << 18); r++) if (rm[r]) { fams.push_back((uint32_t)(r + (k << 18))); fmask.push_back(rm[r]); } }
+    nFamOut = fams.size();
+    if (getenv("PHASE_UNION_DEBUG")) {   // positions per family and the kernel's occupancy (tuning aid)
+        long long hk[PU_MAXPOS + 1] = {0}; for (auto m : fmask) { int k = 0; for (uint32_t x = m; x; x &= x - 1) k++; hk[k]++; }
+        printf("  [union debug] families by positions:"); for (int k = 1; k <= nPos; k++) printf(" %d:%lld", k, hk[k]); printf("\n");
+    }
+    uint64_t *dPU, *dPall; uint16_t *dMemb, *dFM; uint32_t* dF; int* dWt;
+    CUDA_CHECK(cudaMalloc(&dPU, nU * sizeof(uint64_t))); CUDA_CHECK(cudaMemcpy(dPU, PU.data(), nU * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&dMemb, nU * sizeof(uint16_t))); CUDA_CHECK(cudaMemcpy(dMemb, memb.data(), nU * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&dF, fams.size() * sizeof(uint32_t))); CUDA_CHECK(cudaMemcpy(dF, fams.data(), fams.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&dFM, fmask.size() * sizeof(uint16_t))); CUDA_CHECK(cudaMemcpy(dFM, fmask.data(), fmask.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&dPall, Pall.size() * sizeof(uint64_t))); CUDA_CHECK(cudaMemcpy(dPall, Pall.data(), Pall.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+    const std::vector<int> wts = phaseWeights();
+    CUDA_CHECK(cudaMalloc(&dWt, wts.size() * sizeof(int))); CUDA_CHECK(cudaMemcpy(dWt, wts.data(), wts.size() * sizeof(int), cudaMemcpyHostToDevice));
+    const unsigned int qCap = 1u << 22, eCap = 1u << 23;
+    unsigned long long* dQ; unsigned int *dQN, *dEN, *dEQ; int *dB, *dEW, *dEC, *dEB;
+    CUDA_CHECK(cudaMalloc(&dQ, qCap * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dQN, sizeof(unsigned int))); CUDA_CHECK(cudaMalloc(&dB, qCap * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dEN, sizeof(unsigned int))); CUDA_CHECK(cudaMalloc(&dEQ, eCap * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&dEW, eCap * sizeof(int))); CUDA_CHECK(cudaMalloc(&dEC, eCap * sizeof(int))); CUDA_CHECK(cudaMalloc(&dEB, eCap * sizeof(int)));
+    const size_t shBytes = (size_t)nU * (4 + 4 + 2) + 16 + (size_t)nPos * 5 * PU_THREADS * 4;
+    if (shBytes > 48 * 1024) CUDA_CHECK(cudaFuncSetAttribute(phaseUnionBoundKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shBytes));
+    int nSM = 0; CUDA_CHECK(cudaDeviceGetAttribute(&nSM, cudaDevAttrMultiProcessorCount, 0));
+    if (getenv("PHASE_UNION_DEBUG")) {
+        int bu = 0, bo = 0; CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bu, phaseUnionBoundKernel, PU_THREADS, shBytes));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bo, phaseBoundKernel, 256, 0));
+        cudaFuncAttributes fa; cudaFuncGetAttributes(&fa, phaseUnionBoundKernel); cudaFuncAttributes fo; cudaFuncGetAttributes(&fo, phaseBoundKernel);
+        printf("  [union debug] union kernel: %zu B shared, %d regs, %d blocks x %d threads per SM = %d warps; old kernel: %zu B shared, %d regs, %d blocks x 256 = %d warps\n",
+               shBytes + fa.sharedSizeBytes, fa.numRegs, bu, PU_THREADS, bu * PU_THREADS / 32, fo.sharedSizeBytes, fo.numRegs, bo, bo * 8);
+    }
+    const uint32_t minv = phaseMinv13();
+    const long long total = (long long)fams.size() << 15;
+    long long chunk = 1LL << 26;                                     // items per launch (multiple of 32768)
+    std::vector<unsigned long long> hQ; std::vector<int> hB; std::vector<unsigned int> hEQ; std::vector<int> hEW, hEC, hEB;
+    for (long long base = 0; base < total; ) {
+        const long long items = std::min(chunk, total - base);
+        CUDA_CHECK(cudaMemset(dQN, 0, sizeof(unsigned int)));
+        phaseUnionBoundKernel<<<nSM * 16, PU_THREADS, shBytes>>>(dPU, dMemb, nU, dF, dFM, base, items, T, dQ, dQN, qCap);
+        CUDA_CHECK(cudaGetLastError());
+        unsigned int nq = 0; CUDA_CHECK(cudaMemcpy(&nq, dQN, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        if (nq > qCap) { chunk /= 4; if (chunk < 32768) { fprintf(stderr, "phase union: survivor queue overflow\n"); exit(1); } continue; }   // redo smaller
+        survivors += nq;
+        if (nq) {
+            CUDA_CHECK(cudaMemset(dEN, 0, sizeof(unsigned int)));
+            phaseExactUnionKernel<<<(nq + 127) / 128, 128>>>(dPall, n, dF, dQ, nq, dB, dWt, T, dEN, eCap, dEQ, dEW, dEC, dEB);
+            CUDA_CHECK(cudaGetLastError());
+            unsigned int ne = 0; CUDA_CHECK(cudaMemcpy(&ne, dEN, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+            if (ne > eCap) { fprintf(stderr, "phase union: layout list overflow (%u > %u) - raise eCap\n", ne, eCap); exit(1); }
+            hQ.resize(nq); hB.resize(nq);
+            CUDA_CHECK(cudaMemcpy(hQ.data(), dQ, nq * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(hB.data(), dB, nq * sizeof(int), cudaMemcpyDeviceToHost));
+            for (unsigned int q = 0; q < nq; q++) survOut[hQ[q] >> 48]++;
+            hEQ.resize(ne); hEW.resize(ne); hEC.resize(ne); hEB.resize(ne);
+            if (ne) {
+                CUDA_CHECK(cudaMemcpy(hEQ.data(), dEQ, ne * sizeof(unsigned int), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hEW.data(), dEW, ne * sizeof(int), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hEC.data(), dEC, ne * sizeof(int), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hEB.data(), dEB, ne * sizeof(int), cudaMemcpyDeviceToHost));
+            }
+            for (unsigned int k = 0; k < ne; k++) {                 // one hit per emitted layout, as phaseSearchPosition
+                const unsigned int q = hEQ[k];
+                const long long g = (long long)(hQ[q] & ((1ULL << 48) - 1)); const int p = (int)(hQ[q] >> 48);
+                PhaseHit h; h.fam = fams[g >> 15]; h.cls = (uint32_t)(g & 0x7FFF);
+                const uint64_t v = ((uint64_t)hEW[k] * minv) & 0x1FFF;
+                h.seed = (long long)((uint64_t)h.fam | ((uint64_t)h.cls << 20) | (v << 35));
+                h.count = hEC[k]; h.blocks = hEB[k]; h.bestCount = hB[q]; h.dx = grid[p].first; h.dz = grid[p].second;
+                h.possible = poss[p][h.fam & 0x3FFFF]; h.rankPct = pct[p][h.possible]; hits.push_back(h); hitOut[p]++;
+            }
+        }
+        base += items;
+    }
+    for (int p = 0; p < nPos; p++) classesDone += (long long)famOut[p] << 15;   // the per-position class count, as before
+    cudaFree(dPU); cudaFree(dMemb); cudaFree(dF); cudaFree(dFM); cudaFree(dPall); cudaFree(dWt);
+    cudaFree(dQ); cudaFree(dQN); cudaFree(dB); cudaFree(dEN); cudaFree(dEQ); cudaFree(dEW); cudaFree(dEC); cudaFree(dEB);
+}
 struct Result { double var; double mean; int cx, cz; unsigned mx; };
 
 static void runVarScan(const std::vector<int>& lx, const std::vector<int>& lz,
@@ -788,7 +2140,7 @@ static Derivation derive(int ccx, int ccz, uint64_t seedBase,
                 }
                 // FAST BAIL: if we are already at tFloor, have 0 bits, and the
                 // tail is literally 0 after bigNMin seeds, this location is
-                // structurally dead. Don't escalate N â€” every 4x costs seconds
+                // structurally dead. Don't escalate N ??? every 4x costs seconds
                 // and will still find nothing. This cuts dud cost from ~4s to
                 // ~0.2s (the single kernel launch).
                 if (D.bitsFixed == 0 && T <= tFloor && tail == 0 && useN >= bigNMin) {
@@ -1025,6 +2377,10 @@ struct Measure {
     unsigned baseMax = 0, treatMax = 0, ctrlMax = 0;
     long long N = 0, maxN = 0;      // maxN = the FIXED sample the maxes came from
     bool ctrlZero = false;
+    // whether the baseline/control arms were actually run (see measure()): they
+    // are skipped when the verdict cuts on treatHits, so 0 there means "not
+    // measured", not "measured zero".
+    bool armsRun = false;
     // THE RANKING KEY. Measured at --score-t, the count you actually want - NOT
     // at --deep-t, which is only as deep as the bootstrap can reach. They are
     // different questions and the tail curves cross between them. Variance,
@@ -1109,29 +2465,39 @@ static Measure measure(int ccx, int ccz, uint64_t seedBase, const Derivation& D,
     // pay the full ceiling, and those are the ones we are about to discard.
     long long useN = std::min(Nmin, N);
     unsigned fBase = 0, fTreat = 0, fCtrl = 0; bool firstPass = true;
+    // TREATMENT FIRST, AND ALONE. The verdict below cuts on
+    // `treatHits < minHits` BEFORE it ever reads lift or sep, and lift/sep are
+    // the ONLY consumers of the baseline and control arms - nothing in the
+    // ranking key touches them (winners = 2^(48-b) x scoreRate x pWin). So on
+    // any spot that fails minHits, two thirds of this stage was computed and
+    // thrown away. Measured: the 3-arm stage is ~1.05s of a 1.57s dud
+    // (--measure-n 8M drops the same spot to 0.52s), and duds are essentially
+    // all of pass 2 - a real --range 50000 scan dropped 400 of 400.
+    //
+    // This is NOT the removed --min-chunks/--min-max filter. That one gated on
+    // the frozen max, a noisy order statistic. Nothing new is being filtered
+    // on here and no threshold was added: the verdict, the ranking key and the
+    // emitted commands are all bit-identical. It is the same decision, reached
+    // without paying for inputs the decision never reads.
     for (;;) {
         M = Measure(); M.N = useN;
-        // three independent streams: decorrelated from the derivation and from
-        // each other, so we never test on the seeds we mined the bias from.
-        oneArm(ccx, ccz, seedBase ^ 0x9E3779B97F4A7C15ULL, useN, T, 0, 0, M.baseHits, M.baseMax);
-        oneArm(ccx, ccz, seedBase ^ 0xC2B2AE3D27D4EB4FULL, useN, T, D.mask, D.val, M.treatHits, M.treatMax);
-        oneArm(ccx, ccz, seedBase ^ 0x165667B19E3779F9ULL, useN, T, D.mask, (~D.val) & D.mask,
-               M.ctrlHits, M.ctrlMax);
-        // The max counts MUST come from a fixed sample size or they are not
-        // comparable between locations: adaptive sizing stops a live spot at
-        // Nmin but escalates a sparse one 16x, which would hand the weak spots
-        // more draws to set a high max. Freeze the maxes at the first pass.
-        if (firstPass) {
-            fBase = M.baseMax; fTreat = M.treatMax; fCtrl = M.ctrlMax; firstPass = false;
-            // The --min-chunks verdict reads the FROZEN max, so no amount of
-            // escalation can change it. If the first pass already failed that
-            // bar, escalating 32M -> 128M -> 512M burns ~2G samples to
-            // re-confirm a decision that is already made. Measured on a real
-            // run: duds cost 3.2s vs 0.5s for keeps, purely from this.
-            if (M.treatMax < minMax) break;
-        }
+        oneArm(ccx, ccz, seedBase ^ 0xC2B2AE3D27D4EB4FULL, useN, T, D.mask, D.val,
+               M.treatHits, M.treatMax);
+        if (firstPass) { fTreat = M.treatMax; firstPass = false; }
         if (M.treatHits >= minHits || useN >= N) break;
         useN = std::min(useN * 4, N);
+    }
+    // Only now, and only if the verdict is actually going to read lift/sep, pay
+    // for the other two arms - at the settled useN so all three share a sample
+    // size. Live spots clear minHits on the first pass, so for them useN never
+    // escalated and this is exactly the sample the old code used.
+    if (D.bitsFixed != 0 && M.treatHits >= minHits) {
+        oneArm(ccx, ccz, seedBase ^ 0x9E3779B97F4A7C15ULL, M.N, T, 0, 0,
+               M.baseHits, M.baseMax);
+        oneArm(ccx, ccz, seedBase ^ 0x165667B19E3779F9ULL, M.N, T, D.mask, (~D.val) & D.mask,
+               M.ctrlHits, M.ctrlMax);
+        fBase = M.baseMax; fCtrl = M.ctrlMax;
+        M.armsRun = true;
     }
     M.baseMax = fBase; M.treatMax = fTreat; M.ctrlMax = fCtrl;
     M.maxN = std::min(Nmin, N);
@@ -1243,6 +2609,44 @@ static void efficiencyProbe(int ccx, int ccz, uint64_t seedBase, const Derivatio
     unsigned long long h = 0, win = 0, rec = 0; double sum = 0;
     int blk = (int)std::min<long long>(8192, (nSeeds + 255) / 256);
     if (blk < 1) blk = 1;
+
+    // FLOOR SEARCH, CHEAP FIRST. The floor has to step down until the sample is
+    // big enough to mean anything, but the old loop paid a FULL nSeeds pass at
+    // every step: at --score-t 70 it starts at 66 and walks to 54, up to 7
+    // passes of 128M seeds (~900M) per location, and only the last pass's
+    // numbers are ever used. Measured: this probe was ~41% of pass 2 (a 20-spot
+    // scan went 24.0s -> 14.2s with --eff-n 4M).
+    //
+    // The ACCEPTANCE RULE IS UNCHANGED - a floor is still only accepted when a
+    // full nSeeds pass at that floor returns >= MIN_EFF_SAMPLES - so the floor
+    // finally chosen, and every number derived from it, are the same. All that
+    // changes is that floors a 1/16-size probe rules out do not get a full pass
+    // first. The probe threshold is deliberately permissive (a quarter of the
+    // scaled target), so a floor that would have cleared at full size is not
+    // skipped: one that yields 2000 at 128M yields ~125 at 8M, four times the
+    // bar it has to clear here.
+    long long calibN = nSeeds / 16;
+    if (calibN >= 1000000 && calibN < nSeeds) {
+        unsigned long long calibNeed = MIN_EFF_SAMPLES / 64;
+        if (calibNeed < 1) calibNeed = 1;
+        int calibBlk = (int)std::min<long long>(8192, (calibN + 255) / 256);
+        if (calibBlk < 1) calibBlk = 1;
+        while (floorCount > MIN_EFF_FLOOR) {
+            CUDA_CHECK(cudaMemset(dH, 0, sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemset(dWin, 0, sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemset(dRec, 0, sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemset(dSum, 0, sizeof(double)));
+            cqRateKernel<<<calibBlk, 256>>>((long long)ccx, (long long)ccz,
+                                            seedBase ^ 0xEFF1C1E7ULL,
+                                            calibN, floorCount, D.mask, D.val & D.mask,
+                                            effBar, recBlocks, dH, dSum, dWin, dRec);
+            CUDA_CHECK(cudaGetLastError());
+            unsigned long long ch = 0;
+            CUDA_CHECK(cudaMemcpy(&ch, dH, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+            if (ch >= calibNeed) break;
+            floorCount -= 2;
+        }
+    }
 
     for (;;) {
         CUDA_CHECK(cudaMemset(dH,   0, sizeof(unsigned long long)));
@@ -1510,6 +2914,8 @@ static const char* need(int argc, char** argv, int& i, const char* f) {
 
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
+    slimeFixArgv(argc, argv);       // "\" -> "/" off Windows (portable_paths.h)
+    selectCudaDevice(argc, argv);   // consumes --device N / SLIME_DEVICE
     // NOTE: do NOT call setvbuf here. MSVC requires size >= 2 when the buffer
     // pointer is NULL, and it maps _IOLBF to _IOFBF (full buffering), so it is
     // both invalid and backwards on Windows. The explicit fflush(stdout) after
@@ -1523,6 +2929,17 @@ int main(int argc, char** argv) {
     uint64_t sweepMask = 0, sweepMark = 0;
     long long sweepN = 1000, sweepSeeds = 400000;
     int sweepFloor = 0;
+    int sweepRX = 0, sweepRZ = 0;   // --sweep-rx/--sweep-rz: windowed sweep (familySweepWinKernel)
+    // --phase-search: every seed of the likely families at a spot, exactly (see PHASE SEARCH above)
+    bool phaseSearch = false; int phaseRX = 6, phaseRZ = 3, phaseT = 64, phaseStepX = 3, phaseStepZ = 3; double phaseTopPct = 3.0; std::string phaseOut;
+    // the driver's files, written here so it never loads the full layout list: the refine shortlist
+    // (top phaseRefineTop layouts by blocks + top phaseRefineCount by chunks, up to phasePerLayout seeds
+    // each, deterministic) and the keep file (every layout whose class reaches phaseKeepMin chunks)
+    bool phaseStdin = false;
+    std::string phaseShortlist, phaseKeep; int phaseRefineTop = 400, phaseRefineCount = 200, phaseRefineY39 = 200, phasePerLayout = 3, phaseKeepMin = 68;
+    int phaseTopPositions = 0, phasePosStat = 150;      // 0 = search every grid position
+    bool phaseUnion = false;                             // --phase-union: all positions in one union-window pass (same result)
+    bool heatSurveyMode = false; long long heatFrom = 0, heatTo = -1, heatSeeds = 50000; int heatT = 40, heatRow = 1028571; double heatMin = 0; bool heatClass = false, heatFam = false; std::string heatPlan; long long heatStart = 0; std::string heatOut = "heat_survey.csv", heatRowsFile, heatSpotsFile;
     std::string sweepOut;
     bool doScan = false, doCheck = false;
     std::string fromSeeds; int seedFloor = 70;
@@ -1553,6 +2970,7 @@ int main(int argc, char** argv) {
     // the center coords so two scans never clobber each other.
     std::string scanName;
     std::string outFile;   // resolved after parsing (needs scanName)
+    std::string pass1Out;  // --pass1-out: write the pass-1 ranking here and skip pass 2
 
     // pass 2 (deep-tail rank)
     int gateTop = 100, benchLocs = 3, deepT = 60, scoreT = 68, tStart = 45, tStep = 5, tFloor = 40;
@@ -1666,6 +3084,49 @@ int main(int argc, char** argv) {
     long long reportEvery = 50000000LL;
     std::string huntExe = "slime_gpu.exe";
 
+    // --phase-* flags are taken out first: the main else-if chain below is at MSVC's
+    // nesting limit ("C1061: blocks nested too deeply"), so new flags cannot go in it.
+    {
+        int o = 1;
+        for (int i = 1; i < argc; i++) {
+            if      (!strcmp(argv[i], "--phase-search"))  phaseSearch = true;
+            else if (!strcmp(argv[i], "--phase-rx"))      phaseRX = atoi(need(argc, argv, i, "--phase-rx"));
+            else if (!strcmp(argv[i], "--phase-rz"))      phaseRZ = atoi(need(argc, argv, i, "--phase-rz"));
+            else if (!strcmp(argv[i], "--phase-t"))       phaseT = atoi(need(argc, argv, i, "--phase-t"));
+            else if (!strcmp(argv[i], "--phase-step-x"))  phaseStepX = std::max(1, atoi(need(argc, argv, i, "--phase-step-x")));
+            else if (!strcmp(argv[i], "--phase-step-z"))  phaseStepZ = std::max(1, atoi(need(argc, argv, i, "--phase-step-z")));
+            else if (!strcmp(argv[i], "--phase-top-pct")) phaseTopPct = atof(need(argc, argv, i, "--phase-top-pct"));
+            else if (!strcmp(argv[i], "--phase-out"))     phaseOut = need(argc, argv, i, "--phase-out");
+            else if (!strcmp(argv[i], "--phase-shortlist")) phaseShortlist = need(argc, argv, i, "--phase-shortlist");
+            else if (!strcmp(argv[i], "--phase-keep"))    phaseKeep = need(argc, argv, i, "--phase-keep");
+            else if (!strcmp(argv[i], "--phase-stdin"))   phaseStdin = true;
+            else if (!strcmp(argv[i], "--phase-refine-top"))   phaseRefineTop = atoi(need(argc, argv, i, "--phase-refine-top"));
+            else if (!strcmp(argv[i], "--phase-refine-y39"))   phaseRefineY39 = atoi(need(argc, argv, i, "--phase-refine-y39"));
+            else if (!strcmp(argv[i], "--phase-refine-count")) phaseRefineCount = atoi(need(argc, argv, i, "--phase-refine-count"));
+            else if (!strcmp(argv[i], "--phase-per-layout"))   phasePerLayout = atoi(need(argc, argv, i, "--phase-per-layout"));
+            else if (!strcmp(argv[i], "--phase-keep-min"))     phaseKeepMin = atoi(need(argc, argv, i, "--phase-keep-min"));
+            else if (!strcmp(argv[i], "--phase-top-positions")) phaseTopPositions = atoi(need(argc, argv, i, "--phase-top-positions"));
+            else if (!strcmp(argv[i], "--phase-pos-stat"))     phasePosStat = atoi(need(argc, argv, i, "--phase-pos-stat"));
+            else if (!strcmp(argv[i], "--phase-union"))        phaseUnion = true;
+            else if (!strcmp(argv[i], "--phase-no-union"))     phaseUnion = false;
+            else if (!strcmp(argv[i], "--heat-survey"))  heatSurveyMode = true;
+            else if (!strcmp(argv[i], "--heat-from"))    heatFrom = atoll(need(argc, argv, i, "--heat-from"));
+            else if (!strcmp(argv[i], "--heat-to"))      heatTo = atoll(need(argc, argv, i, "--heat-to"));
+            else if (!strcmp(argv[i], "--heat-row"))     heatRow = atoi(need(argc, argv, i, "--heat-row"));
+            else if (!strcmp(argv[i], "--heat-seeds"))   heatSeeds = atoll(need(argc, argv, i, "--heat-seeds"));
+            else if (!strcmp(argv[i], "--heat-t"))       heatT = atoi(need(argc, argv, i, "--heat-t"));
+            else if (!strcmp(argv[i], "--heat-out"))     heatOut = need(argc, argv, i, "--heat-out");
+            else if (!strcmp(argv[i], "--heat-min"))     heatMin = atof(need(argc, argv, i, "--heat-min"));
+            else if (!strcmp(argv[i], "--heat-rows"))    { heatRowsFile = need(argc, argv, i, "--heat-rows"); heatSurveyMode = true; }
+            else if (!strcmp(argv[i], "--heat-class"))   heatClass = true;
+            else if (!strcmp(argv[i], "--heat-plan"))    { heatPlan = need(argc, argv, i, "--heat-plan"); heatSurveyMode = true; }
+            else if (!strcmp(argv[i], "--heat-start"))   heatStart = atoll(need(argc, argv, i, "--heat-start"));
+            else if (!strcmp(argv[i], "--heat-fam"))     heatClass = heatFam = true;
+            else if (!strcmp(argv[i], "--heat-spots"))   { heatSpotsFile = need(argc, argv, i, "--heat-spots"); heatSurveyMode = true; }
+            else argv[o++] = argv[i];
+        }
+        argc = o;
+    }
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--center-x"))   centerBX = atoi(need(argc, argv, i, "--center-x"));
         else if (!strcmp(argv[i], "--center-z"))   centerBZ = atoi(need(argc, argv, i, "--center-z"));
@@ -1688,6 +3149,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--sweep-seeds")) sweepSeeds = atoll(need(argc, argv, i, "--sweep-seeds"));
         else if (!strcmp(argv[i], "--sweep-floor")) sweepFloor = atoi(need(argc, argv, i, "--sweep-floor"));
         else if (!strcmp(argv[i], "--sweep-out"))   sweepOut   = need(argc, argv, i, "--sweep-out");
+        else if (!strcmp(argv[i], "--sweep-rx"))    sweepRX    = atoi(need(argc, argv, i, "--sweep-rx"));
+        else if (!strcmp(argv[i], "--sweep-rz"))    sweepRZ    = atoi(need(argc, argv, i, "--sweep-rz"));
         else if (!strcmp(argv[i], "--rec-margin")) recMargin = atof(need(argc, argv, i, "--rec-margin"));
         else if (!strcmp(argv[i], "--step"))       { stepX = stepZ = atoi(need(argc, argv, i, "--step")); }
         else if (!strcmp(argv[i], "--step-x"))     stepX = atoi(need(argc, argv, i, "--step-x"));
@@ -1713,6 +3176,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--out-top"))    gateTop = atoi(need(argc, argv, i, "--out-top"));  // alias for --gate-top
         else if (!strcmp(argv[i], "--var-min"))    varMin = atof(need(argc, argv, i, "--var-min"));
         else if (!strcmp(argv[i], "--out"))        outFile = need(argc, argv, i, "--out");
+        else if (!strcmp(argv[i], "--pass1-out"))  pass1Out = need(argc, argv, i, "--pass1-out");
         else if (!strcmp(argv[i], "--name"))       scanName = need(argc, argv, i, "--name");
         // pass 2 (deep-tail rank)
         
@@ -1830,21 +3294,26 @@ int main(int argc, char** argv) {
     if (outFile.empty()) outFile = "main/commands/commands_" + scanName + ".csv";
 
     // --z-all generates every hot Z line in range from the closed form and
-    // feeds them into the same path --z-only uses. The hot Z lattice is
-    //   chunkZ mod 97 in {48, 49}   <=>   blockZ = 1552k + 768 or 1552k + 784
-    // derived from BOTH records (534 and 437 are each mod 97 == 49) and every
-    // measured peak. There is nothing to anchor: --center-z is ignored, so
-    // --center-z 0 works. This is strictly safer than --z-period, which misses
-    // the lattice entirely if the anchor phase is wrong.
+    // feeds them into the same path --z-only uses. There is nothing to anchor:
+    // --center-z is ignored, so --center-z 0 works.
+    // CORRECTED: the hot band is centred on chunk row 48.5 + 96.875 n - period
+    // 96.875 chunks (1550 blocks), NOT 97 (1552). Measured with an exact Java
+    // slime model (row-coherence peaks) out to |Z| = 30M blocks: within 1-2 rows
+    // at n = 19300. The old "chunkZ mod 97 in {48,49}" matched near spawn (both
+    // records are within 5 lines of Z = 0) but drifted 2 blocks per line: ~2
+    // chunks off by Z = +-25k and past the band by +-50k, so wide scans quietly
+    // sampled band shoulders and pass 2 kept picking near-spawn lines. Three rows
+    // per line (floor(centre) - 1 .. + 1) cover the band.
     if (zAll) {
         zOnly.clear();
         long long zLo = (long long)centerBZ - range, zHi = (long long)centerBZ + range;
-        // walk k so that 1552k+768 and 1552k+784 cover [zLo, zHi]
-        long long kLo = (zLo - 784) / 1552 - 1, kHi = (zHi - 768) / 1552 + 1;
-        for (long long k = kLo; k <= kHi; k++) {
-            for (long long off : { 768LL, 784LL }) {
-                long long bz = 1552 * k + off;
-                if (bz >= zLo && bz <= zHi) zOnly.push_back((int)(bz / 16));
+        long long nLo = (long long)std::floor((zLo / 16.0 - 48.5) / 96.875) - 1;
+        long long nHi = (long long)std::floor((zHi / 16.0 - 48.5) / 96.875) + 1;
+        for (long long n = nLo; n <= nHi; n++) {
+            long long c = (long long)std::floor(48.5 + 96.875 * (double)n);
+            for (long long cz = c - 1; cz <= c + 1; cz++) {
+                long long bz = cz * 16;
+                if (bz >= zLo && bz <= zHi) zOnly.push_back((int)cz);
             }
         }
         std::sort(zOnly.begin(), zOnly.end());
@@ -1856,6 +3325,152 @@ int main(int argc, char** argv) {
         return feedback(fromSeeds, ccx, ccz, mChunks, seedFloor, bitWindow, maxBits,
                         zMin, minDev, huntFloor, reportEvery, huntExe);
 
+    // ---------------- --heat-survey ----------------
+    // --heat-survey --heat-from CX --heat-to CX [--heat-row R] [--heat-seeds N] [--heat-t 40] [--heat-out file]
+    if (heatSurveyMode) {
+        if (!heatPlan.empty()) { heatPlanRun(heatPlan, heatSeeds, heatT, splitmix64(seedBase ^ 0xC1A55EEDULL), heatOut, heatMin, heatStart); return 0; }
+        if (heatSpotsFile.empty() && heatTo < heatFrom) { fprintf(stderr, "--heat-survey needs --heat-from <= --heat-to (chunk X)\n"); return 1; }
+        if (!heatSpotsFile.empty() && heatClass) heatClassSpots(heatSpotsFile, heatSeeds, heatT, splitmix64(seedBase ^ 0xC1A55EEDULL), heatOut, heatFam);
+        else if (!heatSpotsFile.empty()) heatSpots(heatSpotsFile, heatSeeds, heatT, seedBase ^ 0x4EA75EEDULL, heatOut);
+        else if (!heatRowsFile.empty()) heatRows(heatRowsFile, heatFrom, heatTo, heatSeeds, heatT, seedBase ^ 0x4EA75EEDULL, heatOut);
+        else heatSurvey(heatFrom, heatTo, heatRow, heatSeeds, heatT, seedBase ^ 0x4EA75EEDULL, heatOut, heatMin);
+        return 0;
+    }
+
+    // ---------------- --phase-search ----------------
+    // Every class of the kept families at every AFK chunk within +-phaseRX / +-phaseRZ of the
+    // spot: the exact best farm of each class (all 8,192 of its seeds) from the phase model.
+    // --phase-stdin (2026-09-22): one process searches spot after spot, one tab-separated line each on stdin
+    // (X, Z, shortlist path, keep path; '-' = none), and prints PHASE_SPOT_DONE <rc> after each - the CUDA context
+    // and the fixed buffers are set up once per run instead of once per spot. Each spot runs the same code.
+    if (phaseSearch) {
+    auto phaseOne = [&]() -> int {
+        const long long pcx = (long long)std::floor(centerBX / 16.0), pcz = (long long)std::floor(centerBZ / 16.0);
+        printf("=== PHASE SEARCH  block(%d,%d)  AFK chunks +-%d X, +-%d Z every %d x %d  floor %d chunks  families: top %.2f%% by possible chunks\n",
+               centerBX, centerBZ, phaseRX, phaseRZ, phaseStepX, phaseStepZ, phaseT, phaseTopPct);
+        std::vector<PhaseHit> hits; long long classes = 0, surv = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        // Every phaseStepX-th / phaseStepZ-th AFK chunk (multiples of the step within the window).
+        // Neighbouring positions share most chunks: at the 67.07 spot every class whose best was
+        // >= 70 over a full 17 x 9 grid still reached 64 on the 3 x 3-stride grid (397 of 397), and
+        // slime_refine then finds its best AFK chunk. Default: 15 positions covering ~+-7 X, +-4 Z.
+        std::vector<std::pair<int, int>> grid;
+        for (int dz = -(phaseRZ / phaseStepZ) * phaseStepZ; dz <= phaseRZ; dz += phaseStepZ)
+            for (int dx = -(phaseRX / phaseStepX) * phaseStepX; dx <= phaseRX; dx += phaseStepX) grid.push_back({dx, dz});
+        if (phaseTopPositions > 0 && phaseTopPositions < (int)grid.size()) {
+            std::vector<std::pair<long long, size_t>> sc;
+            for (size_t g = 0; g < grid.size(); g++) sc.push_back({phasePositionScore(pcx + grid[g].first, pcz + grid[g].second, phasePosStat), g});
+            std::stable_sort(sc.begin(), sc.end(), [](const std::pair<long long, size_t>& a, const std::pair<long long, size_t>& b) { return a.first > b.first; });
+            std::vector<std::pair<int, int>> keep;
+            for (int k = 0; k < phaseTopPositions; k++) keep.push_back(grid[sc[k].second]);
+            printf("  adaptive positions: the top %d of %zu by families with >= %d possible chunks (%lld .. %lld)\n",
+                   phaseTopPositions, grid.size(), phasePosStat, sc[0].first, sc[phaseTopPositions - 1].first);
+            grid = keep;
+        }
+        if (phaseUnion) {
+            std::vector<int> cuts; std::vector<size_t> nfs, hp; std::vector<long long> sp; int nU = 0; size_t nFam = 0;
+            phaseSearchUnion(pcx, pcz, grid, phaseT, phaseTopPct, hits, classes, surv, cuts, nfs, sp, hp, nU, nFam);
+            for (size_t p = 0; p < grid.size(); p++)
+                printf("  AFK (%+d,%+d): %zu families (possible >= %d), %.2fG classes, %lld pass the bound, %zu reach %d\n",
+                       grid[p].first, grid[p].second, nfs[p], cuts[p], (double)((long long)nfs[p] << 15) / 1e9, sp[p], hp[p], phaseT);
+            printf("  union window: %d chunks, %zu distinct families for %zu positions  [%.1fs]\n", nU, nFam, grid.size(),
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            fflush(stdout);
+        } else
+        for (auto& gp : grid) { const int dx = gp.first, dz = gp.second;
+            auto tp = std::chrono::steady_clock::now(); long long c0 = classes, s0 = surv; size_t h0 = hits.size(); int cutN = 0; size_t nf = 0;
+            phaseSearchPosition(pcx + dx, pcz + dz, dx, dz, phaseT, phaseTopPct, hits, classes, surv, cutN, nf);
+            printf("  AFK (%+d,%+d): %zu families (possible >= %d), %.2fG classes, %lld pass the bound, %zu reach %d  [%.1fs]\n",
+                   dx, dz, nf, cutN, (classes - c0) / 1e9, surv - s0, hits.size() - h0, phaseT,
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
+            fflush(stdout);
+        }
+        double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        // live guard: recount every hit with the reference check (cap 200k, then a sample)
+        uint8_t disc[17 * 17]; buildIntersectMask(disc); int wt[17 * 17]; buildBlockWeights(wt);
+        long long bad = 0, checked = 0; size_t step = hits.size() > 200000 ? hits.size() / 200000 + 1 : 1;
+        for (size_t i = 0; i < hits.size(); i += step) {
+            const int hx = (int)(pcx + hits[i].dx), hz = (int)(pcz + hits[i].dz);
+            int c = scoreCenterChunks(disc, hits[i].seed, hx, hz), bl = scoreCenterBlocks(wt, hits[i].seed, hx, hz); checked++;
+            if (c != hits[i].count || bl != hits[i].blocks) {
+                if (bad < 5) fprintf(stderr, "  MISMATCH seed %lld: model %d chunks %d blocks, reference %d / %d\n", hits[i].seed, hits[i].count, hits[i].blocks, c, bl);
+                bad++; hits[i].count = c; hits[i].blocks = bl; }
+        }
+        int bestCnt = 0; for (auto& h : hits) bestCnt = std::max(bestCnt, h.bestCount);
+        // by BLOCKS at the searched position: cq is blocks / 256, so this is the order to refine in
+        std::sort(hits.begin(), hits.end(), [](const PhaseHit& a, const PhaseHit& b) { return a.blocks > b.blocks; });
+        int n64 = 0, n66 = 0, n68 = 0, n70 = 0;
+        {   // classes (not layouts), so the numbers stay comparable with earlier runs
+            std::vector<unsigned long long> seenC; seenC.reserve(hits.size());
+            for (auto& h : hits) seenC.push_back(((unsigned long long)h.fam << 32) | ((unsigned long long)h.cls << 12) | (unsigned long long)((h.dx + 64) * 128 + (h.dz + 64)) % 4096);
+            std::vector<size_t> idx(hits.size()); for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return seenC[a] < seenC[b]; });
+            for (size_t i = 0; i < idx.size(); i++) { if (i && seenC[idx[i]] == seenC[idx[i - 1]]) continue; const int bc = hits[idx[i]].bestCount;
+                n64 += bc >= 64; n66 += bc >= 66; n68 += bc >= 68; n70 += bc >= 70; }
+        }
+        printf("  %.1fG classes (%.0fT seeds) in %.1fs: layouts >= 64: %d, >= 66: %d, >= 68: %d, >= 70: %d; best %d chunks%s\n",
+               classes / 1e9, classes * 8192.0 / 1e12, secs, n64, n66, n68, n70, bestCnt,
+               bad ? "" : "  (reference recount: all match)");
+        if (bad) printf("  REFERENCE RECOUNT: %lld of %lld differ (rejection path?) - counts corrected\n", bad, checked);
+        auto writeRows = [&](const std::string& path, const std::vector<const PhaseHit*>& rows) {
+            FILE* pf = fopen(path.c_str(), "w"); if (!pf) return;
+            fprintf(pf, "seed,count,blocks,cq_at_pos,dx,dz,family,class,best_count,possible,family_rank_pct,blocks39\n");
+            for (auto* h : rows) fprintf(pf, "%lld,%d,%d,%.2f,%d,%d,0x%05X,%u,%d,%d,%.3f,%d\n", h->seed, h->count, h->blocks, h->blocks / 256.0, h->dx, h->dz, h->fam, h->cls, h->bestCount, h->possible, h->rankPct, h->blocks39);
+            fclose(pf);
+        };
+        if (!phaseShortlist.empty()) {
+            // the first nKeys layout keys in the given order, up to phasePerLayout seeds each
+            // mode 0 = by cq blocks, 1 = by chunk count, 2 = by -39 blocks (what /perimeterinfo reads)
+            auto take = [&](std::vector<const PhaseHit*> v, int mode, int nKeys, std::vector<const PhaseHit*>& out) {
+                std::sort(v.begin(), v.end(), [&](const PhaseHit* a, const PhaseHit* b) {
+                    if (mode == 2 && a->blocks39 != b->blocks39) return a->blocks39 > b->blocks39;
+                    if (mode == 1 && a->count != b->count) return a->count > b->count;
+                    if (a->blocks != b->blocks) return a->blocks > b->blocks;
+                    return a->seed < b->seed; });
+                std::map<std::tuple<uint32_t, int, int, int, int>, int> per; int keys = 0;
+                for (auto* h : v) {
+                    auto k = std::make_tuple(h->fam, h->count, h->blocks, h->dx, h->dz);
+                    auto it = per.find(k);
+                    if (it == per.end()) { if (keys >= nKeys) break; it = per.emplace(k, 0).first; keys++; }
+                    if (it->second < phasePerLayout) { it->second++; out.push_back(h); }
+                }
+            };
+            std::vector<const PhaseHit*> all; all.reserve(hits.size()); for (auto& h : hits) all.push_back(&h);
+            // the shortlist is the UNION of three rankings, so adding the -39 one can only ADD layouts to refine:
+            // every seed the old two slices picked is still picked, and the layouts that are best at the number the
+            // user actually measures now get refined too (at 23% of spots the best-blocks layout is not the
+            // best-count layout, and 6% of spots lose over 500 blocks that way - docs\PREDICTION.txt section 10)
+            std::vector<const PhaseHit*> sl; take(all, 0, phaseRefineTop, sl); take(all, 1, phaseRefineCount, sl); take(all, 2, phaseRefineY39, sl);
+            std::sort(sl.begin(), sl.end(), [](const PhaseHit* a, const PhaseHit* b) { return a->seed < b->seed; });
+            sl.erase(std::unique(sl.begin(), sl.end(), [](const PhaseHit* a, const PhaseHit* b) { return a->seed == b->seed; }), sl.end());
+            writeRows(phaseShortlist, sl);
+            printf("  wrote %s (%zu seeds to refine)\n", phaseShortlist.c_str(), sl.size());
+        }
+        if (!phaseKeep.empty()) {
+            std::vector<const PhaseHit*> kp; for (auto& h : hits) if (h.bestCount >= phaseKeepMin) kp.push_back(&h);
+            writeRows(phaseKeep, kp);
+        }
+        if (!phaseOut.empty()) {
+            FILE* pf = fopen(phaseOut.c_str(), "w");
+            if (pf) { fprintf(pf, "seed,count,blocks,cq_at_pos,dx,dz,family,class,best_count,possible,family_rank_pct\n");
+                for (auto& h : hits) fprintf(pf, "%lld,%d,%d,%.2f,%d,%d,0x%05X,%u,%d,%d,%.3f\n", h.seed, h.count, h.blocks, h.blocks / 256.0, h.dx, h.dz, h.fam, h.cls, h.bestCount, h.possible, h.rankPct);
+                fclose(pf); printf("  wrote %s (%zu layouts)\n", phaseOut.c_str(), hits.size()); }
+        }
+        return bad ? 2 : 0;
+    };
+    if (!phaseStdin) return phaseOne();
+    char ln[8192];
+    while (fgets(ln, sizeof ln, stdin)) {
+        slimeFixPath(ln);   // shortlist/keep paths from phase_spots.ps1
+        char a1[4096] = "", a2[4096] = ""; int x = 0, z = 0;
+        char* lp = ln; if ((unsigned char)lp[0] == 0xEF && (unsigned char)lp[1] == 0xBB && (unsigned char)lp[2] == 0xBF) lp += 3;
+        if (sscanf(lp, "%d\t%d\t%4095[^\t\r\n]\t%4095[^\t\r\n]", &x, &z, a1, a2) < 2) continue;
+        centerBX = x; centerBZ = z; phaseShortlist = strcmp(a1, "-") && a1[0] ? a1 : ""; phaseKeep = strcmp(a2, "-") && a2[0] ? a2 : "";
+        const int rc = phaseOne();
+        printf("PHASE_SPOT_DONE %d\n", rc); fflush(stdout);
+    }
+    return 0;
+    }
     // ---------------- self-test ----------------
     // ---------------- --family-sweep ----------------
     // Hold the SPOT fixed, sweep many families, measure each. Answers the
@@ -1917,9 +3532,20 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemset(dEff,  0, F * sizeof(double)));
         CUDA_CHECK(cudaMemset(dMax,  0, F * sizeof(int)));
         auto t0 = std::chrono::steady_clock::now();
-        familySweepKernel<<<(int)F, 256>>>((long long)ccx2, (long long)ccz2, seedBase ^ 0x5A17ED5EEDULL,
-                                           sweepSeeds, floorC, sm, dVals, dHits, dEff, dMax);
-        CUDA_CHECK(cudaGetLastError());
+        const bool win = (sweepRX > 0 || sweepRZ > 0);
+        if (win) {
+            if (sweepRX < 0 || sweepRX > 4 || sweepRZ < 0 || sweepRZ > 4) {
+                fprintf(stderr, "--sweep-rx/--sweep-rz must be 0..4\n"); return 1;
+            }
+            printf("  WINDOWED: a seed counts when the best AFK chunk within +-%d X, +-%d Z reaches the floor\n",
+                   sweepRX, sweepRZ);
+            runWinSweep(sweepRX, sweepRZ, ccx2, ccz2, seedBase ^ 0x5A17ED5EEDULL,
+                        sweepSeeds, floorC, sm, F, dVals, dHits, dEff, dMax);
+        } else {
+            familySweepKernel<<<(int)F, 256>>>((long long)ccx2, (long long)ccz2, seedBase ^ 0x5A17ED5EEDULL,
+                                               sweepSeeds, floorC, sm, dVals, dHits, dEff, dMax);
+            CUDA_CHECK(cudaGetLastError());
+        }
         std::vector<unsigned long long> hHits(F); std::vector<double> hEff(F); std::vector<int> hMax(F);
         CUDA_CHECK(cudaMemcpy(hHits.data(), dHits, F * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(hEff.data(),  dEff,  F * sizeof(double), cudaMemcpyDeviceToHost));
@@ -1927,10 +3553,15 @@ int main(int argc, char** argv) {
         double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         cudaFree(dVals); cudaFree(dHits); cudaFree(dEff); cudaFree(dMax);
 
-        struct FR { uint64_t val; unsigned long long hits; double eff; int mx; };
+        struct FR { uint64_t val; unsigned long long hits; double eff; int mx; int dx, dz; };
         std::vector<FR> fr(F);
+        const int NXw = 2 * sweepRX + 1;
         for (long long f = 0; f < F; f++) {
-            fr[f].val = hVals[f]; fr[f].hits = hHits[f]; fr[f].mx = hMax[f];
+            fr[f].val = hVals[f]; fr[f].hits = hHits[f];
+            // windowed: hMax packs (blocks << 8) | position of the best hit
+            fr[f].mx = win ? (hMax[f] >> 8) : hMax[f];
+            fr[f].dx = win ? (hMax[f] & 255) % NXw - sweepRX : 0;
+            fr[f].dz = win ? (hMax[f] & 255) / NXw - sweepRZ : 0;
             fr[f].eff = hHits[f] ? hEff[f] / (double)hHits[f] : 0.0;
         }
         // Rank by HITS, not max cq. Max-of-sample is an order statistic: at 400k
@@ -1963,10 +3594,14 @@ int main(int argc, char** argv) {
         if (!sweepOut.empty()) {
             FILE* sf = fopen(sweepOut.c_str(), "w");
             if (sf) {
-                fprintf(sf, "val,hits,best_cq,pack_pct\n");
-                for (int i = 0; i < 64 && i < (int)F; i++)
-                    fprintf(sf, "0x%llX,%llu,%.2f,%.1f\n", (unsigned long long)byMax[i].val,
+                // windowed sweeps add best_dx,best_dz: chunk offset of the best hit's AFK spot
+                fprintf(sf, win ? "val,hits,best_cq,pack_pct,best_dx,best_dz\n" : "val,hits,best_cq,pack_pct\n");
+                for (int i = 0; i < 64 && i < (int)F; i++) {
+                    fprintf(sf, "0x%llX,%llu,%.2f,%.1f", (unsigned long long)byMax[i].val,
                             byMax[i].hits, byMax[i].mx / 256.0, byMax[i].eff * 100.0);
+                    if (win) fprintf(sf, ",%d,%d", byMax[i].dx, byMax[i].dz);
+                    fprintf(sf, "\n");
+                }
                 fclose(sf);
                 printf("\n  wrote %s (top 64 by hits)\n", sweepOut.c_str());
             }
@@ -2201,6 +3836,191 @@ int main(int argc, char** argv) {
             }
         }
 
+        // [6] familySweepWinKernel (--sweep-rx/--sweep-rz). (a) with a 0x0 window
+        // it must reproduce familySweepKernel exactly (same stream, same hits, same
+        // best blocks); (b) with a 3x2 window every family's hits and best
+        // (blocks, position) must equal a CPU loop over all 35 positions built on
+        // slime_core.h's scoreCenterChunks/scoreCenterBlocks. Floor 30 so a few
+        // thousand seeds give plenty of hits.
+        printf("[6] windowed family sweep: 0x0 == single-position sweep, 3x2 == CPU reference\n");
+        {
+            const int NF = 6, floorW = 30;
+            const uint64_t wm = 0xFFFFFULL;
+            uint64_t hv[NF] = { 0x9E078, 0xA2CEC, 0x95DE3, 0x00000, 0x5A5A5, 0xFFFFF };
+            const uint64_t sb = seedBase ^ 0x5A17ED5EEDULL;
+            uint64_t* dV; unsigned long long *dH0, *dH1, *dH2; double *dE0, *dE1, *dE2; int *dM0, *dM1, *dM2;
+            CUDA_CHECK(cudaMalloc(&dV, NF * sizeof(uint64_t)));
+            CUDA_CHECK(cudaMemcpy(dV, hv, NF * sizeof(uint64_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMalloc(&dH0, NF * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dE0, NF * sizeof(double))); CUDA_CHECK(cudaMalloc(&dM0, NF * sizeof(int)));
+            CUDA_CHECK(cudaMalloc(&dH1, NF * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dE1, NF * sizeof(double))); CUDA_CHECK(cudaMalloc(&dM1, NF * sizeof(int)));
+            CUDA_CHECK(cudaMalloc(&dH2, NF * sizeof(unsigned long long))); CUDA_CHECK(cudaMalloc(&dE2, NF * sizeof(double))); CUDA_CHECK(cudaMalloc(&dM2, NF * sizeof(int)));
+            const long long N0 = 200000, N2 = 3000;
+            familySweepKernel<<<NF, 256>>>((long long)ccx, (long long)ccz, sb, N0, floorW, wm, dV, dH0, dE0, dM0);
+            CUDA_CHECK(cudaGetLastError());
+            runWinSweep(0, 0, ccx, ccz, sb, N0, floorW, wm, NF, dV, dH1, dE1, dM1);
+            runWinSweep(3, 2, ccx, ccz, sb, N2, floorW, wm, NF, dV, dH2, dE2, dM2);
+            unsigned long long h0[NF], h1[NF], h2[NF]; int m0[NF], m1[NF], m2[NF];
+            CUDA_CHECK(cudaMemcpy(h0, dH0, sizeof(h0), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(m0, dM0, sizeof(m0), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h1, dH1, sizeof(h1), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(m1, dM1, sizeof(m1), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(h2, dH2, sizeof(h2), cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(m2, dM2, sizeof(m2), cudaMemcpyDeviceToHost));
+            cudaFree(dV); cudaFree(dH0); cudaFree(dE0); cudaFree(dM0); cudaFree(dH1); cudaFree(dE1); cudaFree(dM1);
+            cudaFree(dH2); cudaFree(dE2); cudaFree(dM2);
+            bool ma = true;
+            for (int f = 0; f < NF; f++) if (h0[f] != h1[f] || m0[f] != (m1[f] >> 8)) ma = false;
+            printf("  0x0 window vs single-position: %d families, %llu hits -> %s\n", NF,
+                   h0[0] + h0[1] + h0[2] + h0[3] + h0[4] + h0[5], ma ? "OK" : "MISMATCH");
+            int wt[17 * 17]; buildBlockWeights(wt);
+            uint8_t disc[17 * 17]; buildIntersectMask(disc);
+            bool mb = true; unsigned long long tot = 0;
+            for (int f = 0; f < NF && mb; f++) {
+                unsigned long long hits = 0; int bestPacked = 0;
+                const uint64_t base = sb + ((uint64_t)f * 0x9E3779B97F4A7C15ULL);
+                for (long long j = 0; j < N2; j++) {
+                    uint64_t w64 = (splitmix64(base + (uint64_t)j) & ~wm) | (hv[f] & wm);
+                    long long seed = (long long)w64;
+                    int best = -1, bp = 0;
+                    for (int pz = 0; pz < 5; pz++) for (int px = 0; px < 7; px++) {
+                        int c = scoreCenterChunks(disc, seed, ccx + px - 3, ccz + pz - 2);
+                        if (c > best) { best = c; bp = pz * 7 + px; }
+                    }
+                    if (best < floorW) continue;
+                    hits++;
+                    int blocks = scoreCenterBlocks(wt, seed, ccx + (bp % 7) - 3, ccz + (bp / 7) - 2);
+                    bestPacked = std::max(bestPacked, (blocks << 8) | bp);
+                }
+                tot += hits;
+                if (hits != h2[f] || bestPacked != m2[f]) {
+                    mb = false;
+                    printf("  family 0x%llX: GPU %llu hits best 0x%X, CPU %llu hits best 0x%X\n",
+                           (unsigned long long)hv[f], h2[f], m2[f], hits, bestPacked);
+                }
+            }
+            printf("  3x2 window vs CPU: %d families x %lld seeds, %llu hits -> %s\n", NF, N2, tot, mb ? "OK" : "MISMATCH");
+            if (!ma || !mb) ok = false;
+        }
+
+        // [7] PHASE MODEL (--phase-search). (a) B(v) = B(0) + 2^18 w reproduces isSlimeChunk for
+        // every top value; (b) the exact class best equals brute force over all 8,192 seeds;
+        // (c) the bound never falls below the exact best; (d) the GPU passes find exactly the
+        // classes the host finds, with the same best.
+        printf("[7] phase model: B(v) = B(0) + 2^18 w exact, class best == brute force, bound >= best, GPU == host\n");
+        {
+            std::vector<uint64_t> P; phaseOffsets(ccx, ccz, P); const int n = (int)P.size();
+            long long bad = 0, checks = 0, bruteBad = 0;
+            for (int k = 0; k < 6; k++) {
+                const uint64_t s35 = splitmix64(0xFA5EULL + k) & ((1ULL << 35) - 1);
+                int bruteBest = 0, bruteBlocks = 0; int wt7[17 * 17]; buildBlockWeights(wt7); const std::vector<int> W7 = phaseWeights();
+                for (int v = 0; v < 8192; v++) {
+                    const uint32_t w = (uint32_t)((PH_M * (uint64_t)v) & 0x1FFF);
+                    const long long seed = (long long)(s35 | ((uint64_t)v << 35));
+                    int cnt = 0;
+                    for (int i = 0; i < n; i++) {
+                        const uint32_t b0 = phaseB0(s35, P[i]); const uint32_t b = (b0 + (w << 18)) & 0x7FFFFFFFu;
+                        const bool model = (b % 10) == 0, real = isSlimeChunk(seed, (int)(ccx + g_dx[i]), (int)(ccz + g_dz[i]));
+                        if (b < 0x7FFFFFF8u) { checks++; if (model != real) bad++; }
+                        cnt += real;
+                    }
+                    if (cnt > bruteBest) bruteBest = cnt;
+                    const int bl = scoreCenterBlocks(wt7, seed, (int)ccx, (int)ccz); if (bl > bruteBlocks) bruteBlocks = bl;
+                }
+                int w, pb = 0, wb = 0, cb = 0;
+                if (phaseBestOfClass(P.data(), n, s35, &w, W7.data(), &pb, &wb, &cb) != bruteBest || pb != bruteBlocks) bruteBad++;
+            }
+            printf("  (a) %lld (seed, chunk) checks: %lld mismatches   (b) 6 classes, best chunks and best blocks vs brute force: %lld differ\n", checks, bad, bruteBad);
+            long long boundBad = 0;
+            for (int k = 0; k < 20000; k++) {
+                const uint64_t s35 = splitmix64(0xB0D0ULL + k) & ((1ULL << 35) - 1);
+                uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0; for (int i = 0; i < n; i++) phaseAccumulate(phaseB0(s35, P[i]), c0, c1, c2, c3);
+                int w; if (phaseBoundFrom(c0, c1, c2, c3) < phaseBestOfClass(P.data(), n, s35, &w)) boundBad++;
+            }
+            printf("  (c) 20000 classes: bound below the exact best %lld times\n", boundBad);
+            // (d) two families, floor 44 so there are survivors: GPU vs host on all 65,536 classes
+            const int Tt = 44; std::vector<uint32_t> fams = { 0x9E078u, (uint32_t)(splitmix64(77) & 0xFFFFF) };
+            uint64_t* dP; uint32_t* dF; unsigned long long* dQ; unsigned int* dQN; int *dB, *dW;
+            CUDA_CHECK(cudaMalloc(&dP, n * 8)); CUDA_CHECK(cudaMemcpy(dP, P.data(), n * 8, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMalloc(&dF, 8)); CUDA_CHECK(cudaMemcpy(dF, fams.data(), 8, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMalloc(&dQ, 65536 * 8)); CUDA_CHECK(cudaMalloc(&dQN, 4)); CUDA_CHECK(cudaMalloc(&dB, 65536 * 4)); CUDA_CHECK(cudaMalloc(&dW, 65536 * 4));
+            CUDA_CHECK(cudaMemset(dQN, 0, 4));
+            phaseBoundKernel<<<64, 256>>>(dP, n, dF, 0, 65536, Tt, dQ, dQN, 65536);
+            CUDA_CHECK(cudaGetLastError());
+            unsigned int nq = 0; CUDA_CHECK(cudaMemcpy(&nq, dQN, 4, cudaMemcpyDeviceToHost));
+            phaseExactKernel<<<(nq + 127) / 128 + 1, 128>>>(dP, n, dF, dQ, nq, dB, dW);
+            CUDA_CHECK(cudaGetLastError());
+            std::vector<unsigned long long> hq(nq); std::vector<int> hb(nq);
+            if (nq) { CUDA_CHECK(cudaMemcpy(hq.data(), dQ, nq * 8, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(hb.data(), dB, nq * 4, cudaMemcpyDeviceToHost)); }
+            cudaFree(dP); cudaFree(dF); cudaFree(dQ); cudaFree(dQN); cudaFree(dB); cudaFree(dW);
+            std::vector<int> gpuBest(65536, -1); for (unsigned int q = 0; q < nq; q++) gpuBest[hq[q]] = hb[q];
+            long long gpuBad = 0, reach = 0;
+            for (int g = 0; g < 65536; g++) {
+                const uint64_t s35 = (uint64_t)fams[g >> 15] | ((uint64_t)(g & 0x7FFF) << 20);
+                uint64_t c0 = 0, c1 = 0, c2 = 0, c3 = 0; for (int i = 0; i < n; i++) phaseAccumulate(phaseB0(s35, P[i]), c0, c1, c2, c3);
+                if (phaseBoundFrom(c0, c1, c2, c3) < Tt) { if (gpuBest[g] >= 0) gpuBad++; continue; }
+                int w; const int hb2 = phaseBestOfClass(P.data(), n, s35, &w); reach += hb2 >= Tt;
+                if (gpuBest[g] != hb2) gpuBad++;
+            }
+            printf("  (d) 65536 classes, floor %d: %u pass the bound on the GPU, %lld reach the floor; GPU vs host differ %lld\n", Tt, nq, reach, gpuBad);
+            bool ok7 = bad == 0 && bruteBad == 0 && boundBad == 0 && gpuBad == 0 && checks > 0;
+            printf("  -> %s\n", ok7 ? "OK" : "MISMATCH");
+            if (!ok7) ok = false;
+        }
+
+        // [8] UNION WINDOW (--phase-union) == per-position search: every emitted layout (seed, count,
+        // blocks, position, best count, possible) identical, on a 4-position grid with overlapping
+        // windows and families kept at some positions only.
+        printf("[8] union-window phase search == per-position phase search\n");
+        {
+            const std::vector<std::pair<int, int>> grid8 = { {0, 0}, {3, 0}, {0, 3}, {-3, -3} };
+            const int T8 = 58; const double pct8 = 0.4;
+            std::vector<PhaseHit> a, b; long long ca = 0, sa = 0, cb2 = 0, sb = 0;
+            for (auto& gp : grid8) { int cut = 0; size_t nf = 0; phaseSearchPosition(ccx + gp.first, ccz + gp.second, gp.first, gp.second, T8, pct8, a, ca, sa, cut, nf); }
+            std::vector<int> cuts; std::vector<size_t> nfs, hp; std::vector<long long> sp; int nU = 0; size_t nFam = 0;
+            phaseSearchUnion(ccx, ccz, grid8, T8, pct8, b, cb2, sb, cuts, nfs, sp, hp, nU, nFam);
+            auto key = [](const PhaseHit& h) { return std::make_tuple(h.seed, h.count, h.blocks, h.dx, h.dz, h.bestCount, h.possible, h.fam, h.cls); };
+            auto lt = [&](const PhaseHit& x, const PhaseHit& y) { return key(x) < key(y); };
+            std::sort(a.begin(), a.end(), lt); std::sort(b.begin(), b.end(), lt);
+            bool same = a.size() == b.size() && ca == cb2 && sa == sb;
+            for (size_t i = 0; same && i < a.size(); i++) same = key(a[i]) == key(b[i]) && a[i].rankPct == b[i].rankPct;
+            printf("  4 positions, top %.1f%%, floor %d: per-position %zu layouts / %lld survivors / %.2fG classes, union %zu / %lld / %.2fG (%d chunks, %zu families)\n",
+                   pct8, T8, a.size(), sa, ca / 1e9, b.size(), sb, cb2 / 1e9, nU, nFam);
+            const bool ok8 = same && !a.empty();
+            printf("  -> %s\n", ok8 ? "OK" : (a.empty() ? "NO LAYOUTS (test too weak)" : "MISMATCH"));
+            if (!ok8) ok = false;
+        }
+        // [9] BIT-SLICED BOUND (phaseBoundBSKernel, the search's default) queues exactly the classes phaseBoundKernel
+        // queues: 2 positions x 3 floors, every class of the kept families, queues compared as sets.
+        printf("[9] bit-sliced bound queue == quarter-bound queue\n");
+        {
+            bool ok9 = true; long long tot = 0;
+            for (int pos = 0; pos < 2; pos++) {
+                std::vector<uint64_t> P9; phaseOffsets(ccx + 3 * pos, ccz, P9); const int n9 = (int)P9.size();
+                uint64_t* dP9; CUDA_CHECK(cudaMalloc(&dP9, n9 * 8)); CUDA_CHECK(cudaMemcpy(dP9, P9.data(), n9 * 8, cudaMemcpyHostToDevice));
+                std::vector<uint32_t> f9; int cut9 = 0; phaseFamilies(dP9, n9, 0.3, f9, cut9);
+                if (f9.size() > 1024) f9.resize(1024);
+                uint32_t* dF9; CUDA_CHECK(cudaMalloc(&dF9, f9.size() * 4)); CUDA_CHECK(cudaMemcpy(dF9, f9.data(), f9.size() * 4, cudaMemcpyHostToDevice));
+                const unsigned int cap9 = 1u << 24; unsigned long long *qa, *qb; unsigned int *na, *nb;
+                CUDA_CHECK(cudaMalloc(&qa, cap9 * 8ULL)); CUDA_CHECK(cudaMalloc(&qb, cap9 * 8ULL)); CUDA_CHECK(cudaMalloc(&na, 4)); CUDA_CHECK(cudaMalloc(&nb, 4));
+                const long long items9 = (long long)f9.size() << 15;
+                for (int T9 : {52, 60, 64}) {
+                    CUDA_CHECK(cudaMemset(na, 0, 4)); CUDA_CHECK(cudaMemset(nb, 0, 4));
+                    phaseBoundKernel<<<20 * 48, 256>>>(dP9, n9, dF9, 0, items9, T9, qa, na, cap9);
+                    bsEnsureTables(), phaseBoundBSKernel<<<20 * 48, 256>>>(dP9, n9, dF9, 0, items9, T9, qb, nb, cap9);
+                    CUDA_CHECK(cudaGetLastError());
+                    unsigned int ha = 0, hb = 0; CUDA_CHECK(cudaMemcpy(&ha, na, 4, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(&hb, nb, 4, cudaMemcpyDeviceToHost));
+                    bool same = ha == hb && ha <= cap9;
+                    if (same) {
+                        std::vector<unsigned long long> va(ha), vb(hb);
+                        CUDA_CHECK(cudaMemcpy(va.data(), qa, ha * 8ULL, cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(vb.data(), qb, hb * 8ULL, cudaMemcpyDeviceToHost));
+                        std::sort(va.begin(), va.end()); std::sort(vb.begin(), vb.end()); same = va == vb;
+                    }
+                    printf("  position %d, %zu families, floor %d: quarter queue %u, bit-sliced queue %u -> %s\n", pos, f9.size(), T9, ha, hb, same ? "same" : "DIFFERENT");
+                    tot += ha; if (!same) ok9 = false;
+                }
+                cudaFree(qa); cudaFree(qb); cudaFree(na); cudaFree(nb); cudaFree(dF9); cudaFree(dP9);
+            }
+            if (!tot) ok9 = false;
+            printf("  -> %s\n", ok9 ? "OK" : "MISMATCH");
+            if (!ok9) ok = false;
+        }
         printf("\n%s\n", ok ? "SELF TEST PASSED." : "SELF TEST FAILED.");
         return ok ? 0 : 1;
     }
@@ -2252,9 +4072,15 @@ int main(int argc, char** argv) {
         // scoreT-specific numbers are SCORE below and the packing/pWin lines,
         // which come from scoreAt()/efficiencyProbe() at the real scoreT.
         printf("\n  Held-out measurement at count >= %d (--deep-t), %lld seeds/arm max:\n", deepT, measureN);
-        printf("    baseline (no mask)      : %10llu hits  rate %.4e  max %u\n", M.baseHits,  M.baseRate,  M.baseMax);
+        if (M.armsRun)
+            printf("    baseline (no mask)      : %10llu hits  rate %.4e  max %u%c", M.baseHits,  M.baseRate,  M.baseMax, 10);
+        else
+            printf("    baseline (no mask)      :   NOT RUN - cut on treatment; the verdict reads%c    treatHits < --min-hits before it reads lift/sep%c", 10, 10);
         printf("    treatment (mask,val)    : %10llu hits  rate %.4e  max %u\n", M.treatHits, M.treatRate, M.treatMax);
-        printf("    control  (mask,~val)    : %10llu hits  rate %.4e  max %u\n", M.ctrlHits,  M.ctrlRate,  M.ctrlMax);
+        if (M.armsRun)
+            printf("    control  (mask,~val)    : %10llu hits  rate %.4e  max %u%c", M.ctrlHits,  M.ctrlRate,  M.ctrlMax, 10);
+        else
+            printf("    control  (mask,~val)    :   NOT RUN (same reason)%c", 10);
         if (M.effSamples)
             printf("    packing at >=%d chunks   : %.1f%% mean  ->  cqCeil %.1f cq  (%llu samples)\n",
                    scoreT - 4, M.effMean * 100.0, M.cqCeil, M.effSamples);
@@ -2273,7 +4099,7 @@ int main(int argc, char** argv) {
             printf("      -> ~%.3g seeds per record-class hit; slime_refine decides the rest.\n",
                    1.0 / M.pRec);
         printf("    lift (treat/base)    = %s%8.2fx   [keep if >= %.1f]\n",
-               M.baseHits ? " " : ">", M.lift, minLift);
+               (M.armsRun && M.baseHits) ? " " : ">", M.lift, minLift);
         printf("    sep  (treat/control) = %s%8.2fx   [keep if >= %.1f]  <-- the real dud test\n",
                M.ctrlZero ? ">" : " ", M.sep, minSep);
         if (M.ctrlZero)
@@ -2294,7 +4120,11 @@ int main(int argc, char** argv) {
                    huntCommand(ccx * 16, ccz * 16, D.mask, D.val, mChunks, huntFloor,
                                reportEvery, huntExe.c_str(), "main/seeds").c_str());
             printf("\nTHEN SCORE (after the hunt has collected some seeds):\n"
+#ifdef _WIN32
                    "slime_refine.exe --seeds main\\seeds\\manual\\%d_%d.csv --center-x %d --center-z %d --radius 6\n",
+#else
+                   "./slime_refine --seeds main/seeds/manual/%d_%d.csv --center-x %d --center-z %d --radius 6\n",
+#endif
                    ccx * 16, ccz * 16, ccx * 16, ccz * 16);
         }
         else if (M.verdict == 1)
@@ -2432,6 +4262,22 @@ int main(int argc, char** argv) {
             std::sort(res.begin(), res.end(), [](const Result& a_, const Result& b_) { return a_.var > b_.var; });
         }
 
+        // --pass1-out: dump the (re-scored) pass-1 ranking and stop before pass 2.
+        // Built for the X survey: spot strength along X is the SAME on every Z line
+        // (profiles correlate 0.996 between line 4 and line 12656), so one single-row
+        // scan across the whole world width ranks every X column for all lines.
+        if (!pass1Out.empty()) {
+            FILE* po = fopen(pass1Out.c_str(), "w");
+            if (!po) { fprintf(stderr, "cannot write %s\n", pass1Out.c_str()); return 1; }
+            fprintf(po, "cx,cz,block_x,block_z,var,mean,max\n");
+            for (const Result& q : res)
+                fprintf(po, "%d,%d,%d,%d,%.4f,%.4f,%u\n", q.cx, q.cz, q.cx * 16 + 8, q.cz * 16 + 8, q.var, q.mean, q.mx);
+            fclose(po);
+            printf("\n--pass1-out: wrote %zu ranked locations to %s (pass 1 took %.1fs; pass 2 skipped)\n",
+                   res.size(), pass1Out.c_str(), gsecs);
+            return 0;
+        }
+
         double centerVar = 0; int crank = 0;
         for (size_t i = 0; i < res.size(); i++)
             if (res[i].cx == ccx && res[i].cz == ccz) { crank = (int)i + 1; centerVar = res[i].var; }
@@ -2560,7 +4406,7 @@ int main(int argc, char** argv) {
             R.D = derive(rcx, rcz, seedBase, bigN, bigNMin, tStart, tStep, deepT, tFloor,
                          bitWindow, maxBits, zMin, minDev, minTail, false);
             // EARLY EXIT: a spot that derived < 10 bits has no usable constraint.
-            // Skip the 3-arm measure + reach guard + scoreAt entirely â€” those cost
+            // Skip the 3-arm measure + reach guard + scoreAt entirely ??? those cost
             // 1-5s each and the answer is always "drop". This is the main speedup
             // for the ~70% of candidates that are structural duds.
             if (R.D.bitsFixed < 10) {
@@ -2579,14 +4425,14 @@ int main(int argc, char** argv) {
             // burn 1-2s on 3 arms to discover the same thing. Check: if the last
             // round's tail was sampled at deepT, its max is a useful signal.
             // If max < scoreT - 4, this spot cannot plausibly reach scoreT.
-            if (R.D.bitsFixed >= 10 && R.D.topT >= deepT) {
-                // Find the max count observed during derivation's last sampling at deepT
-                unsigned long long lastTail = 0;
-                for (auto& rd : R.D.rounds) if (rd.T >= deepT) lastTail = std::max(lastTail, rd.tail);
-                // If derivation found bits at deepT but its own sampling never saw
-                // anything near scoreT, measure() won't either. Skip.
-                // (lastTail > 0 means derive DID sample at deepT, so this is safe)
-            }
+            // (An abandoned optimization lived here: it scanned R.D.rounds for
+            // the max tail seen at deepT, commented "so this is safe -> Skip",
+            // and then did nothing with it. Removed rather than finished: the
+            // idea is to skip measure() when derivation's own deepT sampling
+            // never saw anything near scoreT, but measure() sets the verdict and
+            // verdict is the PRIMARY sort key (see the std::sort below), so
+            // skipping it reorders rows and changes which --emit-top spots are
+            // emitted. That is a scoring change, not a work elimination.)
             // bitsFixed == 0 is verdict 0 by definition -- do not pay for 3 arms
             // to discover that.
             // The 3-arm test lives at --deep-t. Running it at --score-t was a bug:
@@ -2888,7 +4734,7 @@ int main(int argc, char** argv) {
                    "measured batch produced ZERO hits in 100M seeds. WaitForExit means the\n"
                    "runner starts the next spot the moment one gives up.\n"
                    "Change 60000 (ms) to hunt each spot longer.\n\n", outFile.c_str(), 120, seedsDir.c_str());
-            printf("powershell -Command \"Get-Content '%s' | ForEach-Object { $a = $_ -split ' ', 2; "
+            printf(HS_PS " -Command \"Get-Content '%s' | ForEach-Object { $a = $_ -split ' ', 2; "
                    "Write-Host $a[0] $a[1]; $p = Start-Process -FilePath ('.\\' + $a[0]) -ArgumentList $a[1] "
                    "-PassThru -NoNewWindow; if (!$p.WaitForExit(60000)) { $p.Kill() } }\"\n",
                    outFile.c_str());
@@ -2898,7 +4744,7 @@ int main(int argc, char** argv) {
             // -match with a signed-int regex, NOT -split '_': a negative X like
             // -92224_5424 splits into ["",92224,5424] and $n[0] comes out empty,
             // silently scoring every negative-X family at the wrong centre.
-            printf("powershell -Command \"Get-ChildItem '%s\\*.csv' | ForEach-Object { "
+            printf(HS_PS " -Command \"Get-ChildItem '%s\\*.csv' | ForEach-Object { "
                    "if ($_.BaseName -match '^(-?\\d+)_(-?\\d+)$') { "
                    ".\\slime_refine.exe --seeds $_.FullName "
                    "--center-x $matches[1] --center-z $matches[2] --radius 6 } }\"\n", seedsDir.c_str());

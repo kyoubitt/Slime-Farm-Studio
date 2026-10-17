@@ -1,0 +1,86 @@
+VERIFICATION — what was checked in this share, and what was not
+================================================================
+Everything below was run from THIS folder on 2026-10-16, built from the shipped sources, on a laptop-class
+6 GB GPU (Windows, nvcc + MSVC). Nothing was verified from the original working copy.
+
+build.ps1
+---------
+CHECKED   Compiles all seven tools from the shipped sources with no errors: hotspot_scan.cu, slime_gpu.cu,
+          slime_refine.cpp, perimeter_setup.cpp, phase_prepass.cu, geo_rank.cpp, afk_rescan.cpp.
+CHECKED   All three self-tests pass:
+            hotspot_scan  - GPU vs validated CPU core, incl. off-centre windows
+            slime_gpu     - same, independently
+            slime_refine  - reproduces slimefinder.jar's fine phase exactly
+CHECKED   Every source build.ps1 references is present. (It referenced two - slime_gpu.cu and geo_rank.cpp -
+          that the first pass of this share had left out; both are now shipped. The build banner also points
+          at stress_toolchain.ps1, which is now shipped for the same reason.)
+NOT       Any GPU other than the one above. `-arch=native` means binaries never port; sources should.
+NOT       Linux. The orchestration is PowerShell driving Windows .exe files throughout.
+
+hotspot_scan.exe --phase-search (the exact search)
+--------------------------------------------------
+CHECKED   Known answer. Re-searching the record spot 16598688,-28207696 returns SPOT BEST 76.23 cq,
+          80 chunks at the screen and 86 at the refined best - matching data\known_answers.csv.
+CHECKED   Runs inside 6 GB alongside a desktop.
+NOT       Long runs from this folder (hours). The original ran for days; the share has only been run in
+          single-spot and few-thousand-spot bursts.
+
+phase_prepass.exe (the screen)
+------------------------------
+CHECKED   Built-in bit-sliced-bound self-test passes.
+CHECKED   3,000-spot screen at 0.011 s/spot with the default 3 worker threads.
+CHECKED   Peak GPU memory 2,034 MiB of 6,141 MiB during that run, desktop included - so roughly 1.5-1.8 GB
+          of it is this tool.
+NOT       A GPU with less than 6 GB. If you have 3-4 GB, set PP_WORKERS=1 or 2 (environment variable) before
+          trusting a long run; each worker carries its own buffers.
+NOT       --y39 mode in this share. Note the floor difference documented in AI_CONTEXT.md: --floor 64 is
+          verified identical in chunk mode but moves `best` on 4 spots in 3,000 in --y39 mode.
+
+afk_rescan.exe + y39_rank.ps1 (the -39 ranking)
+-----------------------------------------------
+CHECKED   Known answer, all five rows. Re-scoring the fixture's AFK points at --dy 24 --window 48 reproduces
+          every estimate_blocks39 exactly: 20506, 19734, 19103, 18885, 18727.
+NOT       The caching path in y39_rank.ps1 at archive scale. It was verified on the original 8,633-farm
+          archive (84.3 s -> 2.5 s, identical output), but this share ships no archive to exercise it.
+
+hunt_pipeline.ps1 / heat\*.ps1 (orchestration)
+----------------------------------------------
+CHECKED   heat\phase_spots.ps1 drives the exact search and files results correctly from this folder.
+          (The test run's filed farms, images and ledger rows were deleted afterwards by exact name - the
+          share intentionally ships no results.)
+NOT       A full compartment (heat\universe_chunk.ps1) from this folder. It needs a spot list, which is not
+          shipped - see data\DATA.txt.
+NOT       heat\second_pass.ps1, heat\tier2_skim.ps1, heat\best_family.ps1, heat\rescreen.ps1,
+          heat\heat_of.ps1, heat\spot_top.ps1. Shipped as-is, exercised only in the original working copy.
+
+catalogue\ (the heat pipeline)
+------------------------------
+NOT       Built or run from this share at all. catalog_build.cpp and the tools folder are shipped as the
+          method for producing heat and the tier lists; the 2.8 GB catalogue they produce is not shipped.
+          docs\HEAT_CATALOGUE.txt documents the original run: 109,040,528 spots, 16,384 classes, keep
+          threshold read >= 6.5, ~18,000 pairs/s, 1.5 h.
+NOTE      catalogue\tools\analyze_z.py had a hard-coded absolute path on the author's machine. It now takes
+          the folder as argv[1] and defaults to ./zscan/. This change is untested - there is no z-scan data
+          in the share to run it against.
+NOTE      catalogue\tools\hotspot_scan.cu is a SNAPSHOT of the version used for the catalogue run. The
+          top-level hotspot_scan.cu is newer. Build the catalogue tools in their own folder, not over the
+          top-level one.
+
+perimeter_gen\
+--------------
+NOT       Built or run. Shipped as source with its own build.bat and notes; it is a separate C project and
+          was never part of the GPU toolchain.
+
+Personal data
+-------------
+CHECKED   Case-insensitive content and filename scan for absolute user paths, the author's username and
+          email, hardware model names, .claude paths and "the user" phrasing. All hits inspected by hand
+          and fixed; the final scan returns zero text-file matches. No binaries, no hidden files, exactly
+          one .md (AI_CONTEXT.md).
+
+What the sender still has to do
+-------------------------------
+1. Delete edited_files\ before passing this on. It exists so the sender can see every change made while
+   preparing the share; the recipient has no use for it.
+2. Decide whether to include the catalogue, the spot list or the farm archive - none are shipped. See
+   data\DATA.txt.

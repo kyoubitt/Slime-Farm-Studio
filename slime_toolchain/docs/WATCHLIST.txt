@@ -1,0 +1,55 @@
+# watchlist\ - the spot archive (protocol, user 2026-10-03)
+
+`watchlist.csv` is a permanent archive of SPOTS worth remembering, not farms. It exists because the top of the
+record archive is made of a handful of exceptional spots, not exceptional seeds: the top 50 farms at y -39 come
+from only 15 distinct spots, 45 of the 50 from spots that produced two or more of them, and 10 of the top 50 from
+the record spot alone (9060800,-15431040). A spot that produces one top farm nearly always produces several.
+
+## Columns
+
+`spot_x, spot_z` - the spot (screen coordinates) | `max_chunks` - highest chunk count among its filed farms
+`best_b39` / `best_cq` - its best farm | `farms_filed` - how many 66+ farms it has produced
+`found` - which section found it | `reason` - why it is listed | `deep_searched` - date, blank if never
+`note` - what a deep search found
+
+## Entry rule
+
+A spot is archived when it reaches **79+ chunks** in a filed farm. That is the measured gate: all three 19,000+
+farms ever found came from 79+ spots, and none of the 925 spots that topped out at 74-78 has produced one, despite
+being ~75% of all exact-search time. Spots producing 2+ farms in the archive top 100 are also worth adding.
+
+## Reporting protocol (standing, user 2026-10-03)
+
+After every section, the results report lists any NEW spots that cleared the gate and **asks whether to scan them
+deeper**. Nothing is re-scanned without being asked. Deep scans are logged back into `deep_searched` / `note` so a
+spot is never deep-searched twice.
+
+## The deep-search test (2026-10-03) - CLOSED, and NOT part of any run
+
+A one-off experiment, run by hand with explicit flags. **It is not the default and must not become one:**
+`heat\phase_spots.ps1` keeps its shipped budget (`-TopPct 5`, refine 400/200/200, `-TopPositions 10`), and a
+section passes no search flags at all. The experiment used ~9x that budget - 25% of families, refine 1500/800/800,
+all 15 AFK positions, 2,100-2,800 layouts refined instead of ~600 - at 41-47 s a spot against ~4.7 s.
+
+**Result: 8 of 8 spots unchanged. Zero new farms, zero improvement to any spot's best.**
+
+| spot | best before | best after 9x search |
+|---|---|---|
+| 14432976,5926432 | 19,103 | 19,103 |
+| -15986784,-22325440 | 18,692 | 18,692 |
+| -29388896,19617584 | 18,507 | 18,507 |
+| -13677024,-22325440 | 17,969 | 17,969 |
+| -509360,19617600 | 17,709 | 17,709 |
+| -25130288,16457136 | 17,632 | 17,632 |
+| -7531104,20099648 | 17,386 | 17,386 |
+| 9060800,-15431040 (record) | 19,734 | 19,734 |
+
+So the standard exact-search budget already SATURATES a spot - there are no blocks left on the table at spots we
+have visited. This empirically refutes the 2026-10-01 audit's `exact-budget` hypothesis ("did we leave blocks at
+spots already searched?"), which had never been verified. Do not re-propose deeper per-spot searching as a way to
+find more; the remaining value is in visiting NEW spots.
+
+CAVEAT on the gate: `max_chunks` here is the chunk count of a FILED farm (post exact search). The screen's own
+count (the 74+ promote threshold) is a different, correlated quantity - the deep runs above reported 74-78 for
+spots whose filed farms show 80-81. Do not turn "79+ chunks" into a screen-side promote threshold without first
+measuring the screen-count to exact-count mapping.

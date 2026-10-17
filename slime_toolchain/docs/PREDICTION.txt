@@ -1,0 +1,637 @@
+# Prediction - groundwork for the final goal (2026-09-13)
+
+**Goal:** predict where the best farms are - and what they will read in game - from structure, instead of
+searching every spot. The exact phase search proves what a spot holds; prediction decides which spots
+(and which families) deserve it, and eventually could name record seeds directly.
+
+## 1. What is already exact (the target is well defined)
+
+- **In-game count from the layout.** `afk_rescan` (feet at y -39 over the -64 floor: `24^2 <= a^2 + b^2 + 24^2 <= 128^2`,
+  no inner circle, outer radius 125.7, AFK point free within +-48 blocks) reproduces `/perimeterinfo`:
+  full floor 49,669 = 49,669; farms 69.39 (18,598), 70.82 (18,261), 69.30, 68.28, 66.04 exactly; 70.64 +20;
+  misses: 70.34 and 69.09 (~200 - unexplained, the the in-game numbers win). **So the target is "the best -39 count
+  of a spot", computable from any layout.**
+- **Layout from the seed, per class.** Phase model (docs\PHASE_MODEL.txt): for family f (bits 0-19) and class c
+  (bits 20-34), all 8,192 top values give layouts fixed by 222 numbers B(0); a chunk is slime when
+  w = phase (mod 5) (phase + 2 after the wrap). The best layout of a class costs 222 numbers, not 8,192 seeds.
+
+## 2. What the data says (479-760 exact spots)
+
+| finding | evidence |
+|---|---|
+| A rich spot = one rich family | at 40 spots with >= 40 rows of 70+ chunks the top family holds 50-100% (10 spots: 100%); the 70.34 spot: 91% family 0x0FFDB, all five of its 69+ farms |
+| Richness is phase ALIGNMENT, not possible count | 0x0FFDB ranks only 0.52% by possible chunks at its position |
+| Inside a rich family the good classes share low bits | 0x0FFDB's 70+ classes: class mod 64 = 9..14 (245 of 353 rows = 13); bits 9-14 take 20 of 64 values |
+| Some X columns carry across lines | X = -5042368: 5 of 5 lines strong (66.84-68.85, one spot with 210 layouts of 70+); X = -21323312: 68.86 and the 69.39 (#1 in game) |
+| Spots rich in MANY families do slightly better at -39 | corr(-39 best, top-family share) = -0.23 |
+| Pre-search predictors are weak | corr(-39 best, heat40) = 0.10; after the search: layouts70 0.47, spot best cq 0.77 |
+| The -39 ranking found the in-game #1 | the 69.39 was mid-table by model cq; the five best -39 spots are exactly the in-game #1-#5 |
+
+## 3. The structure to exploit (theory)
+
+B(0) of chunk i is the LCG output of `((f + P_i) ^ C) ^ M` with `P_i = x^2 a + x b + z^2 c + z d` (int32 pieces).
+- **Without the xor, the phase differences between chunks would not depend on the seed at all** - a spot's
+  quality would be a pure property of its P-differences. The xor with C (8 of the 15 class bits flipped,
+  C >> 20 = 0x5E43) makes richness depend on (f, c) through carries. So richness = (spot geometry in
+  P-space) x (carry pattern of f + P against C).
+- **Transport hypothesis (H1):** two spots whose chunk offsets differ by a near-constant Delta in the low bits
+  share rich families, shifted: f' = f - Delta (mod 2^20). Along one X column the x-part of P is the same, so
+  lines with similar z-differences would share rich families - a candidate explanation for strong X columns.
+- **Low-bit hypothesis (H3):** the farm is set by roughly the lowest 26 seed bits (family + class mod 64); the
+  class's upper bits and v mostly rotate phases. If universal, a first pass over (family, class mod 64) -
+  2^26 instead of 2^35 - could rank families ~500x cheaper (needs a sound bound to stay exact).
+
+- **SISTER COLUMNS (found 2026-09-13): hot X columns repeat every 65,536 chunks (2^20 = 1,048,576 blocks).** Why: whether a
+  chunk can be slime depends on the low 18 bits of (seed + P_i); inside a window only the DIFFERENCES P_i - P_c matter
+  (a constant is absorbed by the family), and their low 18 bits are unchanged when cx moves by 2^16 (the x^2 term's
+  2*cx*dx*0x4c1906 carries a factor 4; the x term cancels). In Z the same holds every 2^17 chunks. Data: the 69,955 hot
+  X peaks use 8,702 of 65,536 residues (period exactly 2^16), and 30% of a hot column's sisters are hot (16x chance;
+  shifted controls 0%). Each great spot has up to ~56 sister spots (same line, X + k * 1,048,576 blocks) with the same
+  possible-chunk structure - with its rich family SHIFTED by the offset difference. Their FARMS are NOT as good
+  (tested 2026-09-13, section 5.2): richness needs the high bits, which the shift scrambles.
+
+## 4. Data for testing any predictor
+
+- `main\theory\prediction\spots.csv` (`heat\prediction_table.ps1`): one row per exact spot - heat, line, X,
+  layout counts, best cq, best -39 estimate (top 20 refined farms re-scored), in-game count if measured, and
+  the richest family's share / possible count / rank / class mod 64. Rebuild any time (~45 s).
+- `main\theory\heat\phase_layouts\<X>_<Z>.csv` - every kept layout (seed, count, blocks, position, family,
+  class); `..._scored.csv` - refined 65+ farms. `main\records\measured_in_game.csv` - the ground truth.
+
+## 5. Experiments, in order
+
+1. DONE 2026-09-13 - **X-column test: NO.** 103 unsearched lines on 5 "strong" columns (-5042368, -8546768, 484176,
+   -21323312, -25146448): mean best 64.72, 67+ 6%, 68+ 1%, no 69 - vs 64.60 / 7% / 3% / 11 of 987 normal spots at the
+   same heat. The 5-of-5 at X = -5042368 was selection (its hottest lines); its other 38 lines are ordinary (best 67.78).
+2. DONE 2026-09-13 - **Transport / sister test: NO.** The 35 sisters (X +- 1..3 x 1,048,576 blocks, same line) of the
+   69.39, 70.34, 70.82, 70.64, 69.30 and 70.09 spots: mean best 62.88, none 67+ (best 66.38), 0-5 layouts of 70+ (the
+   originals: 20-254). The predicted rich family (the original's, bits 16-17 shifted by 3K * 2^16, exact for the
+   possible structure) is among the 68+ layouts at 0 of 19 sisters. Why: the sister shift preserves the low 18 bits of
+   every P-difference (possibility) but moves bits >= 18 by an amount LINEAR in the chunk's x (K * 2^17 * x * 0x4c1906),
+   so the phases - which use all 31 bits of B(0) - scramble. **Richness lives in the high bits; it is a property of the
+   spot itself, not of its column, line or sisters.** Pre-search statistics that see only the low 18 bits (heat,
+   possible counts, columns, sisters) cannot find it - which fits heat's weak r = 0.10.
+3. DONE 2026-09-13 - **Low-bit test: YES.** 187 families with >= 10 rows of 70+ chunks at 109 spots: the share of a
+   family's 70+ rows inside its best 8-wide window of class mod 64 is median 1.00 (25%: 0.92, 10%: 0.71, min 0.43;
+   random would be ~0.13-0.25); 146 of 187 are >= 0.9. The upper class bits (class >> 9) take a median of only 4 of 64
+   values. So a rich (family, class) is fixed by ~26 low bits plus a few upper-bit values - the class space of a rich
+   family is tiny. Use: a class-group pre-pass could rank families far cheaper - but only with a SOUND group bound
+   (the search must stay exact); without one it is a predictor, not a search.
+4. **Spot ranking model**: fit pre-search features (heat, X-column record, line, possible-count statistics) on
+   spots.csv with a holdout; compare with heat (0.10). Only worth deploying if clearly better.
+5. **In-game truth**: keep measuring the top -39 estimates - every measurement is a test of the whole chain.
+
+## 6. What makes a family rich (study 2026-09-13, main\theory\research\phase_study.cpp)
+
+- **Richness is a jackpot, not a gradient.** At the 70.34's AFK chunk, 2,001 kept families (top 5%): the rich family 0x0FFDB
+  reaches 75 chunks; every other one 42-60 (median ~49). Possible-count rank of the jackpot family: #141.
+- **A class sample finds a jackpot only if it hits the family's good classes.** Same position: best over 64 classes (class
+  bits 6-14 = 0) = 74, over 4,096 = 75, over 512 random = 68 - all rank it #1 of 2,001. For ordinary families a random
+  512-class sample ranks best (Spearman 0.87 vs the full truth; 64 structured classes 0.59; possible count 0.39).
+- **As a spot predictor the cheap version is not enough.** 64-class pre-pass over all 15 positions of 30 searched spots:
+  corr with the spot's true best count 0.43 (heat 0.23), with best cq 0.39 (heat 0.14). It ranks the 70.34 spot #1 but scores
+  the other record spots mid-pack (61-65 while their truth is 72-76): their rich families have NO good class below 64.
+- **The good classes of a rich family form a lattice at family-specific high bits.** 70.82's rich family 0x0A8BB: class >> 6 in
+  {221, 229, 347, 349, 357, 365}; 69.30's 0x9A563: {265, 273, 393, 401} - steps of 8 and 128 (class bits 9 and 13 flip freely),
+  on top of the low-bit window. Where the lattice sits differs per family, so no fixed cheap sample covers all jackpots; a
+  sample big enough to (4,096 classes) costs 1/8 of the exact search.
+- **Open question (D1, sharpened):** which class bits are "free" for a family, and where its lattice sits, comes from how the
+  carries of f + P_i interact with the xor constant C. If that is predictable from the family alone, a pre-pass could aim at
+  the right classes - the remaining route to real prediction.
+
+## 7. The prediction search (2026-09-13, user's idea) - main\theory\research\phase_prepass.cu
+A SEPARATE search that only chooses which new spots the exact search should visit (it never replaces it).
+- **phase_prepass**: per spot, all 15 grid positions, the kept families (top 5%) on a SAMPLE of K classes each, exact phase
+  model; reports the best count found and how many (family, class) pairs reach 66/68/70. GPU, ~1 s per spot at K = 512.
+- **Validation on 30 searched spots** (6 record spots + 24 spread over true best count 65-76):
+
+  | pre-pass | corr with true best count | corr with best cq | time/spot |
+  |---|---|---|---|
+  | 2,048 random classes / family | 0.86 | 0.78 | ~3.7 s |
+  | 512 random classes / family | 0.77 | 0.67 (families66: 0.75) | ~1 s |
+  | 256 low-bit classes | 0.58 | 0.47 | ~0.5 s |
+  | heat40 (same 30 spots) | 0.23 | 0.14 | - |
+
+  Random samples work because a rich family's good classes form a lattice at family-specific high bits (section 6): a
+  random sample of ~1/64 of the classes hits it often enough, a fixed low-bit sample misses most. Caveat: 30 spots, 6 of
+  them records - the real test is the experiment below.
+- **Experiment**: pool = the next 1,000 fresh spots by heat (27.8-26.8) + 1,000 random fresh spots at heat 24-26 (fresh =
+  the search's same-farm rule, +-4 chunks X / +-2 rows Z from any searched spot). Screen all with K = 512, exact-search the
+  top 50, compare with the heat list's own results in the same band (the WR search covers pool A in the next hours).
+- **RESULT (2026-09-13): the prediction search works.** 2,000 fresh spots screened (25 min), the top 50 exact-searched (11 min):
+
+  | | spots | mean best cq | 67+ | 68+ | 69+ | 70+ layouts per spot |
+  |---|---|---|---|---|---|---|
+  | picks, heat 26.8-27.8 | 38 | 66.45 | 32% | 13% | 3 | 40 |
+  | heat list, same heat | 284 | 64.49 | 7% | 1% | 1 | 3.2 |
+  | picks, heat 24-26 | 12 | 65.95 | 25% | 17% | 1 | 47 |
+  | heat list and tests, heat 24-26 | 214 | 64.23 | 1% | 0% | 1 | 1.4 |
+
+  Four farms of 69.9+ from 50 spots (70.80 at heat 25.9, 70.25, 70.11, 69.91; -39 estimates 17,837-18,053) against about one
+  per 280 spots for the heat list in that band. The pre-pass also finds rich spots at LOW heat, which the heat list reaches late.
+  Within the picks, corr(pre-pass best, exact best count) = 0.46. Nothing is lost by ordering spots this way: the exact search
+  per spot is unchanged and unpicked spots stay on the list.
+- **CONFIRMED (cycle #3 of predict_cycle.ps1, 2026-09-13):** 2,000 fresh spots (1,000 hottest unscreened + 1,000 random at heat
+  20-27.6), 2-stage screen, top 50 exact-searched in 30 min: best 72.9 cq (new model record), 67+ 19, 68+ 12, 69+ 7, 70+ 5,
+  186 new 66+ farms. All 100 prediction picks so far: mean best 66.54, 67+ 34%, 68+ 19%, 69+ 11% (11 farms), 70+ 8, against
+  the heat list's 1,007 spots at heat 26.8+: 64.68, 8%, 4%, 1.2% (12), 4. Per spot ~9x the 69+ rate and ~20x the 70+ rate;
+  per hour ~4x the 69+ farms and ~8x the 70+ farms. The random band also delivers (a 69.66 at heat 20.5).
+  Two BIG -39 estimates above the in-game record: 72.22 (est 18,727) and 71.34 (est 18,675) at spot (28616800,-2104120).
+- **In game: the 72.22 measured 18,727** (exactly its -39 estimate) - the new #1, found by the prediction search's first real cycle. The -39 estimate is now exact for 6 measured farms.
+- **Pre-pass 2.2x faster (2026-09-13):** the exact search's fast inner loop ported (byte-identical output on 60 spots with all 15 positions) and only the exact search's own adaptive top-10 positions screened (same best at 58 of 60 spots; the 2 others had their best at a position the exact search never visits). Same predictive quality on the 30 known spots (score vs best cq 0.72 at 512 classes, 0.80 at 2,048). 0.51 -> 0.23 s per spot; a predict cycle ~22 min instead of 30. Keeping 50 exact picks per cycle: ranks 1-10 hold 69+ at 35%, 11-25 at 7%, 26-50 at 4% (the 72.9 was rank 26-50) - all far above the heat list's 1.2%.
+
+## 8. The probe screen (2026-09-20) - the pre-pass now nearly matches the exact search
+
+**Finding 1 - a rich family's WHOLE class landscape is lifted, not just its few good classes.**
+`main\theory\research\class_landscape.cpp` dumps the exact count of all 32,768 classes of a (spot, position, family).
+Over 100 known jackpots (count >= 72) and 200 ordinary kept families at the same positions: mean count over all classes
+**50.2 vs 39.2**, p99 **64.5 vs 46.4**. The jackpot's own good set is tiny - a median of **9 classes of 32,768** (within 2
+of its best) - which is why the old 512-random sample found it only 14% of the time.
+The good classes sit on the lattice the phase model predicts: c+4, c+512 and c+8192 keep the count within 2 about 30% of
+the time each (every other step 0-18%), because a class enters only through `(H_i + c) & C'` and those steps stay inside a
+run of C' = 0x5E43 for all but ~1/16 of the chunks (`land_analyze.cpp`).
+
+**Finding 2 - 8 classes per family find the jackpot family.** `probe_rank.cpp` on 20 known jackpots: the jackpot family's
+rank among the ~59,000 kept families is **median 7 by the mean of 8 random classes** (median 2 by their max), against
+**1,945 by possible chunks** - the statistic the pre-pass and the exact search's family cut rank by. Inside the top 256
+families: 100% (probe-mean) vs 25% (possible).
+
+**The new screen** (`phase_prepass --probe 8 --exhaust N --top-pct P`, the default): probe every kept family with 8 classes,
+then run ALL 32,768 classes of the best N. Measured against the spot's true exact best on **180 searched spots**
+(80 of them with best >= 74):
+
+| screen | s/spot | finds the spot's exact best within 2 | on the 80 best spots |
+|---|---|---|---|
+| old: top 5%, 512 random classes | 0.27 | 34% | 12% |
+| top 0.6%, 4,096 random classes | 0.32 | 76% | 65% |
+| **probe 8, top 0.25%, exhaust 64** (stage 1) | **0.24** | **84%** | **79%** |
+| probe 8, top 1%, exhaust 64 | 0.34 | 91% | 86% |
+| **probe 8, top 1%, exhaust 128** (stage 2) | **0.39** | **94%** | **92%** |
+| probe 8, top 5%, exhaust 128 | 0.96 | 94% | 92% |
+
+It never reported a count above the spot's exact best (a sanity check: its space is a subset of the exact search's).
+So at the same price the screen went from "a weak hint" to "the spot's answer": a cycle's picks are now the actual best
+spots of the chunk, not a guess. `predict_cycle.ps1` uses it for both stages.
+
+**Consequence - the ~16,000 spots screened before 2026-09-20 deserve a second look** (`heat\rescreen.ps1`): they were
+ranked by the 34% screen, so rich spots among them were very likely passed over.
+
+## 9. Master predictor: what a spot's geometry alone can say (2026-09-20)
+
+**The exact algebra.** For family f, class c and chunk offset P_i:
+`B_i(c) = (8M * ((H_i + c) ^ C') + L_i) mod 2^31`, with `H_i = ((f + P_i) >> 20) & 0x7FFF`,
+`L_i = ((((f + P_i) mod 2^20) ^ K_lo) * M + 11) >> 17`, `C' = 0x5E43`, `M = 0x5DEECE66D`.
+Two consequences: **the class enters ONLY through `(H_i + c) ^ C'`**, and **`H_i` can only be `(P_i >> 20)` or that
+plus 1** (the carry out of the low 20 bits). So the SPOT fixes every pairwise H difference up to 1, whatever the seed;
+the family chooses only which chunks are possible (parity of L) and the L values themselves.
+
+**Three things that turned out NOT to be the mechanism** (research tools in `main\theory\research`):
+- *Class-independent pairs* (`core_align`, `core_align2`). A pair whose H difference stays inside a run of C' keeps a
+  constant B difference for ~15/16 of classes - but over 64 sampled classes NO pair agrees always (rich and control
+  alike), and pairs agreeing in > 80% of classes: 0.0% in both. The transparent steps explain the good-class LATTICE
+  (section 8), not the jackpot.
+- *H structure of the aligned set*. Among the chunks actually slime together at a family's best class, H differences
+  divisible by 4 occur 24.9% of the time - exactly chance, and identical to a random subset of the same size (25.0%).
+- *H clustering of the possible set* (`hstruct`). Rich 1.09 vs control 0.91 at |dH| <= 8, nothing at 64 and above.
+- *Possible count*. Controlled for: at equal possible chunks rich families average 49.6 vs 39.3 (bucket 140-144), and
+  they sit **+8.5 counts above the control regression line** `mean = 6.93 + 0.229 * possible`. Richness is real and
+  family-level, it lives in the L values, and it is visible in the AVERAGE class - which is what the probe exploits.
+
+**What the geometry DOES predict** (`geo_predict` on all 1,724 searched spots, `geo_rank.exe` for production):
+`hpair` = pairs of window chunks whose H values are within 512, minimum over the 15 grid positions - 222 offsets per
+position, no family and no class, ~2,000 operations (the family cut costs 2^18 * 222).
+
+| statistic | corr with the spot's exact best |
+|---|---|
+| hpair (H within 512, min over positions) | **-0.288** |
+| H bins of 512 occupied (max over positions) | +0.262 |
+| pairs with close low-20 bits | +0.02 |
+| no-xor coherence (best 2^17 arc window of P*M) | -0.00 |
+| heat40 (for comparison) | 0.10-0.23 |
+
+It is nearly independent of heat (corr +0.15) and survives inside a narrow heat band (26-30: the low-hpair half holds
+72+ at 21.0% and 74+ at 5.0%, the high half 12.5% and 2.0%). By quintile over all searched spots:
+
+| hpair quintile (low = H spread out) | mean best | 72+ | 74+ |
+|---|---|---|---|
+| 1-3 | 70.2-70.3 | 25-27% | 6-7% |
+| 4 | 69.4 | 15.1% | 2.0% |
+| 5 | 68.7 | 8.4% | 1.2% |
+
+So it is a **free veto**: the worst 40% of spots hold a 74+ three to six times less often. `predict_cycle.ps1` now
+picks half of every chunk by it (band `geo`, cached in `main\theory\prediction\universe_geo.csv`) and keeps the random
+half as a control band, so the cycle lines themselves measure whether it holds up.
+Distance from the world origin explains none of it (corr(best, |X|) = -0.00, corr(best, |Z|) = -0.04).
+
+**Where this points.** A spot statistic this cheap is what a whole-world sweep would need (the heat survey costs
+2^18 * 222 per spot; this costs 2,000). It is not yet a master predictor - r = -0.29 is a prior, not an answer - but
+combined with the probe screen (section 8, 84-94% accurate at 0.24 s) the chain is now: geometry prior (free) ->
+probe screen (sub-second) -> exact search (12.8 s) -> in-game measurement.
+
+### 9a. Groundwork for the sweep (2026-09-20): the prior saturates, and there is no cheap middle ground
+
+- **More geometry features do not help** (`geo_fit.cpp`, 21 features: hpair at five widths x min/mean/max, H bins,
+  nearest-neighbour gaps, the same on the low 20 bits). Trained on 11,920 re-screened spots (screen labels), tested on
+  the 1,724 spots with TRUE exact bests: holdout corr **+0.290**, against **-0.288** for `hpair512min` alone. The
+  signal is one-dimensional - H clustering - and the ridge fit finds nothing else. Useful anyway as a filter: top
+  decile of the fitted prior holds 74+ at **9.3%**, the rest 4.1%, the bottom decile **0.6%**.
+- **A tiny seed sample does NOT rank spots** (`spot_probe.cpp`): N random (family, class) draws per spot, scored by
+  their max or the mean of their top 8, against the true exact best of 1,724 spots -
+
+  | draws | ops/spot | corr (max) | corr (mean of top 8) |
+  |---|---|---|---|
+  | 32 | 7.1e3 | +0.02 | +0.03 |
+  | 128 | 2.8e4 | +0.03 | +0.03 |
+  | 512 | 1.1e5 | +0.06 | +0.05 |
+  | 2,048 | 4.5e5 | +0.05 | +0.04 |
+
+  Random families say nothing: a probe only becomes meaningful AFTER the family cut (section 8), and the family cut is
+  the 2^18 * 222 pass that heat also pays for. **So there is no cheap middle ground between geometry (2e3 ops, -0.29)
+  and the family cut (5.8e7 ops).** Any world sweep must be: geometry prior everywhere -> family cut + probe screen on
+  the survivors -> exact search on the best.
+
+### 9b. CORRECTION (2026-09-20): the geometry prior measured on an UNSELECTED population
+
+Section 9's numbers (corr -0.288, the worst 40% of spots holding a 74+ at 1-2% against 6-7%) were measured on the
+1,724 **exact-searched** spots. Those spots are not a sample of anything: they were picked by heat and by the old
+screen. Re-measured on the 11,920 spots of the re-screen (`heat\rescreen.ps1`, the general population of the
+heat-20 universe, labelled by the probe screen):
+
+| prior on 11,920 unselected spots | corr with the best count | top decile: 70+ | 72+ | 74+ |
+|---|---|---|---|---|
+| geometry (hpair512min) | **-0.150** | 12.6% | 2.1% | 0.25% |
+| heat40 | +0.144 | 15.2% | 1.5% | 0.07% |
+| **combined: heat z - geo z** | **+0.234** | **18.0%** | **2.7%** | 0.17% |
+| base rate (all 11,920) | - | 12.9% | 1.8% | 0.14% |
+
+So: geometry is about as strong as heat, not twice as strong, and the two are near-independent - combining them beats
+either, which is what `predict_cycle` now uses for band A. But the honest limit is the last column: **no prior
+enriches the TOP tier**. A 74+ sits at 0.14% base and 0.17% in the best decile. Priors move the middle of the
+distribution (70+: 12.9% -> 18.0%); records come from the screen, not from the prior.
+Consequence for the sweep: a geometry prior cannot replace screening on new territory, it can only order it. The
+open question is now whether never-surveyed spots (below heat 20, or never sampled) hold 72+/74+ at a rate near the
+heat-20 universe's 1.8% / 0.14% - that is one 8-minute screening run of 2,000 random world spots, and it decides
+whether sweeping new territory is worth GPU hours at all.
+
+### 9c. The world test (2026-09-20): heat is a population filter, and it cannot be skipped
+
+3,000 RANDOM world spots (never surveyed, no heat filter) screened with the same stage-1 probe settings as the
+re-screen, against the 11,920 spots of the heat-20 universe:
+
+| population | mean best | 70+ | 72+ | 74+ |
+|---|---|---|---|---|
+| heat-20 universe (n=11,920) | 67.8 | 12.9% | 1.8% | 0.14% |
+| **random world (n=3,000)** | **60.7** | **0.00%** | **0.00%** | **0.00%** |
+
+Not one of 3,000 random spots reached even 70 chunks. So heat is weak WITHIN the universe (corr +0.144, section 9b)
+and decisive BETWEEN populations: the heat >= 20 cut is what makes a spot viable at all, and no cheap statistic
+replaces it - geometry ranks inside a population, it cannot identify one (and random seed sampling ranks nothing,
+section 9a). **A world sweep therefore needs the heat survey EXTENDED, not bypassed.** The 3,000,000-spot survey is
+an asset, not a limitation; the 183,536 spots above heat 20 are the hunting ground we actually have.
+
+## 10. The objective was wrong: score -39 BLOCKS, not chunk count (2026-09-20)
+
+The search has always ranked layouts and spots by how many of the 222 chunks are slime. The number that matters is
+what `/perimeterinfo` reads at the the player's AFK spot (feet at y -39 over the -64 floor): blocks = SUM over slime chunks
+of that cell's spawn columns, `0 <= a^2 + b^2 <= 15808` (dy = 24, no inner no-spawn circle; a full floor = 49,669,
+exactly the in-game number). Those are different things:
+
+- Within ONE chunk count the blocks span ~2,500 (count 74: 15,517-18,006), while two extra chunks are worth ~580.
+- At **23% of 2,335 searched spots** the best-blocks layout is not the best-count layout; 6% of spots lose over 500
+  blocks that way (~2 cq, a 70 against a 72) and 29 spots over 1,000.
+- Against the TRUE -39 number of 303 filed farms:
+
+  | ranking objective | corr with the -39 count | best -39 in its top 20 |
+  |---|---|---|
+  | chunk count | **+0.21** | 17,984 |
+  | cq blocks (inner 24, outer 128) | +0.37 | 18,407 |
+  | **-39 blocks (`--y39`)** | **+0.74** | **18,407** (the true best) |
+
+  Ranking by chunk count misses the best farm of the set in its top 20; ranking by -39 blocks finds it. The gap from
+  1.0 is `afk_rescan`'s +-48-block AFK optimisation, which a fixed-position weighting cannot see.
+
+**The phase model carries the weights for free**: a chunk is slime when w == phase (mod 5), so the sweep that counts
+aligned chunks can add their weights instead - same cost. Verified against brute force over all 8,192 top values:
+**2,000 checks, 0 mismatches** (`main\theory\research\phase_blocks.cpp`).
+**And the existing bound stays sound**: a cell is worth at most 256 blocks, so blocks <= 256 * count and the count
+bound at T = 60 cannot prune anything worth 60 cq or more. The proven fast bound kernel is untouched; only the exact
+scoring of survivors changes.
+`phase_prepass` now takes `--blocks` (cq weighting) and `--y39` (the raised-AFK weighting); `predict_cycle` screens
+both stages with `--y39` at the same 0.25 s/spot, and its score is `best / 256 + log2(1 + pairs68)`.
+**Still on count:** the exact search's own layout ranking and refine selection (hotspot_scan / phase_spots) - the
+next change, and it must keep the count floor so that nothing currently found is lost.
+
+## 11. The -39 ranking, deployed - and the mask hole it exposed (2026-09-20)
+
+Installed in the exact search: the refine shortlist is now the UNION of three rankings - top 400 layouts by cq
+blocks, top 200 by chunk count, top 200 by **-39 blocks** (`--phase-refine-y39`, driver `-RefineY39`). A union can
+only ADD: at the 68.28 spot the old 939 seeds are still there, row for row, with 40 added (+4% refine CPU), and the
+regression gate re-found **132 of 132** archived farms across 16 spots. Every shortlist and keep row now carries a
+`blocks39` column.
+
+**The bug the deployment found.** The spawn mask has 222 cells, not 226: the four chunks touching the AFK column are
+dropped because at dy = 0 they lie entirely inside the 24-block exclusion sphere. At dy = 24 there is no inner
+circle, so those four are the first thing the game counts - a full 256 columns each. Scoring the -39 objective over
+the mask therefore read **48,645 for a full floor instead of 49,669**, and made two layouts that differ only in the
+middle tie - the exact difference the raised AFK exists to see (the 69.30's 4 middle chunks, +3.8% in game). Both
+`hotspot_scan --phase-refine-y39` and `phase_prepass --y39` had it; both now add the four from their own offsets and
+abort if the window does not sum to 49,669. Checked against `afk_rescan` (independent code, calibrated in game) on
+25 shortlist layouts: **25 of 25 exact**. Measured cost of the bug at the 68.28 spot: top-1 and top-50 unchanged,
+12 of the top 200 reordered - small here because the missing term is 256 blocks at 73% of layouts and 0 at 25%.
+
+**Which screen picks the best spots** (400 spots drawn at random from the 1,764 exact-searched, labelled with the
+true -39 number of their best farm via `afk_rescan --dy 24 --window 32`):
+
+| screen objective | Spearman vs true -39 | of the true top 40 | mean true -39 of its 40 picks |
+|---|---|---|---|
+| chunk count | 0.516 | 13 | 17,176 |
+| cq blocks (`--blocks`) | 0.588 | 17 | 17,262 |
+| **-39 blocks (`--y39`)** | **0.617** | **18** | **17,333** |
+
+(all 400 spots: mean 16,633, max 18,598.) The label is the -39 of the spot's best-CQ farm, so it understates the
+-39 screen - the farm it is measured on was itself picked by cq. Cost: 0.32 s/spot against 0.24, 226 cells instead
+of 222 plus the weighted sweep.
+
+**Open, and the obvious next run:** `main\theory\prediction\rescreened.csv` (15,613 spots) was ranked by CHUNK
+COUNT, the weakest of the three. Re-screening it with `--y39` is ~80 min of GPU and would change which 40 spots the
+exact search takes next - on the table above, 13 of the true top 40 becomes 18.
+
+## 12. The 19,103 record, and what found it (2026-09-20/21)
+
+**New in-game record: 19,103** (seed 230337960196917, AFK 14432930,5926460, 72.03 cq, 78 chunks), beating
+19,012 by 91. `afk_rescan` estimated it EXACTLY. Note the cq: at **72.03** it is *lower* than the 73.19 it
+beats - ranking farms by cq would have buried it. It won on the -39 objective, which is the whole point of
+sections 10-11.
+
+**The chain that found it**, every link built the same day:
+
+1. **The bound.** Sort the 220 non-zero -39 cell weights descending; a layout with `k` slime chunks reads at
+   most the prefix sum. The top 78 weights are all 256, so 19,103 needs **75+ chunks arithmetically** and
+   78+ realistically. This makes CHUNK COUNT the right thing to screen on, even though count correlates only
+   +0.21 with the in-game number - it is not a predictor, it is a *bound*.
+2. **The screen gate** (`phase_spots -GateCount`, `record_cycle -GateCount`). The probe screen costs 0.32 s
+   against the exact search's 14 s and **never over-states** a spot's best count (0 of 400). On the 18+54
+   candidates exact-searched since, it has called the count **exactly** every time.
+3. **New territory.** The gate over the old measured list found **0 spots at 74+ in 3,410**. The same gate
+   over `universe_h20` finds **0.44%** - and the record came from a spot at heat 24.4 that the old
+   top-10,000-X x top-300-lines cross product never contained.
+
+**Stage 2** (`heat\candidates.ps1`): re-screen the 0.44% that pass with `--y39` before searching them.
+Against the 18 candidates' real -39 numbers, screen blocks39 correlates **0.838** vs 0.506 for count. The
+screen is a LOWER BOUND, not a prediction - it read 17,747 for the record spot whose farm is 19,103.
+
+**Efficiency, and why count is self-defeating past a point.** Over 18 exact-searched candidates,
+`peri / (256 x count)` ran 86.4% to 96.9%, median 91.3%; the record sits at 95.7%. Count and efficiency run
+AGAINST each other - the 77-chunk spot was the worst at 88.4%, a 74 the best at 96.9% - because packing more
+slime chunks into 226 cells forces them onto low-weight rim cells. To beat 19,103 needs 96.9% at 77 chunks
+(the maximum ever seen), 95.7% at 78, 94.5% at 79, 93.3% at 80. The peri-optimal count is ~78-80, not maximal.
+
+**Families do not recur across the world (negative, 9,545 spots).** Best-families repeat 1,215 times, which
+looked like a 23x excess over uniform - but **1,171 of those pairs are spots within 2,048 blocks**, sharing
+most of their 226-chunk window. Genuinely distant repeats: **44 observed against 52.9 expected by chance** -
+below chance. A rich family is a local accident of the high bits of (seed + P), confirming the 2026-09-13
+sister-spot test on 270x more spots. There is no transportable family.
+
+**Where the tail stands.** 9,545 distinct universe spots: 74+ 0.42%, 76+ 0.063%, **78+ one spot - the
+record's own**. Universe estimates ~769 / ~115 / ~19. The 74+ rate is firm across three batches; every 78+
+number rests on a single observation (Poisson 95% CI on n=1: ~0.5 to 105), so treat ~19 as an order of
+magnitude, not a count.
+
+## 13. The 20,000 question, and what the archive already knew (2026-09-21)
+
+### 13a. 20,000 is out of reach in this universe
+
+A chunk fully inside the -39 disc contributes 256 blocks and no chunk contributes more, so the whole objective
+is `-39 <= 256 x k` where k is the slime-chunk count AT THE FINAL AFK POINT. The ladder is flat - the 91st
+largest cell weight is still 256 - so the bound is simply 256k:
+
+| target | chunks required | efficiency needed at that k |
+|---|---|---|
+| 19,103 (the record) | 75 | 99.5% |
+| **20,000** | **79** | **98.9%** |
+| 20,000 at the record's realized 95.7% | **82** | - |
+
+Supply, from 12,587 distinct screened spots (after the NUL/shape cleanup of 13d) - **each extra chunk is
+2.61x rarer**:
+
+| k | observed | 1 in | expected in all 183,536 spots |
+|---|---|---|---|
+| 76 | 8 | 1,573 | - |
+| 77 | 2 | 6,293 | - |
+| 78 | 1 (the record) | 12,587 | ~15 |
+| 79 | 0 | - | ~6 |
+| 80 | 0 | - | ~2.3 |
+| 82 | 0 | - | **~0.3** |
+
+So the universe probably contains no spot capable of 20,000, and confirming that costs a full 12.7-hour
+screen. **The realistic ceiling here is ~19,300-19,500.** 20,000 needs a larger universe, not a better search.
+
+### 13b. The count bound is on the FINAL count, not the screen's count
+
+Over 536 searched spots joined to their filed farms' -39 numbers, the best -39 achieved per exact BestCount:
+
+| exact BestCount | best -39 achieved | as % of 256 x count |
+|---|---|---|
+| 70 | 17,996 | **100.4%** |
+| 74 | 19,018 | **100.4%** |
+| 76 | 18,970 | 97.5% |
+| 78 | 19,103 | 95.7% |
+
+Two entries exceed 100% of their own ceiling, which is only possible if refinement moves the AFK point to a
+window containing MORE slime chunks than the spot's chunk-aligned best. It does. So section 11-12's rule
+("beating 19,103 needs 78+ chunks") is wrong as stated: it binds the final configuration, and the screen's
+count is a weak proxy for that. Among filed farms, **corr(count, final -39) = -0.08**, and corr(pre-refine
+`blocks39`, final -39) is only **0.278** - because the refinement uplift is mean **+1,019 blocks with sd
+737**, which is larger than the entire spread of the top 20 farms (19,103 down to 18,690 = 413).
+**The refinement step contributes more variance to the final number than any pre-refinement ranking explains.**
+
+### 13c. The archive, ranked by the objective for the first time
+
+`afk_rescan` over all 2,902 filed 66+ farms took 45 seconds; the ranking is `main\records\y39_all.csv`.
+Only 401 of them had ever been given a -39 number (`over66_y-39\` skips farms whose record image is missing).
+
+- **No record was hiding in the archive** - 19,103 is genuinely #1 of 2,902.
+- **11 of the top 50 by -39 are outside the top 50 by cq.** At cq 69.x the -39 range is **17,289-18,598**,
+  a spread of 1,309 blocks, against ~265 blocks per cq point. cq ordering is not -39 ordering, and the
+  66-cq filing gate is close to random with respect to the real objective.
+- The record spot is **exhausted**: all 11,634 of its layouts through `afk_rescan` return 19,103, from
+  several different seeds converging on the same AFK point (14432930, 5926460).
+- **The AFK window is not binding**: windows 48 / 96 / 160 over the top 60 farms give identical maxima and
+  identical means. The refined AFK point is a genuine local peak; widening the search finds nothing.
+
+### 13d. `universe_screened.csv` was corrupt
+
+The file held **10,948 NUL bytes** and 9 torn rows - including the phantom "135 chunks" that section 12
+records as filtered. It was not filtered: the shape test added to `universe_screen.ps1` guards rows on
+WRITE and never swept the rows already in the file, so the corrupt row survived and re-appeared tonight as
+a fake 79-chunk spot at (457136,67) in the tail estimate. 10,533 clean rows kept; the original is at
+`universe_screened.csv.prefilter`. **Any file written before its guard existed needs a sweep, not a guard.**
+
+### 13e. `possible` does not rank within the searched range
+
+Over 198,513 layouts from 300 spots, corr(`possible`, `count`) = **-0.005**, and max count per `possible`
+is flat at 74-76 from possible 143 to 164 once sample size is controlled - while `max/possible` falls
+steadily from 0.53 at 134 to 0.39 at 178. More possible chunks do not buy a higher count; the phase split
+just divides them more thinly. This does not condemn the family cut, because `phase_spots.ps1` already runs
+the CENTRE position at `--phase-top-pct 100` (the cut applies only to the offset grid) - but it does remove
+`possible` as a candidate ranking statistic.
+
+### 13f. The ceiling, three ways - and the extrapolation that lies
+
+Per-spot best -39 over 556 exact-searched spots (median 17,224, 90th 17,887, **max 19,103**). Fitting the
+upper tail and extrapolating to more spots:
+
+| method | ceiling it implies |
+|---|---|
+| exponential tail on the top 10% of exceedances | 20,044 at 5,000 spots; **21,298** at the full universe |
+| chunk ladder + the 2.61x-per-chunk count tail (13a) | ~19,300-19,500 |
+| **GPD, method of moments, highest usable threshold** | **upper endpoint 19,744** |
+
+**The exponential fit is wrong and says so itself**: at n=536 it predicts a max of 19,268 when the observed
+max at n=556 is 19,103. It over-predicts at the sample size where we can check it, because an exponential
+tail is unbounded and this objective is not - `-39 <= 256k` caps it. Fitted GPD shape is negative at every
+threshold (xi = -0.13 to -0.25) and the fitted endpoint FALLS as the threshold rises (20,774 -> 20,161 ->
+19,744), which is what a tail lighter than exponential looks like from below.
+
+**Take ~19,400-19,750 as the ceiling of this universe.** 20,000 sits at or just past the fitted endpoint:
+not provably impossible, but past the point where any honest extrapolation supports it. This revises 13a's
+~19,300-19,500 slightly upward. Any future estimate built on an unbounded tail should be discarded on sight -
+it is the same failure mode as the heat bands, the family "23x excess" and the duplicate-inflated 78 count.
+
+### 13g. The record spot, fully mined (and two claims withdrawn)
+
+All 11,634 layouts of the record spot through `afk_rescan` (98 s):
+
+- **The spot's maximum is 19,103 and nothing at it goes higher.** Exhausted.
+- **Three distinct seeds give 19,103 at the identical AFK point** (14432930,5926460): 230337960196917 (filed),
+  25863157168949 and 25004163709749 (not filed). Alternative seeds for the same world-record farm.
+- Seed multiplicity, measured: 11,634 layouts -> 10,485 distinct seeds -> **4,750 distinct (blocks39, AFK)
+  farms, mean 2.29 seeds per farm**, max 34. The effective search space is ~2.3x smaller than the seed count.
+- **The filing pipeline did NOT leak here.** The spot's top farms by -39 are all filed except exact ties of
+  the record. Open item 2 is answered at this spot, negatively.
+
+Two things I claimed from this data before checking them, both wrong:
+- *"80% of refine slots are duplicates"* - came from grouping layouts by their refined AFK POINT, which
+  splits one farm across adjacent blocks and merges different seeds. By seed the duplication is 8-11%.
+- *"Five top-10 farms were never filed"* - same cause: the archive had those seeds, at an AFK point one or
+  two blocks away. **Dedupe farms by SEED, never by refined position.**
+
+`cq_at_pos` is a position artifact, not a farm property: the same farm appears at cq_at_pos 62 and 68
+depending on which chunk-aligned offset found it. Mean -39 does rise with it (15,073 at cq 53 to 18,950 at
+69) but the MAXIMUM is flat across the whole range, because the low bands hold 100x more layouts. Do not
+gate or rank on `cq_at_pos`.
+
+### 13h. Stage 2 recalibrated on 76 candidates (2026-09-21)
+
+The 0.838 for `--y39` was measured on 18 candidates. On the 76 searched 74+ universe candidates that filed a
+farm (17 more filed nothing at 66+ cq and are excluded - a mild selection toward better spots):
+
+| pre-search feature | r with the final -39 | of the 10 best farms, in its top 20 of 76 |
+|---|---|---|
+| **screen39** | **0.751** | **10 of 10** |
+| efficiency (screen39 / 256 count) | 0.660 | 9 |
+| pairs68 | 0.395 | 6 |
+| count | 0.346 | **2** (random: 2.6) |
+| heat | 0.152 | 4 |
+
+- **screen39 is the ranking, and it is sharp at the top**: every one of the ten best farms sat in its top
+  quarter. Compartment 2's "#1 pick came second" was ordering noise inside that quarter.
+- **Count is useless for ORDERING candidates** once they pass the 74 gate - worse than random at finding
+  the winners. It remains the right GATE (the bound is on count); it is the wrong SORT.
+- Nothing adds to it: partial correlations after screen39 are count +0.13, pairs68 +0.15, heat +0.21, all
+  inside noise at n=76 (|r| < ~0.23).
+- **Uplift from screen to farm: mean +466, sd 379**, median +440, 90th +921, max +1,928 (one spot went
+  down 374). NOTE this is a different quantity from 13b's sd 737, which was per-LAYOUT blocks39 to the final
+  farm; the screen's value is already a best-over-families, so it starts closer. The candidate ranking is
+  about twice as tight as 13b implied.
+
+**The record threshold on the screen - regression, not additive uplift.** Final farm = **4,092 + 0.787 x
+screen39**, residual sd 362 (max +1,148). The slope below 1 matters: high screens regress, so adding the mean
+uplift to a high screen over-states it. To beat 19,103 a spot needs screen39 >= **18,474** at the 90th-pct
+residual, and >= **17,613** even at the largest residual yet seen. Compartment 1's winner screened 18,349;
+compartment 2 had nothing above 18,056.
+
+**Expected records left in the universe** (~601 candidates in the remaining 146,797 spots at 0.41%, each
+scored by the model above against the screen39 distribution of the 116 candidates seen so far):
+
+| beat | P per candidate | expected in the rest of the universe |
+|---|---|---|
+| 19,103 | 1 in 251 | **~2.4** |
+| 19,300 | 1 in 629 | ~1.0 |
+| 19,500 | 1 in 4,408 | ~0.1 |
+
+A first pass with ADDITIVE uplift said 5.5 records and 1-in-110 - withdrawn, it ignored the 0.787 slope.
+This also tightens 13f: the realistic best from finishing the universe is ~19,300, and 19,744 is an
+endpoint, not an expectation. Per 30-minute compartment (~40 candidates) that is ~0.16 records - most
+compartments will find nothing, and ~2 of the remaining ~15 should.
+
+Not wired in as a skip: max uplift rests on 76 samples, and the tail can go further. It is a way to READ a
+batch before searching it - a batch with nothing above ~17,200 is a long shot, one with an 18,000+ is live.
+
+### 13i. Where the heat floor is (2026-09-21, `heat\floor_sample.ps1`)
+
+1,000 random unscreened spots per 1-heat band, same stage-1 probe as the universe screen:
+
+| heat | 72+ | 74+ |
+|---|---|---|
+| 16-17 | 1.30% | 0.20% |
+| 17-18 | 1.30% | 0.20% |
+| 18-19 | 1.20% | 0.10% |
+| 19-20 | 0.70% | 0.10% |
+| 20-21 | 1.60% | 0.20% |
+| 21-22 | 1.60% | 0.30% |
+| universe 22-26 | ~2.5% | ~0.42% |
+
+**No cliff: a step, then a plateau.** The rate roughly halves around heat 21-22 and stays flat at about half
+down to 16 (the 0.70% at 19-20 is noise at ~13 hits a band). The random-world 0% of 9c comes from well below 16.
+Note this corrects 13a/earlier talk of the rate being flat in heat - that held only for 22+.
+
+**And the floor's candidates are worse, not just rarer.** The 11 floor 74+ candidates screened median 16,784 /
+max 17,363 against the universe candidates' 17,004 / 18,349; if they were universe quality, the best of 11 would
+be <= 17,363 in only 2.1% of draws. All 11 exact-searched: 0 BIG, best farm **17,704** (archive rank 521).
+
+| | candidates | P(beat 19,103) each | expected records | screening |
+|---|---|---|---|---|
+| rest of the universe | ~601 | 1 in 240 | **~2.5** | ~7 h (4050) |
+| heat 16-20 (838k spots) | ~1,256 | 1 in 641 | ~2.0 | ~42 h (4050), ~10 h (PRO 6000) |
+
+**Per screening hour the universe is ~8x better** (0.36 vs 0.047 records/h). The floor is real but it is the
+second thing to do, not the first: finish the universe, then take 16-20 only with a faster GPU. This also settles
+the 13a-vs-"full world" question: low heat is a worse population on BOTH axes, so the unmeasured world (mostly
+low-rank columns and lines, i.e. low heat) is poorer still, and the 1.19x full-world figure stands as a ceiling-ish
+estimate rather than an under-count.
+
+**Correction to 13h/13i - the rest of the universe is mostly the weaker tier.** The universe is heat 20+, and
+"universe 22+" in the tables above means only the part screened so far (compartments run hottest-first). Of the
+132,855 still unscreened, **86% (113,963) are heat 20-22**, which performs like the floor (72+ 1.6%, 74+ 0.25%),
+not like 22+. So the remaining universe holds ~360 candidates, not ~601, and **~0.8-1.5 expected records, not
+~2.5** (low end if 20-22 candidates are floor quality, high end if universe quality - unmeasured). By behaviour
+the tiers are 22+ (full yield) and 16-22 (half yield); the heat-20 cut falls inside the lower tier. Order of work
+is unchanged: universe remainder ~0.1-0.3 records/h, heat 16-20 ~0.05/h. And 16 is NOT shown to be the bottom -
+the rate is flat from 16 to 22, random spots (heat ~0.5) are dead, and 12-16 (~1.5M spots) is untested.
+
+### 13j. RETRACTION: the survey is nowhere near the whole world (2026-09-21)
+
+13a and the "full world adds only 1.19x" claim measured how heat **28+** spots thin out beyond the surveyed
+grid (top 10,000 X columns x top 300 Z lines). But 13i showed the population that matters is heat **~13+**, and
+that is spread everywhere: inside the grid, 13+ is still 66% of spots at column rank 10,000 and 64% at line rank
+300. Measured directly - 50,000 random spots heat-surveyed from each unmeasured region (`main\work\worldheat\`):
+
+| region | size | 13+ | 16+ | 22+ | est. spots at 13+ | at 22+ |
+|---|---|---|---|---|---|---|
+| A: top-10k columns x lines 301+ | 3.8e8 | 6.3% | 0.77% | 0.004% | 24M | ~15k |
+| **B: columns 10k-70k x top-300 lines** | 1.8e7 | **45%** | **12%** | **0.26%** | 8M | **~47k** |
+| C: columns 10k-70k x lines 301+ | 2.3e9 | 2.1% | 0.15% | 0 | 49M | ~0 |
+| D: all other columns x any line | 1.4e11 | 0.10% | 0.01% | 0 | 148M | ~0 |
+| **outside the survey, total** | | | | | **~230M** | **~62k** |
+| inside the survey | | | | | ~2.5M | ~63k |
+
+- At heat 22+ the world holds **about as many spots outside the survey as inside it** (mostly region B, which
+  AI_CONTEXT already listed as "not covered"). The 1.19x figure was an extrapolation of a power law fitted
+  inside the grid; it under-counted.
+- At 13+ the survey holds ~1% of the population.
+- The 19,400-19,750 ceiling (13f) was a ceiling for the SURVEYED universe. With ~100x more viable spots in the
+  world, the count tail (2.61x per chunk) puts 80-82-chunk spots in the world in real numbers, and 20,000 is
+  back on the table as a question of search cost, not of existence.
+- **Best next step by value: heat-survey region B** (1.8e7 spots at ~4,000/s = ~75 min on the 4050), screen its
+  ~47k spots at 22+ (~2.4 h), search the ~190 expected candidates. ~0.8 expected records, ~4.5 h total.

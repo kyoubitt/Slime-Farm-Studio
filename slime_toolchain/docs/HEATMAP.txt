@@ -1,0 +1,522 @@
+# Heat v2 - the definitive heat catalog
+
+Goal: EVERY spot in the world with heat40 >= 12, found from first principles, with the seed-sampling noise
+measured and built into every cutoff. Replaces heat v1 (archived: `the original working copy, NOT SHIPPED`, kept
+only as test data). Rules (project owner, 2026-09-21): no full brute-force 2D scan; re-derive where heat can exist
+from the ground up; re-running spots already hunted is fine.
+
+## Scope - EVERY location inside the 30M world border (project owner, 2026-09-21)
+
+The catalog covers the whole world, not a region or a ranked subset: every chunk column AND every chunk row
+from **-1,874,999 to +1,874,999** (blocks -29,999,984 to +29,999,999; 3,749,999 x 3,749,999 chunks). Every
+phase must span that full range on its axis - the phase 2 row files already do (3,749,999 rows each), and the
+phase 3 column scans must too (`--heat-from -1874999 --heat-to 1874999`). No cross product of "top" lists,
+no cut to a hot corner: that is exactly how v1 missed half the heat-22+ spots.
+
+Border caveat, to flag in the catalog rather than drop: a spot within 8 chunks of the border has part of its
+heat disc (and of any farm window) outside the border, where mobs do not spawn - heat is computed as if the
+world continued, so those spots are marked `near_border` for checking, never silently removed.
+
+## SCREEN GATE 76 (project owner, 2026-10-03) - what gets exact-searched, and why
+
+Found by joining the screen's own chunk count to what each searched spot actually produced (1,137 spots with
+both a screen row and filed farms):
+
+| screen count | spots | median best -39 | max best -39 | gave a 19,000+ farm |
+|---|---|---|---|---|
+| 79 | 4 | 19,153 | **19,734** (the record) | 2 of 4 |
+| 78 | 4 | 18,101 | 19,103 | 1 of 4 |
+| 77 | 33 | 17,961 | 18,885 | 0 |
+| 76 | 50 | 17,673 | 18,970 | 0 |
+| 75 | 162 | 17,507 | 18,727 | 0 |
+| 74 | 414 | 17,375 | 18,789 | 0 |
+| 73 | 70 | 17,302 | 18,244 | 0 |
+
+Every 19,000+ farm came from a spot screening 78+ (8 spots of 737 searched); the other 729 took ~99% of the
+exact-search time and their ceiling is 18,970. **The gate is 76, not 78**: scaling each band to the full tier 1
+(we have screened 60%, so x1.66, 350 blocks an e-fold) projects screen 77 to 19,064 and screen 76 to 19,149 -
+both over 19,000 - while 75 and 74 project to 18,906 and 18,968. The screen is also a sampled lower bound: spots
+screening 76 have filed farms with 82 exact chunks, and 74 with 80. 78+ rests on 8 spots; 76+ keeps both bands
+that can still produce a record and leaves 91 spots of observed margin.
+
+THREE CHANGES INSTALLED 2026-10-03:
+1. `heat\candidates.ps1 -MinCount` 74 -> **76**. Section 5's own data: searches 29 of 149 candidates (19%),
+   saving 10 of 13 min. The dropped 74-75 band's best -39 estimate was 18,091; the kept set held the 19,592
+   that became the 19,153 farm.
+2. `heat\second_pass.ps1 -MinPass` 68 -> **74** (`-Gate` 76). The 68-73 sweep is dead weight, now measured:
+   across sections 1-5 it gave the stage-2 screen to **113,452 spots** (~50 min of GPU), promoted 197 under the
+   old gate, and its best result from any of them was **18,679** - not one reached 18,700, i.e. none made the
+   archive top 40. Under the 76 gate it would promote 18 spots whose best historical output was 18,505. The
+   74-75 safety net that justified choosing 76 over 78 costs 3.8 s a section; the old sweep cost 10.1 min.
+3. `heat\universe_screen.ps1` now passes **`--floor 64`** (the layout count bound, was 60). 16% faster and
+   verified IDENTICAL on every result column over 3,000 real tier-1 spots in the production config; live rate
+   0.015-0.016 -> **0.012 s/spot**. Safe only because nothing below 64 is read any more. NOT applied in -Y39
+   mode, where the same change moved `best` on 4 of 3,000 spots - `candidates.ps1`'s -39 re-rank keeps floor 60.
+   This re-opens an item the 2026-10-01 audit refuted purely on Amdahl grounds ("under 3% of a section"): that
+   verdict was computed against a 2,646 s section, and the screen is now most of a much shorter one.
+
+Section cost: **40 min -> ~13 min** per 40,000 spots (screen 10, exact search 2.5, second pass ~10 s, y39_rank
+20 s). Remaining catalogued tier 1 (131,595 spots) goes from ~2.2 h to **~43 min**.
+
+WHAT THIS COSTS: ~720 farms a section are no longer filed - all of them below 19,000, from spots that screened
+74-75. It is a deliberate scope choice (project owner, 2026-10-03), not an output-identical optimization. Pre-change
+copies of every touched script: `main\work\fixverify\`.
+
+## AGREED ORDER (project owner, 2026-10-03) - this is the plan; the 2026-09-21 timeline below is the older version
+
+Tier 1 and tier 2 before anything lower (project owner). Ordered by hours per expected 19,000+ farm, which moved the
+12% closure to AFTER tier 2: it is ~5 h/farm against tier 2's ~1-2 h/farm.
+
+Updated 2026-10-03 after tier 1 finished. A section is ~13 min, not 40. Progress: **331,595 of 331,595 catalogued
+tier-1 spots screened (100%)**, all sections done. The per-spot rate is now MEASURED over the whole catalogue:
+**5 spots in 331,595 produced a 19,000+ farm = 1.51e-5** (the plan first used 2.7e-5 from 2 in 74,000),
+so farm expectations below are ~44% lower than the first version of this table.
+
+| # | step | what it is | time | 19k+ farms | running total |
+|---|---|---|---|---|---|
+| ~~1~~ | ~~sections 6-8~~ | **DONE 2026-10-03 19:50** - the catalogued tier-1 list is 100% screened (331,595 spots). The last 128,595 took **35 min** (27.9 screen + 5.1 search of 58 gated candidates + 32 s second pass) against ~2 h 10 m at the old settings. Found 19,141 at rank 9 | 35 min | +1 | 0 / - |
+| ~~2~~ | ~~heat45 tail read~~ | **DONE 2026-10-03 20:37** - 7,525,585 tier-2 spots at heat40 >= 17, T = 45, 65,536 classes, 21.6 min, 0 failed reads. Order: `main\work\tier2\order.csv` (sorted with unix `sort`; PowerShell's Sort-Object took 3.6 GB and never finished) | 22 min | - | 0.4 h / - |
+| ~~3a~~ | ~~tier 2 skim, first 150,000~~ | **DONE 2026-10-03 21:20** - 6 batches of 25,000 in heat45 order, ~41 min. **FOUND THE NEW RECORD: 20,506 at -39, measured in game, seed 182568670158536** | 41 min | +1 | 1.1 h / 1 |
+| 3b | tier 2 skim, continue | 7,375,585 spots remain in the order, already paid for. Batch 6 still ran 74+ 107 per 25,000 against tier 1's final-batch benchmark of 82, so it was still paying when stopped. ~6.5 min a 25,000 batch | 6.5 min each | ~0.25 a batch | - |
+| **3c** | **EXTENDING 45 (option, user 2026-10-03)** | apply the heat45 read to the bands BELOW the heat40 >= 17 cutoff, because the new record's spot sits at heat40 **17.361** - one notch above that cutoff, and heat40 would have ranked it ~9-millionth in tier 2. heat45 is tail heat; heat40 is mean heat; the record is a tail outlier (ratio 0.064 against a 0.043 median). Read cost at the measured 6,000 spots/s: heat40 16-17 = 5,763,906 spots (**16 min**); 13-16 = 37,139,635 (**1.7 h**); 12-13 = 17,396,747 (**48 min**); the 6.5-12 edge = 40,883,060 (**1.9 h**). CAVEAT: one 20k+ farm is not a trend, and within the existing order the rate halved from batch 1 (208 at 74+) to batches 2-6 (~110-130) while the winner came from batch 6 - so step 3b measures the same question for free before paying for a wider read | 16 min - 4.3 h | unknown | - |
+| 3 | tier 2 skim, top 0.25M | best tail-heat first, stop where it stops paying (~2 h/farm) | 3-10 h | ~6 | 5.4-12.4 h / 6 |
+| 4 | 1,024-class calibration | the zero-leak keep threshold the two-stage run needs | ~30 min | - | 5.9-12.9 h / 6 |
+| 5 | pred >= 8 two-stage heat run | the ~45,800 tier-1 spots the pred-12 cutoff missed. REPLACES the band 10-12 run: 3.8e9 pairs in 5-6 h instead of 526M in 8.1 h, and it makes heat FINAL | 5-6 h | - | 10.9-18.9 h / 6 |
+| 6 | screen + search them | one section's worth on those new spots, at the new 13 min | ~15 min | 0.69 | **11-19 h / ~6.7** |
+
+REMAINING after tier 1: **11-19 h, ~6.7 more farms at 19,000+, best expected ~21,200** (tier 1 alone ~19,700).
+Steps 2 and 5 are single unsplittable runs and want unattended time; 1, 3 and 6 are section-shaped.
+
+The 5 spots that have produced a 19,000+ farm: 9060800,-15431040 (19,734 - the record), 12981312,-2104128
+(19,153, section 5), 14432976,5926432 (19,103), 9468016,15423280 (19,018), -5352800,496752 (19,141, the final batch).
+
+BEFORE TIER 1 IS COMPLETE, nothing else is required - sections 6-8 are the only outstanding work. Open items
+that are NOT blockers: the 1-row gap between index.csv (7,376) and over66.csv/y39_all.csv (7,377), which predates
+section 4 and is probably a hand-filed record with no index row; and the 3,000 spots screened by the floor test,
+which the next section's finish step picks up automatically when it sweeps for unsearched 76+.
+
+DEFERRED TO BEFORE TIER 2, NOT NOW: the screen-side optimisations (the audit's unrun build/toolchain dimension -
+nvcc flags and the `--use_fast_math` asymmetry - and the optional two-tier fusion in phase_prepass.cu, ~6% of a
+section). With only 42 min of tier-1 screening left they would save a few minutes; tier 2 screens ~50M spots,
+where the same work pays off about 100x. Also still unrun: the strategy audit (`wf_717de66b-bd5`).
+
+**7. THE CUTOFF QUESTION (project owner, 2026-10-03 - ranked ABOVE the tier-2 extension).** Settle once and for all what
+is worth looking for: does a random no-heat spot have a shot at the record through sheer numbers, and where is the
+cutoff? The low-heat rate measurement (~30 min) is the only missing input - P(74+) at heat 1-4, where the power-law
+and exponential fits disagree 100x (~35,000 vs ~800,000 farms world-wide). Deliverable is the cutoff chart:
+hours per expected 19,000+ farm against heat band. Current answer from existing data:
+`main\theory\prediction\docs\CUTOFF.txt`.
+
+**8. OPTIONAL: tier 2 top 3.3M instead of 0.25M** - +30-86 h for ~40 farms (~2.2 h/farm). The user is not
+interested at that price; revisit only if step 3's real yield beats the estimate.
+
+DEFERRED (project owner, 2026-10-03): tier 3, below heat 9 as a hunting target, and tier 2's own missing half (~half of all true 13+ spots are
+predicted below 12; ~90+ h to measure and worth nothing, because tier 2 is HUNTING-limited, not catalogue-limited -
+we can only afford the top 0.5-6% of the 50M already known). Tier 1 is the opposite: catalogue-limited, we hunt
+100% of what we know, which is the only reason its 12% is worth closing at all.
+
+NON-HUNTING LEFTOVERS (cheap, no farms): the 2026-10-01 audit's build/toolchain dimension never ran (nvcc flags,
+`--use_fast_math` is on for hotspot_scan and NOT phase_prepass); the strategy audit never ran; optional fusion of
+the screen's two tiers in phase_prepass.cu (~6% of a section). Audit findings: `main\theory\docs\REWRITE_PLAN.txt`.
+
+## TIMELINE (project owner, 2026-09-21, revised: heat45 for tier 2 comes back AFTER tier 1 is complete)
+
+| # | step | what | time on the 4050 |
+|---|---|---|---|
+| 0 | OPTIMIZE THE SCAN (+ prep) | DONE 2026-09-22, installed, all output identical: screen 3.7x, exact search 2.6x, refine 3.1x (section "SPEED-UP 2026-09-22"). Prep still to do: point the hunt at the catalog (tier 1 list from `main/heatmap_v2/catalog/heat_22plus.csv` in the universe_screen format) and fix scripts still reading archived heat v1 files (universe_screen default universe_h20, floor_sample.ps1, region_survey.py, build_universe_all.py) | ~30 min prep |
+| 1 | FULL SCAN OF TIER 1 | every heat40 22+ spot (~331k reads) in compartments (screen -> -39 re-rank -> exact search of every 74+ -> y39_rank -> UNIVERSE_LOG block) | ~3.5 h (rough: screen ~1.2 h at 13 ms/spot + exact search ~2.3 h for ~2,240 candidates at ~3.9 s) |
+| 2 | heat45 FOR TIER 2 (after tier 1 is complete) | optimize the tail-heat read (needs 65,536 classes; parity-skip tried = slower), then read tail heat for tier 2 (catalog heat40 13-22, ~50M). Method and test data: section "heat45 test" below, `NOT SHIPPED - ask the sender` | ~2.4 h today |
+| 3 | SCAN THE BEST OF TIER 2 BY heat45 | hunt tier 2 best tail heat first and stop where it stops paying: top ~0.25M (<= 2 h per expected 19k farm) = ~10 h, ~6 farms; top ~3.3M (<= 2.5 h/farm) = ~86 h, ~40 farms. All of tier 2 (~166 days) is out of reach | ~10-86 h at the old speed; ~3-30 h after step 0 (rough) |
+
+Out of reach, not planned (project owner: months are out of reach): the rest of tier 2, tier 3, below heat 9. Estimated best farm that
+exists: tier 1 ~19,700; tiers 1+2 ~21,200; everything ~22,000 (tail fit to measured farms, 350 blocks per e-fold above 19k).
+Carried-over items that only matter if tier 2 is extended later: sharper heat predictor for the ~half of 13+ spots
+predicted below 12 (TODO below), band 10-12 plan, tier 3 rate test. A PRO 6000 makes every step ~10x shorter.
+
+## CATALOG COVERAGE AND PREDICTIONS, remeasured 2026-09-30 (after the 19,766 record)
+
+**The catalog is NOT complete for 22+.** Band 1 measured only pairs with separable prediction >= 12. Big samples of
+the bands below it (1,000,000 spots each, measured with the class estimator at 16,384 classes, ~55 s a band -
+`main\work\heat2\cov_sample.py`, outputs in `main\work\heat2\cov\`):
+
+| pred band | pairs world-wide | sampled | measured 22+ | rate | estimated 22+ in the band |
+|---|---|---|---|---|---|
+| 10-12 | 526,346,588 | 1,000,000 | 75 | 7.5e-5 | **~39,500** |
+| 8-10 | 3,174,197,210 | 1,000,000 | 2 | 2.0e-6 | ~6,300 |
+| 7-8 | 5,482,835,763 | 1,000,000 | 0 | 0 | 0 (max heat seen 20.0) |
+
+So tier 1 is ~**377,000** spots, of which the catalog holds 331,595 = **88%**; ~46,000 sit below the cutoff. The old
+claim ("band 1 contains ALL 22+, 0 of 400k validation spots below pred 10 reached 22") came from 20,000 samples per
+band - too few to see a 7.5e-5 rate. The README's claim is superseded by this table. Completing tier 1 means running
+band 10-12 (526M pairs, ~8.1 h at 17,978 pairs/s) for the missing ~39,500; band 8-10 would be ~49 h for ~6,300 more.
+
+**Farm-value tail, measured** (sections 1-2, 74,000 tier-1 spots searched end to end): 2 spots gave a 19,000+ farm
+(P = 2.7e-5 per tier-1 spot); e-fold above 19,000 is **294-366 blocks** (the model assumed 350, so it stands).
+
+### The missing 12% folded into the 19,000+ totals (2026-10-03)
+
+Earlier statements of "how many 19,000+ farms exist and how long to reach them" counted only the 331,595 catalogued
+spots. At P = 2.7e-5 per tier-1 spot, the corrected picture:
+
+| | spots | expected 19,000+ farms | cost to get there |
+|---|---|---|---|
+| tier 1, catalogued, already screened | 119,016 | 3.2 (2 found so far) | done - sections 1-3 |
+| tier 1, catalogued, remaining | 212,579 | **5.7** | ~4.7 sections, ~4 h |
+| tier 1, BELOW the pred-12 cutoff (pred 10-12) | ~39,500 | **1.07** | 8.1 h heat run + ~1 section |
+| tier 1, below cutoff (pred 8-10) | ~6,300 | 0.17 | ~49 h heat run - not worth it |
+| **tier 1 total, corrected** | **~377,000** | **~10.2** | - |
+
+So the missing band is worth about **one** 19,000+ farm - a full section's worth of value, at 12% of tier 1. It is
+not better than the catalogued spots (same heat, same per-spot odds), just unreachable until band 10-12 is measured.
+Deferring it behind the remaining sections costs nothing in expected total, only in when that farm arrives; running
+it before section 4 costs 8.1 h of GPU time that would otherwise screen ~7 sections' worth of known spots.
+Sections 1-2 ran (2026-09-22) before this gap was known; it was found on 2026-09-30.
+Per-spot best farms: 60 at 18,000+, 18 at 18,500+, 2 at 19,000+.
+
+**Updated expected best farm that EXISTS** (Gumbel, beta = 350, tier 1 scaled up by the 13.8% of spots below the
+cutoff; per-band P(19k+) scaled from tier 1 by each band's measured 74+ rate):
+
+| scope | spots | expected 19k+ farms | expected best | old model | time with today's pipeline |
+|---|---|---|---|---|---|
+| tier 1 (22+) | 377,000 | 10 | **20,015** | 19,700 | ~6 h |
+| tiers 1+2 (13+) | 245,000,000 | 1,806 | **21,827** | 21,200 | ~2,900 h |
+| everything | ~1.4e13 | ~3,956 | **22,101** | 22,000 | out of reach |
+
+The 19,766 already measured came from 74,000 spots, where the expected best was ~19,240 - it was a lucky draw, and
+tier 1 still has room above it (~20,015 expected best, and ~8 more 19k+ farms in the unsearched part).
+Hours per expected 19k+ farm with the measured pipeline (screen 0.015 s/spot + 4.7 s per 74+ candidate + 0.018 s
+second pass): tier 1 **0.57 h**, heat 16-21 1.25 h, 15 1.39 h, 14 1.85 h, 13 1.66 h.
+
+## TIER 1 RUN PLAN - 30-minute sections (project owner, 2026-09-22; restarted from zero, old done-lists in NOT SHIPPED)
+
+| sections | what | each | command |
+|---|---|---|---|
+| 1-9 | main search: screen, then exact search of that slice's 74+ (+ -39 re-rank, y39_rank, log) | ~39,000 spots (~10 min screen + ~20 min search) | `heat\universe_chunk.ps1 -Minutes 10` |
+
+9 sections, ~4.5 h in total (rough: screen 0.015 s/spot, 74+ at ~0.66% x 4.7 s). Section 9 is the remainder. The sections
+are the main search only (project owner); the second pass (heat\second_pass.ps1, floor 68, ~2 h) is separate and not in this plan. Each section is fully done and resumable. Run one section, report, ask - unless given a total run time.
+QUEUE after the 9 sections (project owner, 2026-09-30). SUPERSEDED 2026-10-03 by "AGREED ORDER" at the top: item 1 below
+(band 10-12, 8.1 h) is dropped in favour of item 3 (pred >= 8 two-stage, 5-6 h), which covers it and 7x more area in
+less time; item 2 is deferred below tier 2; and tier 2's heat45 skim now comes before either.
+1. **Band 10-12 heat run** - `main\heatmap_v2\inputs\plan\band_10_12.plan` with `hs_plan.exe --heat-survey --heat-plan`
+   (526M pairs, ~8 h at 18,900 pairs/s): the ~39,500 tier-1 (22+) spots the pred >= 12 cutoff missed. Then screen +
+   exact-search them like any section (~40 min). It was dropped earlier as a "20+" job, when band 1 was believed to
+   hold all 22+; the 2026-09-30 samples changed that.
+2. **Low-heat rate measurement (one-off, ~30 min, user 2026-09-30)** - settles how many 19k+ farms exist at heat 1-4
+   and below: the only unknown is P(74+) there (power-law fit 3.7e-5 at heat 4, exponential fit 2.2e-4 - the two
+   disagree 100x on the world total, ~35,000 vs ~800,000 farms at heat 1-4). Measure heat on ~2M random world spots
+   (~2 min), screen the ~100,000 that land at heat 1-4 (~25 min), exact-search any 74+. Changes nothing we hunt
+   (16+ h per farm down there); it closes the world-total question.
+3. **Optional, makes heat FINAL (the project owner wants never to rescan heat):** measure every pair with pred >= 8 (3.8e9 pairs)
+   in two stages - stage A at 1,024 classes (16x faster, ~3.7 h) keeping everything above a zero-leak threshold for
+   22, stage B full 16,384 classes on the survivors (~5-6 h in total). Needs the zero-leak keep rule at 1,024
+   classes measured first (we have read >= 6.5 at 16,384 for heat 12). Covers the ~6,300 spots at pred 8-10 too and
+   leaves nothing above pred 8 unmeasured; heat ran at most ~2.7x pred in every sample, so 22+ below pred 8 is
+   implausible - that is what makes it final rather than another band.
+
+Progress: section 1 done 2026-09-22 (30,000 spots screened - paused once; 232 + 56 second-pass spots exact-searched; best at -39 19,015; notes main/theory/prediction/docs\SECOND_PASS_NOTES.txt). Section 2 done 2026-09-22 (44,000 spots; 196 + 36 exact-searched; **NEW RECORD: 19,766 measured in game (estimate 19,734), cq 76.38, seed 130738905053232, AFK 9060723,-15431012**).
+
+## SPEED-UP 2026-09-22 (step 0) - installed, every output identical
+
+| tool | before | after | checked on |
+|---|---|---|---|
+| screen `phase_prepass` (chunks mode, the base) | 96.6 s / 2,000 spots | 26.1 s (3.7x); -39 re-rank mode 3.8x | 2,000 random tier-1 spots, every row identical in both modes |
+| exact search `hotspot_scan --phase-search` | ~10.8 s / spot | ~3.9 s (2.6x) | 6 spots (shortlist + keep identical), 150 survivor queues, `--self-test` [9] |
+| refine `slime_refine` | 37.6 s / 5 spots | 12.1 s (3.1x) | 5 spots, scored CSVs identical |
+
+How: 32 consecutive classes per GPU thread through one table lookup per chunk (bit-sliced bounds, same survivor
+queue); the screen runs 3 spots at once on separate streams and does its per-position work on the GPU (5 waits a
+spot instead of ~22); one warp per class for the exact-best walk (sort-free); refine skips a report nobody reads;
+the driver keeps one search process open. Details, dropped ideas and all variants:
+`the speed-up archive (NOT SHIPPED)` (old builds in its `old/`). Laptop GPU clocks drift ~15% with heat.
+
+## OPTIMIZATION TODO - status 2026-09-22 (identical-or-better rule)
+
+Done, installed, identical output:
+- 1 real-batch timing: found the gaps and fixed them - screen script (compiled list parse, 5,000-spot batches, no
+  re-reads: start-up 58 s -> 18 s, 0.015 s/spot), driver (one --phase-stdin searcher; filing on an in-order
+  background worker; refine at below-normal priority; hunt_pipeline duplicate check pre-searched): exact search
+  8.4-9 s -> ~4.7 s per candidate, GPU-bound. Per-spot logs: main/logs/phase_spots_timing.csv, filing_timing.csv.
+- 6 closed (the exact search's family counts cost 0.002 s/spot), 9 done (5,000-spot batches, one driver call).
+Closed by measurement, nothing to gain:
+- 2 exact search GPU already 94% busy; 10 cut check ~3%; 5 not needed (the gaps were in the scripts).
+- 8 pinned memory: all screen copies 0.016 s of 3.2 s. 7 CUDA graphs: ~16 launches/spot, the 13% idle is waits on
+  host decisions, not launches. 4 screen kernels: grid-size sweep all within noise; the rest would be deep rewrites
+  for <= ~10% of the screen (~1/3 of tier 1 time).
+Later: 3 bit-sliced heat45 read - only for tier 2 (timeline step 2); test sd per GPU-second, keep the old if no win.
+Tier 1 real rate: 0.37 h per expected 19k+ farm; ~1.3 h screen + ~2.7 h exact search in total (rough).
+Rejected by the project owner (2026-09-22), do not re-propose: Windows GPU-scheduling setting; spending the speed-up on
+recall (top-pct 10%, all 15 positions, exhaust 128, deeper tier 2 screen).
+Closed (measured, do not retry): see the speed-up archive (NOT SHIPPED).
+
+## FROZEN BASELINE - heat40 (2026-09-21) - go back to this if heat45 does not pan out
+
+Everything below this section and the whole permanent catalog `main/heatmap_v2/` use HEAT40 (>= 40 of the 197 disc
+chunks). That is the state to return to:
+- catalog: `main/heatmap_v2/` (109,040,528 spots, heat40 per spot, MANIFEST.sha256 verified) - unchanged by heat45
+- tiers on heat40: tier 1 = 22+, tier 2 = 13-21, tier 3 = 9-12 (table below); hours per expected 19k+ farm from
+  `main/work/heat_chart.json` rates (74+ screen rate by band, pu = 0.00675 for 22+, pf = 0.00312 below)
+- hunting order so far (compartments 1-3, floor samples): heat40 order. Those screen/search RESULTS do not depend on the
+  ranking metric and stay valid whatever ranks the next spots.
+
+## heat45 test (2026-09-21) - a better SORT KEY, not a new scan
+
+Data: `heat45_test/` (41,502 already-screened spots, 150 at 74+, each measured at T = 40, 45, 50, 55, 60 with
+`--heat-class`; best.csv = best screen count; h*.csv.gz = the reads).
+
+| metric | AUC for 74+ | 74+ in top 10% | top 25% | top 50% |
+|---|---|---|---|---|
+| heat40 | 0.607 | 20 | 50 | 99 |
+| heat45 | 0.672 | 38 | 68 | 110 |
+| heat50 | 0.620 | 34 | 64 | 99 (15% zero reads at 65,536 classes - noise-limited) |
+| heat55 | 0.558 | 34 | 47 | 87 (88% zero reads) |
+| heat60 | 0.455 | 24 | 44 | 87 (almost all zero) |
+
+- heat45 ~ heat40 x a spot-specific factor 0.021-0.068 (1-99%, median 0.043). Top 1% by heat45 all have heat40 >= 19.7,
+  top 10% >= 17.3, top 25% >= 15.2 - so heat45 REORDERS the heat40 catalog; nothing tier-1 grade lies outside it.
+- What changes if adopted: re-read catalog spots with heat40 >= ~15 at T = 45 (~20-25 min; all 109M ~1.5 h), re-cut
+  tiers on the heat45 scale with the same value-per-hour method, hunt in heat45 order. No scan redone, no code rewrite.
+- Open: heat50 with 4-16x more classes may beat heat45; the test set is already-hot screened spots only.
+- 74+ rate by tenth of each sorted list (same 41,502 spots): heat40 is FLAT over its top half (0.41-0.53%, heat40
+  21-36) and only falls below ~20 (0.12% bottom tenth) - so the "jump at heat40 22" in the tier charts was an artifact of
+  pooled band rates (16-21 pooled, 22+ pooled, different 19k odds pu/pf), not a property of the spots. heat45's top tenth
+  is 0.92% (38 hits vs ~20 expected, ~4 sigma), then 0.58%, then a smooth taper to 0.14%. No natural cliffs in either:
+  tiers are cut-offs chosen by value per hour on a smooth curve.
+- Status: NOT adopted yet (project owner reviewing).
+
+## Z-line spacing derivation (#3, 2026-09-21) - not found, not needed
+
+The formula cz = 48.5 + 96.875 n was FITTED (row-coherence peaks, 2026-09-10) and is good to 1-2 rows out to 30M.
+Two cheap derivations failed: an LCG mod-10 output-coherence score (top rows scattered 2-47 rows off the lines) and a
+search over power-of-two scales of 2c / 2cM (closest period 97.77, too far). Left open; nothing depends on it.
+
+## Low-heat screen (2026-09-21) - can below 9 give a 19k?
+
+22,409 spots screened with the production screen (probe 8, exhaust 64, top-pct 0.25): 2,000 per heat band 0-9 (random
+world + random rows near formula lines, heat read at 16,384 classes), all found at 10-12. Data: `main/work/lowheat/`.
+| heat | 70+ rate | 74+ hits | best |
+|---|---|---|---|
+| 0-1 | 0 / 2,000 | 0 | 69 |
+| 1-6 | 0.05-0.45% | 0 of 10,000 | 71-73 |
+| 7-9 | 0.25-0.85% | 3 of 6,000 (heat 7: 1, heat 9: 2) | 74 |
+| 10-12 | 0.6-1.6% | 0 of 2,409 | 72 |
+| 13-21 (floor sample) | 3.8-13% | 1-3 per 1,000 | 74-76 |
+| 22-25 (universe) | 12-17% | ~4.4 per 1,000 | 75-79 |
+Reading: cold spots are NOT capped far below record territory - even heat 1-6 reaches 71-73 and heat 7/9 reached 74 -
+but the tail is 20-60x thinner than tier 1. Heat 1-9 gave 3 74+ spots in 18,000 (~1.7e-4; heat 1-8 alone 1 in 16,000,
+~6e-5; the tier 1 ratio P(74+)/P(70+) ~ 3.7% applied to their 70+ rates gives ~1e-4). The world has trillions of such
+spots, so in absolute terms that is hundreds of millions of 74+ spots and plausibly thousands or more 19k farms - at
+roughly 50-100 laptop-hours of screening per farm (tier 1: ~1 h) and ~20,000 years to screen it all.
+Heat 0-1 (72% of the world): no 70+ in 2,000, far rarer still. Verdict: possible, numerous, not findable efficiently.
+
+## Hunting tiers (project owner, 2026-09-21)
+
+| tier | heat | hours per expected 19k+ farm (4050, new screen) | status |
+|---|---|---|---|
+| 1 | 22+ | ~1.0 | ~331k reads, ~8 h to hunt fully |
+| 2 | 13-21 | ~4.3-6 | ~245M spots world-wide (13+) |
+| 3 | 9-12 | ~14.5 at 12; 9-11 unmeasured | provisional - test later: screen ~2,000 random spots each at heat 9, 10, 11, 12 |
+| - | below 9 | - | random world (99.99% of it): useless, not hunted |
+
+TODO WHEN TIER 2 STARTS (project owner, 2026-09-21): about half of all 13+ spots were predicted below 12 and are not in the
+band 1 catalog. Before brute-forcing bands 10-12 / 8-10 / ..., build a SHARPER PREDICTOR (the separable model's 17%
+error is what makes those bands huge) - e.g. use the exact 65,536 x 131,072 low-bit repetition, more reference rows
+and columns, or a derivation of the Z-line spacing - and validate it zero-leak the same way as phase 4.
+
+## The pattern, in equations (2026-09-21)
+
+Slime test (Java): chunk (x, z) is slime for world seed S iff `Random(S + X(x) + Z(z) ^ 0x3ad8025f).nextInt(10) == 0`, with
+    X(x) = int32(x^2 * 0x4c1906) + int32(x * 0x5ac0db),     Z(z) = int32(z^2) * 0x4307a7 + int32(z * 0x5f24f).
+Java Random keeps 48 bits: t = (S + X + Z) ^ 0x3ad8025f ^ M mod 2^48, M = 0x5DEECE66D; B = ((t*M + 11) mod 2^48) >> 17
+(31 bits); slime iff B mod 10 == 0, i.e. B even AND B mod 5 == 0.
+
+1. Split the seed: S = s + 2^35 v (s = low 35 bits, v = top 13). Then B(v) = B(0) + 2^18 w (mod 2^31), w = M v mod 2^13,
+   the SAME w for every chunk. So for one s: a chunk is POSSIBLE iff B(0) is even; its PHASE is p = B(0) mod 5; it is
+   slime at w = p (mod 5) while w < 8192 - (B(0) >> 18), and at w = p + 2 (mod 5) after that (the 2^31 wrap).
+   Consequence: all 8,192 seeds of a class move in lockstep (the phase model; exact, 0 mismatches in 90.9M checks).
+2. Possibility is bit 17 of t*M + 11, which depends only on t mod 2^18, i.e. on (S + X(x) + Z(z)) mod 2^18.
+3. Heat. heat40(cx, cz) = P_S[ >= 40 of the 197 chunks within radius 8 of (cx, cz) are slime ] / 2.1e-5 (1 = a random
+   place). Adding a constant to every chunk's offset is absorbed by the uniform seed, so heat depends only on the
+   difference vectors  dX_d = X(cx + d) - X(cx)  and  dZ_d = Z(cz + d) - Z(cz),  d = -8..8.
+4. Exact periods of the possibility pattern (checked: 2,000/2,000 at the period, 0/2,000 at half of it):
+       dX_d(x + T) - dX_d(x) = 0x4c1906 * 2 T d  (mod 2^18)  -> 0 for all d iff T = 0 mod 2^16   (0x4c1906 = 2 x odd)
+       dZ_d(z + T) - dZ_d(z) = 0x4307a7 * 2 T d  (mod 2^18)  -> 0 for all d iff T = 0 mod 2^17   (0x4307a7 odd)
+   (int32 truncation only touches bits >= 32.) So which chunks CAN be slime tiles the world with a 65,536 x 131,072
+   torus. Heat is not exactly periodic because the phase (mod 5) uses all 48 bits: sister columns 65,536 apart keep a
+   hot spot hot 98% of the time, sister rows 131,072 apart 93-94%, sister PAIRS only ~66% (log sd 0.22-0.27).
+5. Z lines (measured, not derived): every row with heat >= 12 at 4 reference columns lies within 4 rows of
+   cz = 48.5 + 96.875 n (= 48.5 + 3100 n / 32; 131,072 / 96.875 = 1,353 lines per Z period); mean heat by offset from
+   the line centre: 10.3 at 0, 8.2 at +-2, 4.3 at +-4, 2.4 at +-6 (column 0).
+6. Near-separability (measured): heat(cx, cz) ~ F(cx) G(cz) / norm with log error sd 0.17 (0.12 read noise + 0.12 true
+   interaction). 17% of all columns reach 12 on the hottest line; ~5 rows per line reach 6.5.
+7. Heat is set by the seed FAMILY (bits 0-19): classes sharing a family hit together (a 256-class tile of one family
+   is worth ~69 random seeds, not 256), so heat is a statement about which low-bit families line up with the disc.
+
+## What heat is
+
+`heat40(cx, cz)` = P(a random world seed makes >= 40 of the 197 chunks in the r <= 8 disc around the chunk
+slime) / 2.1e-5, estimated from N random seeds (`hotspot_scan --heat-survey`). A property of the LOCATION,
+averaged over seeds. A chunk's slime test depends on seed + X(cx) + Z(cz): the X and Z terms are ADDITIVE,
+so heat at (cx, cz) is a function of an X-difference vector and a Z-difference vector. That is what lets two
+1-D scans (every row, every column) stand in for a 2-D scan, provided the interaction is measured.
+
+## Phase 1 - seed noise (2026-09-21, `main/work/heat2/noise/`)
+
+12,639 spots spanning heat 4-37, each measured under three independent 300k-seed streams, once at 900k, and
+once at 9M (the reference "truth", sd 0.25 at heat 12).
+
+| | result |
+|---|---|
+| bias of a 300k read vs 9M truth | none: +-0.05 in every band from 6 to 30 |
+| noise vs the binomial prediction sd = sqrt(heat / (N x 2.1e-5)) | matches in every band (1.47 measured vs 1.44 predicted at 12-14) |
+| independence of seed streams | error correlation +0.02 |
+| scaling with depth | 900k: 0.61x the 300k noise (predicted 0.58x) |
+
+**Consequence - no single noisy read may be cut at the target.** A spot TRULY at heat 12-13, read once at
+300k, reads < 12 in 36% of cases, < 10 in 4.0%, < 9 in 0.71%. Every v1 list cut one read at a threshold
+(the universe at 20, the X list at 18) and so silently dropped a third of its edge spots.
+
+**Protocol for every catalog measurement:**
+1. first read at 300k seeds; keep anything >= 7.5 (3 sd below 12 at that depth);
+2. re-measure every survivor below 16 at 3M seeds (sd 0.46 at heat 12); keep >= 10.6 (3 sd below 12);
+3. store the measured heat AND the number of seeds, so any later cutoff can be made with a known error.
+
+## Separability, first look (on the archived v1 grid, 2026-09-21)
+
+The v1 survey is a complete 10,000-column x 300-line grid (3M spots). Fitting log heat = column + line:
+residual sd 0.144 in log units, of which seed noise alone is ~0.115 at heat 12 - so the true column x line
+interaction is only ~+-9% of heat. The "r = 0.3 across lines" of v1 was 150 near-identical top columns under
+noise, not a real interaction. So: 1-D scans (every row, every column) + a separable prediction + a measured
+margin can stand in for the 2-D brute force. NOT yet shown for weak columns / weak lines - the v1 grid is
+strong x strong only; phases 2-4 test the full range.
+
+## ORDER OF WORK - SPEED FIRST (project owner, 2026-09-21)
+
+**Target: the whole catalog in HOURS on the 4050.** Before running ANY of phases 2-5, get the cost way down:
+the optimization list below ("TODO ... make phase 5 much faster") is step 0, and it applies to every phase,
+not just 5 - early stopping, a tighter prediction, rows-per-line, kernel work, rare-event sampling. Each speed-up
+must still pass the zero-leak check (no true 12+ spot lost). Only then resume at phase 2.
+
+## Step 0 result - the class estimator (2026-09-21 afternoon)
+
+`hotspot_scan --heat-survey --heat-class --heat-spots f --heat-seeds K` (K = CLASSES). One sample is a 35-bit
+class (seed bits 0-34); the phase model gives, exactly, how many of its 8,192 top values put >= 40 disc chunks
+slime - so each sample is the plain estimator averaged exactly over 8,192 seeds. Same expectation, no bias.
+- Exact: every run first checks 36 classes against brute force over all 8,192 seeds (T = 28/32/40): 0 mismatches.
+- Speed: a per-residue octile bound rules out 95.7% of classes after one pass over the 197 chunks; survivors are
+  queued so whole warps run the exact walk (it was 93% of the time while it diverged inside warps).
+- On the 12,639-spot noise set vs the 9M truth: bias <= 0.1 in every band. At 16,384 classes: rel sd 11.5% at
+  true heat 12 (sd 1.38, like 300k plain seeds) at ~20-26k spots/s - **4.4x plain sampling per unit accuracy**.
+- Tried and dropped: a family-split tile (256 classes of one family share the 48-bit work). Hits cluster by
+  FAMILY (seed bits 0-19), so a tile is worth ~69 seeds, not 256 classes - heat is decided by the family.
+- Low tail (81,300 reads of 2,710 spots at true 10.5-14): read/true 1e-4 quantile 0.617, minimum 0.560 at
+  16,384 classes (4,096: 0.306 / 0.260). **Catalog keep rule at 16,384 classes: read >= 6.5** (nothing true
+  10.5-14 read below 6.7 in 81,300).
+- `--heat-plan file.plan` runs the catalog from a binary plan (column list by predicted strength + per-row
+  count), writes only reads >= `--heat-min`, resumable with `--heat-start` (DONE_THROUGH in the log).
+  Identical numbers to spot mode for the same pair (checked).
+
+Phase 2 with it: every row x 4 columns in ~11 min (was ~65). Lines are WIDE: at column 0 the mean heat by
+offset from the formula centre is 10.3 at 0, 8.2 at +-2, 4.3 at +-4, 2.4 at +-6; every row >= 20 is within
+4 rows of a formula line. Rows >= 6.5 at column 0: 188,024 (~5 per line); >= 12: 36,018.
+
+## Phases 2-4 DONE (2026-09-21 15:43-16:20), phase 5 band 1 RUNNING
+
+- Phase 2: every row x columns -319635, 1791063, -1115453, -133170 (`main/work/heat2/zscan/rows_col*.csv`,
+  16,384 classes, 11 min). 99.1-99.9% of rows >= 12 lie within 3.5 rows of a formula line; none further than 4.
+- Phase 3: every column x rows 1028571 (hottest, = the v1 row), -395590, -1545498 (off-centre, d = -2.75),
+  1824786 (median line centre) (`main/work/heat2/xscan/rows_row*.csv`, 11 min). 17% of all columns read >= 12 on
+  the hottest row.
+- Phase 4 (`sep.py`, `val_sample.py`, `val_report.py`): prediction p = F(cx) G(cz) / norm, F = sum of the 4 row
+  reads, G = sum of the 4 column reads. Validated on 280k stratified pairs read at 65,536 classes plus 400k at
+  16,384. Error log sd 0.17 (about 0.12 read noise in F/G + 0.12 true interaction); NOT explained by line offset
+  or by which reference a column/row prefers.
+
+**World totals (stratified estimates from the validation):**
+
+| tier | spots | lowest predicted band they occur in |
+|---|---|---|
+| 12+ | ~580M | 4-5 (0.005% of that band) - long tail |
+| 13+ | ~245M | 4-5 |
+| 16+ | ~18M | 7-8 |
+| 18+ | ~3.7M | 7-8 |
+| 20+ | ~0.8M | 8-10 (7 of 200k reads, partly noise) |
+| 22+ | ~150k | >= 12 only (0 of 400k below 10) |
+
+Pairs per predicted band: >= 12: 109M; 10-12: 526M; 8-10: 3.17B; 7-8: 5.48B; 6-7: 12.8B; 5-6: 27B.
+
+**Consequence - honest cost:** a zero-leak 12+ catalog needs every band down to ~4 (~100B+ pairs): weeks on the
+4050. Even with a perfect predictor, 580M true 12+ spots x 16,384 classes is ~8 h on the 4050. Hours are
+realistic for the HIGH tiers: band >= 12 (1.5 h) holds all 22+, ~90% of 20+; + band 10-12 (7.3 h) holds ~all 20+,
+~95% of 18+. PRO 6000 (~10x): 9 min / 45 min / band 8-10 in ~4.4 h.
+
+Tried and dropped: (a) torus repetition of whole pairs (cx mod 65,536, cz mod 2^17/2^18): single axes repeat
+(98% / 93% of hot spots have a hot sister) but PAIRS do not (log sd 0.22-0.27, worse than the separable model);
+(b) cheap first reads to reject candidates - at 2,048 classes a true 12 reads as low as 0.085x, so nothing
+near the candidate range can be rejected; (c) row-mode sliding windows - band columns are scattered (0.06% of a
+row), no contiguity to exploit.
+
+Phase 5 runner: `main/work/heat2/catalog/run.sh <band>` over `make_plan.py lo hi` plans (rows by G descending,
+per-row column RANGE of the F-sorted list, so bands never repeat a pair). Band 1 `band_12_inf` started
+~16:10, 109M pairs at ~20k/s, keep >= 6.5, output `catalog/band_12_inf.csv` (~4 GB). Resume = re-run
+`run.sh band_12_inf`. Duplicates after a crash-resume are possible (dedupe on cx,cz).
+Seed note: class-mode seeds are now hashed (`splitmix64(seedBase ^ C)`) - before, --rng-seed values a few
+apart gave SHIFTED copies of one class stream (0x..60 / 0x..61 shared 16,383 of 16,384 classes).
+
+## Status - PAUSED 2026-09-21 ~06:25 (superseded by the section above)
+
+| phase | state |
+|---|---|
+| 1. seed noise | **done** (above) |
+| 2. Z axis: every row (3,749,999) at 4 reference columns | **stopped at ~26% of column 0**; nothing kept |
+| 3. X axis: every column at 4 reference rows (from phase 2's hottest lines) | not started |
+| 4. separable prediction + margin, zero-leak validation on random pairs measured at 3M | not started |
+| 5. catalog run (300k read, >= 7.5 kept, re-measure < 16 at 3M, keep >= 10.6) | not started - size and time to be reported BEFORE it runs |
+
+Resume phase 2 (~65 min on the 4050; reference columns -319635, 1791063, -1115453 hot and -133170 medium,
+spot files already in `main/work/heat2/zscan/col0-3.txt`), then run `main/work/heat2/zscan/analyze_z.py`:
+    cd main\work\heat2\zscan
+    foreach ($i in 0..3) { ..\..\..\..\hotspot_scan.exe --heat-survey --heat-spots "col$i.txt" --heat-seeds 300000 --rng-seed 0xC47A1060 --heat-out "rows_col$i.csv" }
+    py -3 analyze_z.py
+The partial outputs are kept as `partial_rows_col0.csv` / `partial_rows_col1.csv` (not complete - redo them).
+When stopping a multi-column loop, stop the LOOP first (it starts the next column when one is killed).
+
+## Plan and time (estimated 2026-09-21)
+
+| phase | what | laptop-class GPU (6 GB) | PRO 6000 |
+|---|---|---|---|
+| 1 | seed-noise model | done | - |
+| 2 | every row (3,749,999) x 4 reference columns, 300k seeds | ~65 min | ~7 min |
+| 3 | every column (3,749,999) x 4 reference rows, 300k seeds | ~65 min | ~7 min |
+| 4 | separable prediction + margin, zero-leak validation (random pairs at 3M) | ~30 min | ~5 min |
+| 5 | catalog pass over every pair the model cannot rule out | ~3-7 days (unoptimized) | ~8-18 h |
+
+Phase 5's size = (pairs not ruled out) x (cost each). Cost is measured: ~4,000 spots/s at 300k seeds on the
+4050. The count is not: ~230M+ spots at 13+ world-wide (2026-09-21 probes), plus the margin below 12 and 1-3
+rows per line, gives ~1-2 billion measurements. Phase 4 ends with the exact count and time, BEFORE phase 5 runs.
+
+## TODO (project owner, 2026-09-21): make phase 5 much faster WITHOUT losing data - later
+
+Hard rule (see memory results-must-not-change): an optimization is accepted only if, on a test set measured
+the unoptimized way, it misses ZERO additional true heat-12+ spots. Speed may cost precision on spots that are
+clearly out; it may never cost recall. Candidates, most promising first:
+
+1. **Sequential measurement (early stopping).** Measure in steps (e.g. 25k, 50k, 100k, 300k seeds) and stop a
+   spot as soon as its running count proves it is far below 12 with a fixed tiny error (SPRT / a confidence
+   sequence, error budget well under the 0.1% recall target). Most candidates sit near the model's margin,
+   i.e. well below 12, and are decided in the first step. Expected 3-6x.
+2. **Tighter prediction = fewer candidates.** Use all 4 reference rows AND columns, the residue (cx mod 65,536)
+   and sister structure, and the measured line width to shrink the margin - accepted only through the same
+   zero-leak validation. Every 10% off the margin cuts the candidate count a lot, since counts rise steeply
+   toward low heat.
+3. **Rows per line.** If phase 2 shows each line's best row is the same for every column (the separable
+   picture says it should be), measure that row plus only the neighbours that can reach 12 - not a fixed band.
+4. **Kernel work.** Check `countTail` exits as soon as a seed reaches T=40 or can no longer reach it; measure
+   along a line with `--heat-survey` (one row, many columns, shared Z terms) instead of per-spot mode.
+5. **Rare-event sampling (research).** heat is the probability of a rare event (>= 40 of 197 chunks). Drawing
+   seeds preferentially from families the phase model says are rich at that location, then re-weighting, is
+   unbiased and could cut the seeds needed per spot by a large factor. Must be validated against plain
+   sampling before use.
+6. **Precision pass is optional for completeness.** Recall comes from the generous first-read cutoff (7.5);
+   the 3M re-measure only sharpens values near 12 - run it later, or only on spots that get hunted.
+7. Hardware: the heat kernel is pure integer compute and should scale ~10x on a PRO 6000.

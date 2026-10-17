@@ -45,6 +45,7 @@
 #include <thread>
 #include <mutex>
 #include "slime_core.h"
+#include "portable_paths.h"
 #include "png_writer.h"
 #ifdef _WIN32
 #include <direct.h>
@@ -98,17 +99,22 @@ struct Weights {
     const int* table(int ox, int oz) const { return &w[(oz * 16 + ox) * 289]; }
 };
 
+// --radius-z R: the Z half-width of the AFK window in chunks (default: the same as --radius). The exact
+// phase search only searches AFK chunks within +-3 of the spot in Z, and over 6,365 refined 65+ farms the
+// best AFK point was never outside -59..+93 blocks in Z (X: -113..+128), so Z needs far less than X.
+static int g_radiusZ = -1;
 static void scoreSeed(long long seed, int centerBX, int centerBZ, int radiusChunks,
                       bool fine, const Weights& W, std::vector<Row>& out) {
     // AFK positions to test
-    int half = radiusChunks * 16;
+    const int radiusZ = g_radiusZ >= 0 ? g_radiusZ : radiusChunks;
+    int half = radiusChunks * 16, halfZ = radiusZ * 16;
     int lo = fine ? -half : -radiusChunks * 16;
     int step = fine ? 1 : 16;
     int bx0 = centerBX + lo, bx1 = centerBX + half;
-    int bz0 = centerBZ + lo, bz1 = centerBZ + half;
+    int bz0 = centerBZ - halfZ, bz1 = centerBZ + halfZ;
     if (!fine) { // snap to chunk origins
         bx0 = ((centerBX >> 4) - radiusChunks) * 16; bx1 = ((centerBX >> 4) + radiusChunks) * 16;
-        bz0 = ((centerBZ >> 4) - radiusChunks) * 16; bz1 = ((centerBZ >> 4) + radiusChunks) * 16;
+        bz0 = ((centerBZ >> 4) - radiusZ) * 16; bz1 = ((centerBZ >> 4) + radiusZ) * 16;
     }
     // Precompute the slime grid once: isSlimeChunk depends only on the chunk,
     // so every AFK position in the window reuses it. This is the whole trick -
@@ -166,6 +172,7 @@ static std::string fmt1(double v) { char b[32]; snprintf(b, sizeof(b), "%.1f", v
 // North is up (Z decreases upward), matching the jar. One tile = 32x32 px.
 // Written to <dir>/../images/<same-name-as-log>.png so seeds and images sit
 // as siblings under main/.
+static bool g_noInnerCircle = false;   // --no-inner-circle: image without the 24-block ring (cross unchanged)
 static void writeSeedImage(long long seed, int bx, int bz, int yOff,
                            double bestCq, double bestEff, int bestChunks, int bestCrChunks,
                            const std::string& imgDir) {
@@ -246,8 +253,9 @@ static void writeSeedImage(long long seed, int bx, int bz, int yOff,
                 }
             }
     };
-    // 24 blocks = 48 px, 128 blocks = 256 px
-    drawCircle(afkPxX + 0.5, afkPxZ + 0.5, 48.0, 200, 0, 0, 200, 1.5);   // inner exclusion
+    // 128 blocks = 256 px. No inner 24-block ring (project owner, 2026-09-13): the farms are measured standing at y -39,
+    // where the exclusion sphere no longer reaches the floor - there is no inner circle. (--no-inner-circle: accepted, no-op.)
+    (void)g_noInnerCircle;
     drawCircle(afkPxX + 0.5, afkPxZ + 0.5, 256.0, 200, 0, 0, 160, 1.5);  // outer eligibility
 
     // --- Layer 4: red AFK crosshair (larger, more visible) ---
@@ -269,6 +277,12 @@ static void writeSeedImage(long long seed, int bx, int bz, int yOff,
         fprintf(stderr, "cannot write %s\n", name.c_str());
 }
 
+
+// --no-logs: skip the per-seed <seed>.txt. Batch scoring (hunt_pipeline scores every
+// seed a hunt finds, thousands per cycle) only needs the --csv summary; writing one
+// log per seed is what grew main/scores to 60k+ files. Results worth keeping are
+// re-run for their single seed without this flag when they are archived.
+static bool g_noLogs = false;
 
 static void report(long long seed, int cbx, int cbz, int radius, bool fine, int yOff,
                    std::vector<Row>& rows, const std::string& dir, int topN, bool quiet,
@@ -308,10 +322,12 @@ static void report(long long seed, int cbx, int cbz, int radius, bool fine, int 
 
     // Filename is just the seed - the score is the first thing IN the log
     // (see "BEST BY BLOCKS" above), not encoded in the filename.
-    std::string name = dir + "/" + std::to_string(seed) + ".txt";
-    FILE* f = fopen(name.c_str(), "w");
-    if (f) { fputs(s.c_str(), f); fclose(f); if (!quiet) printf("\nLog saved to %s\n", name.c_str()); }
-    else fprintf(stderr, "cannot write %s\n", name.c_str());
+    if (!g_noLogs) {
+        std::string name = dir + "/" + std::to_string(seed) + ".txt";
+        FILE* f = fopen(name.c_str(), "w");
+        if (f) { fputs(s.c_str(), f); fclose(f); if (!quiet) printf("\nLog saved to %s\n", name.c_str()); }
+        else fprintf(stderr, "cannot write %s\n", name.c_str());
+    }
 
     // v7: image output under main/images/<family>/. Default ON so the jar isn't
     // needed for the visual. Same base filename as the log, .png extension.
@@ -425,6 +441,7 @@ static void climbSeed(long long baseSeed, int cbx, int cbz, int radius, bool fin
 }
 
 int main(int argc, char** argv) {
+    slimeFixArgv(argc, argv);       // "\" -> "/" off Windows (portable_paths.h)
     int cbx = 2000, cbz = 8544, radius = 3, topN = 10, threads = 0, yOff = 0;
     bool fine = true, quiet = false, selftest = false, images = true;
     std::string seedFile, dir = "main/scores", csvOut, family;
@@ -439,6 +456,7 @@ int main(int argc, char** argv) {
         if      (a == "--center-x")   cbx = atoi(nx("--center-x"));
         else if (a == "--center-z")   cbz = atoi(nx("--center-z"));
         else if (a == "--radius")     radius = atoi(nx("--radius"));
+        else if (a == "--radius-z")   g_radiusZ = atoi(nx("--radius-z"));
         else if (a == "--seeds")      seedFile = nx("--seeds");
         else if (a == "--out-dir")    dir = nx("--out-dir");
         else if (a == "--csv")        csvOut = nx("--csv");
@@ -450,6 +468,8 @@ int main(int argc, char** argv) {
         else if (a == "--self-test")  selftest = true;
         else if (a == "--images")     images = true;
         else if (a == "--no-images")  images = false;
+        else if (a == "--no-logs")    g_noLogs = true;
+        else if (a == "--no-inner-circle") g_noInnerCircle = true;
         else if (a == "--family")     family = nx("--family");
         else if (a == "--climb")          climb = true;
         else if (a == "--climb-top")      climbTop = atoi(nx("--climb-top"));
@@ -458,7 +478,8 @@ int main(int argc, char** argv) {
         else if (a == "--climb-recurse")   climbRecurse = true;
         else if (a == "--climb-max-rounds") climbMaxRounds = atoi(nx("--climb-max-rounds"));
         else { fprintf(stderr,
-            "usage: slime_refine --seeds seeds.csv --center-x X --center-z Z [--radius 3]\n"
+            "usage: slime_refine --seeds seeds.csv --center-x X --center-z Z [--radius 3] [--radius-z R]\n"
+            "  --radius-z R      Z half-width of the AFK window in chunks (default: --radius)\n"
             "  --fine            test every block offset (default, 256x the jar)\n"
             "  --chunk-aligned   only multiples of 16, what the jar did\n"
             "  --csv <file>      one summary row per seed, best cq first\n"
@@ -468,6 +489,8 @@ int main(int argc, char** argv) {
             "                    <x>_<z> so every hotspot keeps its own set\n"
             "  --images          write a PNG per seed (default on)\n"
             "  --no-images       skip the PNGs (batch scoring thousands)\n"
+            "  --no-logs         skip the per-seed .txt logs too (--csv still written)\n"
+            "  --no-inner-circle (no-op: images never draw the 24-block ring now)\n"
             "  --threads N       default: all cores\n"
             "                    ONE y only. 0 is the only value verified vs the jar.\n"
             "  --self-test       verify against SlimeFinder ground truth\n"
@@ -489,11 +512,13 @@ int main(int argc, char** argv) {
     //   main/scores/<family>/<seed>.txt
     //   main/scores/<family>/<seed>.png
     if (family.empty()) family = std::to_string(cbx) + "_" + std::to_string(cbz);
-    MKDIR("main");
-    MKDIR(dir.c_str());        // main/scores
     std::string logDir = dir + "/" + family;
     std::string imgDir = logDir;
-    MKDIR(logDir.c_str());
+    if (!(g_noLogs && !images)) {   // nothing lands there otherwise - do not litter empty dirs
+        MKDIR("main");
+        MKDIR(dir.c_str());        // main/scores
+        MKDIR(logDir.c_str());
+    }
 
     Weights W(yOff);
 
@@ -578,6 +603,7 @@ int main(int argc, char** argv) {
                     [](const Row& a, const Row& b) {
                         if (a.chunks != b.chunks) return a.chunks < b.chunks; return a.dist > b.dist; });
                 sums[i] = Sum{ seeds[i], *bb, *bc }; done[i] = 1;
+                if (g_noLogs && !images && seeds.size() > 8) continue;
                 std::lock_guard<std::mutex> g(mio);
                 report(seeds[i], cbx, cbz, radius, fine, yOff, rows, logDir, topN, seeds.size() > 8, images, imgDir);
             }

@@ -1,0 +1,249 @@
+NOTE: references below to an "archive" folder point into the original working copy. Those folders are
+NOT shipped with this share, and are kept only as a record. Ask the sender if you need one.
+
+# Open items (2026-09-12)
+
+Things discussed but not done, known gaps, timeline work and theory. Newest state of the search:
+exact phase search (`record_cycle -PhaseSearch`), 5% family cut, 15 positions per spot, pipelined
+refine, C++ shortlist, regression gate (`heat\phase_regress.ps1`). Best farm (2026-09-21, ranked by the -39 number, `main\records\y39_all.csv`): **19,103 in game** (cq 72.03,
+seed 230337960196917, AFK 14432930,5926460) - found by the universe screen. #2 **19,018** (cq 73.52), #3/#4
+**19,015**, #5 **19,012 in game** (cq 73.19, at y -44). The old leader, 69.39 = 18,598 in game, is now #10.
+Note the ordering: cq does NOT rank farms at -39 (docs\PREDICTION.txt 13c).
+
+## A. Verify / protect results
+1. **In-game measurement** — measured: **72.22 = 18,727 (model 18,488, +1.3%) - #1 in game** (= the raised-AFK estimate; found by the prediction search); 69.39 = 18,598 (model 17,764, +4.7%) (= the raised-AFK estimate); 70.34 = 18,409 (model 18,007, +2.2%); 69.30 = 18,407 (model 17,740, +3.8%); 70.64 = 18,293 (model 18,083, +1.2%); 70.82 = 18,261 (model 18,131, +0.7%; = the raised-AFK estimate); 68.28 = 17,771 (+1.7%); 69.09 = 17,740 (+0.3%); 66.04 = 17,112 (+1.2%).
+   The gap is layout-dependent (y levels - see B6), so model cq cannot rank farms within a few % of each other; only the game can.
+   The 69.30's overshoot was called from its image before measuring: 4 slime chunks inside the middle no-spawn sphere,
+   which add spawning blocks when the AFK point is raised. Still to measure: 69.78 (70.34 spot), 68.57, 68.54, 68.39, 68.38. Perimeter setups on request only
+   (`perimeter_setup.exe --seed S --center-x X --center-z Z`), written to main\records\perimeter\.
+2. DONE 2026-09-12 (main\theory\heat\regress_spots.csv, 9 spots). **Grow the regression set** with the new top spots (69.09 / 68.57, 68.54, 68.39, 68.38), so every
+   future build must re-find them too. Today it covers only the 5 older known spots.
+3. DONE 2026-09-12 (phase_spots -CheckEvery 50 -> main\theory\heat\cut_checks.csv; first check at the 68.54 spot: 2 of 259 layouts >= 68 outside the cut, 0 of 6 >= 70, worst 70+ family rank 2.86%). **Automatic family-cut spot checks**: every ~50 spots, search one position with ALL families and
+   log what the 5% cut would have missed. Today's evidence (7 positions, worst family for a 70+
+   layout at 3.58%) is good but finite.
+4. **Earlier non-exact spots**: the 27 stratified spots and ~15 test spots were searched with the old
+   best-family method only; the exact search skips them ("new only"). Optional exact re-search.
+5. The 46 remaining spots of the stopped re-pass (searched before the one-layout-per-class fix).
+   Judged not worth it (can only add secondary farms), listed for completeness.
+
+## B. Timeline (speed of the exact search)
+1. DONE 2026-09-12: `--phase-top-positions 10` (driver default): positions ranked by families with >= 150 possible chunks; 97 of 97 test spots (36 + 61 held out) kept their best layout, regression gate 55/55; ~1/3 faster. **Adaptive positions** — pick each spot's positions from a cheap exact statistic instead of a fixed
+   3x3-stride grid: the possible-count distribution (families with >= 155 possible chunks) predicted
+   big layouts at r = 0.81 across positions around one spot. Search the best k positions first.
+2. TRIED 2026-09-13, NOT FASTER on this GPU (`--phase-union`, off by default; self-test [8] and 5 real spots: identical output, every row). 10 positions -> 509 union chunks, each family kept at ~4 positions: ~2.6x fewer B(0), but 200 B of per-position counters per thread cut occupancy to 12 warps/SM (old: 32) and the extra increments cost ~15 s: 27.4 s vs 16.7 s per spot (probe with one increment per chunk: 12.2 s). Ceiling for a reworked version on this laptop ~1.2-1.4x. **Union-window kernel** — 68% of kept families are shared between positions 3 chunks apart, so
+   their chunk values are computed several times. Computing each family's values once over the
+   whole window could approach 2x; needs per-position counters that fit in shared memory.
+3. DONE 2026-09-13: **1.44x** (5 real spots, --phase-out identical row for row; self-tests; regression gate 14/14 spots, 112/112 farms, 1,847/1,847 refined rows): 32-bit inner loop (b = (((H0 + c) ^ C') * 8M + (K >> 17)) mod 2^31) and K>>17 + H0 read as one 64-bit, two chunks per 128-bit, broadcast load - the loop was bound by shared-memory transactions. Byte counters tried: 0.91x, dropped. Remaining limit: the per-thread counter read-modify-write (2 shared transactions per step). **Kernel efficiency** — the bound pass runs at roughly a third of the GPU's integer throughput;
+   the counters are not the cost (probe); suspects: 64-bit adds/shifts in B(0), loop overhead,
+   occupancy. No profiler installed; would need careful micro-benchmarks.
+4. ANSWERED 2026-09-12 (246 exact spots): heat stays the ranking - spots with a 67+ farm: 18% at heat 28+, 8% at 26-28, 1% at 24-26; the possible-count statistic predicts layout counts slightly better (r 0.24 vs 0.16) but spot best cq no better. **Better spot ranking** — heat predicts record-class families only weakly (stratified test). The
+   exact search now logs, per spot, layouts >= 64/66/68/70 and every 68+ layout
+   (`main\theory\heat\phase_layouts\`): enough data soon to fit a better ranking (heat, possible-count
+   statistics, line, X value) and reorder the spot list.
+5. DONE 2026-09-12: every X column, every Z line and 3M candidate spots measured on the GPU (AI_CONTEXT "WHOLE-WORLD COVERAGE"); the spot list is now measured, not predicted. Was: `hotspot_scan --heat-survey` (GPU, same heat40 definition, validated vs the 2M CPU values; 20,000 columns x 50k seeds in 0.8 s) surveying every column of line 10617. **Wider X survey** — the X list covers the survey's top 20,000 columns of ~3.75M; hot columns kept
+   appearing deep in it (the hottest was survey rank 12,893). Needs a GPU heat measurement.
+6. DONE 2026-09-13 as a side folder: main\records\over66_y-39\ (`<peri>-<cq>-<seed>.png`, measured farms `-measured`; see README RAISED-AFK FOLDER). **Raised-AFK rescan of collected results** (to the project owner's spec, 2026-09-12). A SEPARATE
+   tool, NOT part of the search: re-score the farms already collected (records / over66.csv / the phase_layouts keep and
+   _scored files) with the AFK point raised so the middle chunks can spawn - i.e. a slightly smaller outer circle and NO
+   inner no-spawn circle - and look for outliers whose rank jumps. Why: the 69.30 (+3.8%) and 70.34 (+2.2%) beat their
+   y-offset-0 model counts by different amounts, and their 267-block model gap came out as 2 in game. The search itself
+   stays exactly as it is. AFK y level for the rescan: **-39** (project owner, 2026-09-13; floor at -64).
+
+## C. Cleanup / docs
+1. DONE 2026-09-13: guides refreshed - README '[*] THE RECORD SEARCH' leads with -PhaseSearch (commands, what it does, safety, in-game), FEATURES has a first section for the exact search, STEP_BY_STEP has STEP 12 (the exact search) and STEP 13 (the -39 in-game number). Earlier: share\ files regenerated from the whole-world measurements (z_lines = top 1,000 of all 38,710 lines, x_positions = top 5,000 world X peaks, hottest_spots = the measured spot list with exact-search results). Guides still to update: (z_lines, x_positions, hottest_spots with exact-search results). README / FEATURES / STEP_BY_STEP guides: describe the exact search as the main mode; mark
+   -Heat / -BestFamily / triage as previous methods. `share\` files (z_lines, x_positions,
+   hottest_spots) still carry the pre-re-measure rankings — regenerate from the measured values.
+2. DONE 2026-09-13: -Heat RETIRED (prints a pointer to -PhaseSearch; heat_spots.ps1 / record_odds.ps1 in heat\old). `-Heat` mode now orders X by measured value, but its heat cache lacks most of those spots (first
+   run would score ~28k spots, ~1 h CPU). Retire the mode or precompute.
+3. DONE: old .bak sources, one-off scripts, old visuals and scratch moved to main\archive (cleanup_2026-09-12, removed_2026-09-12).
+
+## D. Theory
+1. **Why a family is rich** — phases come from B(0) of (seed + P) ^ C; without the xor, phase
+   differences between chunks would not depend on the seed at all. The xor's carry pattern (C >> 20
+   = 0x5E43, 8 of 15 class bits flipped) decides which (family, class) pairs align. A structural rule
+   could skip even the exact enumeration.
+2. **Position quality** — possible-count statistics vs actual big layouts across many spots (not
+   just around one), now that the data is logged.
+3. **Heat model interaction** — the product model F(X) x G(Z) fits at chi2 1.93 per measurement: a
+   real X x Z interaction exists; small, unexplained.
+4. **Holes in the middle** — your earlier idea that the scoring favours layouts with holes near the
+   AFK spot; theorised, not changed (you preferred to check manually).
+6. **PREDICTION (the final goal)** — groundwork in main\theory\docs\PREDICTION.txt (2026-09-13): the target is exact (best -39 count of a spot, calibrated in game), a per-spot table joins everything (main\theory\prediction\spots.csv, heat\prediction_table.ps1), and five experiments are lined up (X-column test, family transport, class low bits, spot-ranking model, in-game truth).
+5. **Model vs game** — cq is a geometric model; in-game /perimeterinfo decides. Collect measured
+   farms to quantify the gap per layout shape.
+
+## Review 2026-09-12 (evening)
+- VERIFIED: the per-X family handling. Each AFK position builds its own possible-chunk ranking and keeps its own
+  top 5% (cut 130-139 possible chunks, 53-62k families per position at the 69.09 spot); the 69.09 / 68.57 family
+  0xE02CF ranks 0.23% at its position and its classes were found at 2 positions with the full 73-chunk layout.
+- FIXED: family keys with a comma (PHASE@X,Z / 0xFFFFF|v@X,Z) split unquoted rows of index.csv and over66.csv
+  (and two later re-saves baked the shift in: 196 + 198 rows). Writers now put ';' in keys; all rows realigned,
+  run names restored, every index row points at an existing record file. Backups: main\archive\csv_backup_2026-09-12_repair.
+- FIXED: 5 ledger keys (the validation spots) were in families.csv 3 times; one row each now.
+- CHECKED OK: spot log complete (339 rows, none lost; the driver's extra Refined column is dropped by Export-Csv
+  -Append, harmless); gallery = over66 list; no duplicate farms; regression gate tests the 10-position setting.
+- FIXED (later): over66.csv Heat40 was blank for every exact-search farm (Log-Over66 read the old heat_cache.csv,
+  3.3 MB re-read per farm, ~1 s each); now the measured spot_top.csv, loaded once. 199 rows backfilled.
+- FIXED (later): same farm filed twice under different seeds - ArchiveResult checked for copies only AFTER moving the
+  files (12 copies' files sat in the tier folders with no row) and only at the exact AFK block (8 copies 1-5 blocks
+  apart were indexed). Now: same cq + AFK within 8 blocks = same farm, checked before filing; phase_spots archives the
+  10 best distinct farms per spot. 40 files + 8 gallery images to main\archive\duplicates_2026-09-12.
+
+## Timeline additions
+6. DONE 2026-09-13 as Z radius 7 (X stays 9): identical for 12,183 shortlisted seeds at 17 spots and all 6,365 historical 65+ farms, refine 1.27x. Radius 8 in X REJECTED: a farm's best AFK sat exactly on the +128-block edge (9 more within 8 blocks). End to end: 13.9 s per spot (was ~18.5-20). **Refine radius 9 -> 8**: farms sit at most ~2 chunks past a searched position (+-6 X / +-3 Z), so radius 8
+   may give identical results with ~20% less refine CPU. Must pass heat\phase_regress.ps1.
+7. **Extend the measured spot list** before it runs low: spot_top.csv holds 19,740 spots >= 24 (top 10,000 X x
+   top 300 lines). Next slices: X peaks 10,001-30,000 x top 300 lines, or top 10,000 X x lines 301-1,000
+   (~13 min GPU per 3M spots, heat\spot_top.ps1).
+8. **Heat vs outcome on the new list**: after ~300 new-list spots, recompute the 67+ rate by measured heat
+   (earlier: 18% at 28+). Decides how deep the list is worth searching.
+   First look 2026-09-12 (416 searched spots, cycle #43): corr(heat40, spot best) = 0.20. Heat 28+ (187
+   spots): 66+ at 16-40% of spots, 67+ at 5-25%, mean spot best ~64.8. Heat < 28 (229 older spots): 66+ 11%,
+   67+ 3%, mean 64.3. So heat roughly doubles the 66+ rate, but inside 30-34 the rate is flat (69.30 came
+   from heat 30.3) - going down the list costs little. Repeat at ~300 spots of heat 24-28.
+9. **Cut checks**: every 50 spots; if one ever finds a 70+ layout outside the 5% cut, raise the cut.
+10. **Model vs game**: measured gaps +0.3%, +1.2%, +1.7% - each new in-game measurement goes in AI_CONTEXT.
+
+## Patterns 2026-09-12 (479 exact spots, after the 70.34)
+- **A rich spot = one rich family.** At 40 spots with >= 40 rows of 70+ chunks, the top family holds 50-100% of them
+  (10 spots: 100%). The 70.34 spot: 386 rows, 91% family 0x0FFDB (rest 0x0FFAB, 3 bits away); all five 69+ farms there
+  (70.34, 69.78, 69.34, 69.24, 69.08) are 0x0FFDB. That family ranks only 0.52% by possible chunks (143) - its
+  richness is in how its phases line up, not in how many chunks can be slime (theory D1).
+- **Inside the rich family the good classes share their low bits**: 0x0FFDB's 70+ classes are all = 9..14 (mod 64)
+  (245 of 353 rows exactly 13), while class bits 9-14 take 20 of 64 values. So the farm is set by about the lowest
+  26 seed bits; the class's upper bits (xor'd by C) and v mostly rotate phases. Possible speed idea: a class-group
+  bound (all 64 upper-bit variants at once) - only if a sound group bound exists (the xor breaks exact lockstep).
+- **Exceptions with MANY rich families: X = -5042368** (11 and 13 families at two of its spots) - and all 4 of its spots
+  on 4 lines scored 66.84-68.85 (mean 67.5 vs 64.6 overall). The X position itself, not one lucky family. Heat, line and
+  X-mates each predict a spot's best only weakly overall (corr 0.18 / 0.13 / 0.15).
+- Line 10617 is NOT better per spot (199 spots, 67+ at 4%); it holds the most records because it was searched most.
+- Follow-up (cheap): the unsearched lines at X = -5042368 (39 on the measured list) and at the 70.34's X = -8546768 (12).
+
+## Tests 2026-09-13 (night)
+- X-column test NEGATIVE (103 spots on 5 strong columns = ordinary spots). Sister test NEGATIVE (35 sisters of 6 record spots: mean 62.88, none 67+, the rich family does not carry). Richness is in the high bits of (seed + P) - spot-specific; the only structural lead left inside a spot is the class low bits (docs\PREDICTION.txt 5.3). Next for prediction: model phase alignment itself, or accept the exhaustive search and keep speeding it up.
+
+## Performance state 2026-09-13 (afternoon)
+- Installed: 1.44x kernel + Z-radius-7 refine + GPU buffer reuse (reuse alone 1.01x - allocation was never the cost; identical output on 5 spots). Regression gate run for real: 14/14 spots, 112/112 farms (the gate refuses to run with main\STOP_WR present and fails if the driver searched fewer spots - a 2-second false pass happened once). Gate outputs now go to main\logs\regress.
+- Speed: 12.8 s per spot end to end (was ~19). GPU search ~11 s; the rest (~1.8 s, 14%) is the family-cut safety check every 50 spots (~0.5 s/spot), filing new 66+ farms (images, -39 estimate; ~0.4 s/spot) and the batch spot list. Trimming the safe parts: <= ~5% - not pursued.
+- Kernel: now bound by the per-thread counter read-modify-write (2 shared transactions per step). Tried and dropped: union window (0.6x), byte counters (0.91x).
+
+## Prediction search (2026-09-13) - WORKS
+- phase_prepass (512 random classes per family, about 1 s per spot) ranks spots far better than heat: its top 50 of 2,000 fresh spots gave 67+ at 30% (heat list 7%), 68+ 14% (1%), four farms of 69.9+. See docs\PREDICTION.txt section 7.
+- DONE (project owner: all four, as a SEPARATE search): predict_cycle.ps1 - 2-stage screen (512 then 2,048 on the top 10%), score best2048 + log2(1+pairs68) (best of 6 on 80 known spots), universe beyond the heat list (heat 20+, half random), top 50 per 2,000 exact-searched. Running since 2026-09-13 15:50.
+
+## TIMELINE set 2026-09-20 (prediction; work on these later, in order)
+
+1. **Label spots at scale, fit the geometry prior properly.** The probe screen (docs\PREDICTION.txt section 8) gives a
+   near-truth best count in 0.24 s, so ~50,000 random spots can be labelled in ~3 h. Fit the prior on several geometry
+   features (hpair at several widths, H-gap distribution, bins occupied, per-position spread, heat) instead of the one
+   hand-picked statistic now in geo_rank (r = -0.29). Goal: a prior clearly stronger than -0.29, measured on a holdout.
+2. **Escape the heat list.** The universe is 183,536 spots from a survey costing 2^18 * 222 per spot; geo_rank costs
+   ~2,000. With a fitted prior, sweep spots the survey never ranked (and below heat 20) and screen the best of them.
+   Several top farms came from unremarkable heat, so the survey's ordering was probably never the right one.
+3. **Watch the geo band.** predict_cycle now picks half of each chunk by the geometry prior (band 'geo') and half at
+   random (control). After a few cycles, compare the two bands in predict_cycles.txt / screened.csv - that is the real
+   test of the prior, not the 1,724-spot correlation.
+4. **Finish the re-screen** (heat\rescreen.ps1) and exact-search its best; it covers the ~15,600 spots the old 34%
+   screen passed over.
+5. NOT on the timeline: naming record seeds directly without a search. See section 9's negatives.
+
+### Judgment on the full predictive model (2026-09-20, Claude's read - opinion, not measurement)
+
+- **A much stronger prior: probably reachable (~70% confidence).** geo_rank's -0.29 comes from ONE hand-picked
+  statistic fitted on 1,724 biased labels. More features plus ~50,000 screen-labelled spots should do clearly better.
+- **Naming record seeds with no search: probably not possible.** Not because it is hard, but because of the SHAPE of
+  today's negatives. Exploitable structure usually leaks somewhere - locked pairs, a skewed subset, a lattice. Four
+  places were checked (class-independent pairs, H structure of the aligned set, H clustering of the possible set,
+  possible count) and three returned chance while the +8.5-count lift refused to decompose into anything. That is the
+  pattern of a quantity you can only get by trying: the seed mixing is a hash, and the target is a maximum over 2^35
+  tries of a hash-like function - like asking for the best chess move without looking ahead.
+- **A ceiling argument that does not depend on that hunch:** spot ceilings span only ~65-78. A maximum over a huge
+  pool concentrates into a narrow band like that by itself, so much of the spread may be extreme-value behaviour that
+  no map statistic can reach. Expect a good geometry model to say "this spot is promising", not "this spot holds a 77"
+  - which is all it needs to do, now that the screen and the exact search are fast.
+- **What would change this:** if the fitted prior from timeline item 1 comes out clearly stronger than -0.5, geometry
+  carries more than assumed here and naming seeds directly deserves another look.
+
+### Why the heat survey cannot stay the map (coverage, measured 2026-09-20)
+
+`main\theory\heat\spot_measured.csv` is a **300 x 10,000 grid**: 300 distinct Z rows and 10,000 X values = 3,000,000
+spots. Mean gap between used Z rows: **12,495 chunks**; X spacing ~375 chunks, while a spot spans about 9. The world
+holds roughly **3 x 10^11 distinct spots** (same-farm rule: +-4 chunks X, +-2 rows Z), so the survey evaluated about
+**one spot in 100,000** - and the 183,536-spot universe is the top 6% of that sample, ranked by heat, whose
+correlation with a spot's exact best is only 0.10-0.23.
+So every record so far comes from a 0.001% sample ordered by a weak statistic. The best farm in the world is almost
+certainly at a spot that was never evaluated at all - not ranked low, never looked at.
+Heat cannot be extended: measuring it costs 2^18 * 222 per spot, which is why the survey is a grid and not a sweep.
+The geometry prior costs ~2,000 operations and needs no seed, so it CAN be: prior over never-surveyed spots (GPU) ->
+probe screen on the best of them (0.24 s) -> exact search -> in-game. That is what replaces heat.
+
+### Sweep arithmetic (2026-09-20, after the groundwork above)
+
+Geometry is the ONLY statistic cheap enough to run everywhere (2e3 ops; random seed draws fail, docs\PREDICTION.txt 9a), so
+a world sweep looks like: geo prior over the spot lattice -> probe screen the top -> exact search the best of those.
+The screen is the bottleneck, not the prior: at 0.24 s/spot, 100,000 screened spots = ~7 h of GPU. With the fitted
+prior's top decile holding a 74+ at 9.3% against 4.1%, 100,000 geometry-selected NEVER-SURVEYED spots is a far bigger
+hunting ground than the 167,000 left in the heat-20 universe, and it costs the same GPU hours.
+Engineering left: port geo_rank to GPU (it sorts 222 values per position x 15 positions), and decide the spot lattice
+to sweep (same-farm rule: +-4 chunks X, +-2 rows Z).
+
+### TIMELINE CORRECTION (2026-09-20, after the world test)
+
+Item 2 above ("escape the heat list") is **withdrawn**: 3,000 random world spots held nothing at 70+ against the
+universe's 12.9% (docs\PREDICTION.txt 9c). Heat cannot be bypassed by a cheap prior - it is what makes a spot viable.
+Replacement plan, in order:
+1. **Score BLOCKS, not chunk count** (the big one - docs\PREDICTION.txt section 10). The phase model carries the block
+   weights for free and is exact (2,000 checks against brute force, 0 mismatches). Wire it into phase_prepass (rank
+   spots by predicted blocks) and into the exact search's layout ranking, keeping the count floor so nothing
+   currently found is lost.
+2. **Finish the heat-20 universe** with the probe screen: ~167,000 spots left, ~11 h of GPU, resumable.
+3. **Extend the heat survey** if new territory is still wanted - at the survey's own cost per spot, not a prior's.
+   Sizing first: what did the original 3M-spot survey cost, and what would 30M cost?
+4. Fit the prior properly only if it still matters after 1-2; on unselected spots it is worth little (9b).
+
+### DEPLOYED 2026-09-20: the -39 ranking in the exact search
+
+`hotspot_scan.cu` scores every emitted layout at the RAISED AFK (`PhaseHit.blocks39`, `phaseWeights39()`) and the
+refine shortlist is the union of three rankings - top 400 by cq blocks, top 200 by chunks, top 200 by -39 blocks
+(`--phase-refine-y39`, default 200; driver `-RefineY39`). Shortlist and keep rows carry a `blocks39` column.
+Verified before installing: self-tests [1]-[8] pass; at the 68.28 spot the old 939 shortlist rows are reproduced
+ROW FOR ROW with the slice off and are all still present with it on (979 rows, +4% refine, not the feared +50%);
+the regression gate re-found 132 of 132 farms at 16 spots; `blocks39` matches `afk_rescan` on 25 of 25 layouts.
+Deploying it found a real bug - the 222-cell spawn mask drops the four chunks touching the AFK column, which the
+-39 objective must count (a full floor read 48,645, not the in-game 49,669). Fixed in `hotspot_scan` AND in
+`phase_prepass --y39`, both of which now abort unless the window sums to 49,669. See docs\PREDICTION.txt section 11.
+
+Noticed while checking, NOT caused by this change and harmless: the `--phase-keep` file is not reproducible
+run to run (same layouts and stats, different representative seed per layout - the emission order of equal-v
+seeds is a GPU race). The shortlist IS reproducible, and it is the only file the pipeline refines.
+
+### NEXT (prediction): re-rank the re-screen by -39
+
+`main	heory\predictionescreened.csv` (15,613 spots, essentially the whole heat-20 backlog) was screened by
+CHUNK COUNT. On 400 labelled spots the -39 screen puts 18 of the true top 40 in its top 40 against 13 for count
+(docs\PREDICTION.txt 11). Re-screening the file with `phase_prepass --y39` is ~80 min of GPU (0.32 s/spot) and changes
+which 40 spots the exact search takes next. Still open behind it: the heat-20 universe sweep (~167k spots,
+`universe_h20.csv`, ~11 h, resumable) - screen that with `--y39` from the start.
+
+## 2026-09-21 - changes made, and what they opened
+
+**Made:**
+- `y39_rank.ps1` (new, one-shot): ranks every farm in `over66.csv` at -39 into `main\records\y39_all.csv`,
+  45 s for 2,902 farms. Before this only the 401 farms with a record image on disk had a -39 number at all.
+- `heat\universe_screen.ps1`: sweeps the WHOLE output file each run (NUL strip + shape test), not just new
+  rows; a per-output lock file so two screens cannot append to one CSV; `heat` column fixed (the lookup now
+  keys on the parsed integers, so it no longer comes back blank).
+- `universe_screened.csv` cleaned: 10,948 NUL bytes, 9 torn rows. Backup `.prefilter`.
+
+**Open, in priority order:**
+1. **Re-mine searched spots at -39.** 3,758 spots are already exact-searched and their layouts are on disk,
+   but they were filed through a cq-66 gate that correlates ~0 with the -39 number. Running `afk_rescan`
+   over a spot's raw layouts reproduces the record without `slime_refine`. Cost measured on the record spot:
+   11,634 layouts in 98 s; over 45 top spots it projects to ~5 h for 298k layouts, so full coverage of all
+   3,758 spots is ~26 CPU-hours. Started 2026-09-21, stopped at 4% - no result either way.
+2. **Does the cq-66 filing gate lose -39 farms?** The question (1) would have answered. Cheap version: one
+   spot, refine every layout regardless of cq, compare the best -39 among cq<66 against cq>=66.
+3. **Extend the heat survey.** Section 9c settled that heat is a population filter and random world spots
+   score 0.00% at 70+; the 183,536 spots above heat 20 are a cut of a 3,000,000-spot survey. If the -39
+   ceiling here is ~19,300-19,500 (section 13a), more universe is the only way past it.
+4. Drop `possible` as a ranking statistic (13e). It still earns its place as the family CUT.

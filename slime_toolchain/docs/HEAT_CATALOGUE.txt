@@ -1,0 +1,65 @@
+# Heat v2 catalog - every measured spot, documented (2026-09-21)
+
+This folder is the permanent record of heat v2 band 1. Nothing here is a working copy: do not edit, move or
+delete; add new bands as new files. Method and history: `main/theory/heatmap/docs\HEATMAP.txt` (section "The pattern,
+in equations" explains what heat is and why it has the structure it has).
+
+## What was measured
+
+Every (column, row) pair in the whole 30M world (chunks -1,874,999..+1,874,999 on both axes) whose SEPARABLE
+PREDICTION is >= 12 ("band 1", 109,127,698 pairs), each measured directly with the class estimator
+(`hotspot_scan --heat-class`, 16,384 classes ~ 300k plain seeds, brute-force self-check on every run). Reads >= 6.5
+were kept: 109,040,528 spots, 0 duplicates, 0 malformed rows. Run: 2026-09-21 16:12-17:53, laptop-class GPU (6 GB), 17,978 pairs/s.
+
+SUPERSEDED 2026-09-30 (see docs\HEATMAP.txt "CATALOG COVERAGE"): band 1 holds ~88% of the 22+ spots, not all of
+them - 1M-spot samples of pred 10-12 and 8-10 measured 22+ rates of 7.5e-5 and 2.0e-6, about 46,000 spots below the
+cutoff. The old claim below rested on 20,000 samples a band, too few for a 7.5e-5 rate.
+Band 1 contains ALL spots with true heat 22+ (0 of 400k validation spots predicted below 10 reached 22) and ~90% of
+20+. It does NOT contain every 13+ spot: the validation estimates ~245M spots at true 13+ world-wide, about half of
+them predicted below 12 (bands 10-12, 8-10, ... not yet run; plans for 10-12 are in `inputs/plan/`).
+
+## catalog/  - one row per spot, sorted by measured heat (rank 1 = hottest)
+
+| file | measured heat | spots |
+|---|---|---|
+| heat_22plus.csv | >= 22 | 331,595 |
+| heat_20_22.csv | 20-22 | 910,419 |
+| heat_18_20.csv | 18-20 | 3,120,924 |
+| heat_16_18.csv | 16-18 | 9,258,148 |
+| heat_13_16.csv.gz | 13-16 | 37,139,635 |
+| heat_12_13.csv.gz | 12-13 | 17,396,747 |
+| edge_below_12.csv.gz | 6.5-12 (kept so no true 12+ is lost to read noise) | 40,883,060 |
+| summary_by_heat_and_region.csv | counts per integer heat band x region | |
+
+Measured heat carries read noise (sd ~11.5% at 12, ~8% at 22-40), so the tier counts are of READS: e.g. 331,595
+reads >= 22 against ~150k spots of TRUE heat 22+ - many 20-22 spots read high. Rank by heat, but treat +-2 as a tie.
+
+Columns (all files):
+- `rank` - position in the whole catalog by measured heat
+- `cx, cz` - chunk coordinates of the spot (disc centre); `x_block, z_block` = 16 cx, 16 cz (the hunting lists' convention)
+- `heat40` - measured heat (1 = a random place); `sd` - standard error of this read; `classes` - 16,384
+- `pred` - separable prediction F(cx) G(cz) / 341.277 that put the pair in the band
+- `line`, `line_offset` - nearest Z line n and cz - (48.5 + 96.875 n)
+- `v1_region` - `v1` (the exact spot was in the old 3M survey), `v1_other_row` (old column and old line, a different
+  row), `A` (old top-10k column, line outside the old top 300), `B` (old column rank 10k-70k, old top-300 line),
+  `new` (anything else)
+- `near_border` - 1 if within 8 chunks of the world border (heat computed as if the world continued; check in game)
+- `screen_best_chunks` - best chunk count from any universe/floor screen of this spot (blank = never screened)
+- `search_best_cq` - best cq from an exact search of this spot (blank = never exact-searched)
+
+## inputs/ - everything needed to reproduce or extend
+
+- `phase2_rows/rows_col{0-3}.csv.gz` - every row at columns -319635, 1791063, -1115453, -133170 (16,384 classes)
+- `phase3_columns/rows_row{0-3}.csv.gz` - every column at rows 1028571, -395590, -1545498, 1824786; `rows.txt`, `pick.log`
+- `plan/` - `band_12_inf.plan` (the run), `band_10_12.plan` (next band), `band_12_inf.log`, `band_12_inf_raw.csv.gz`
+  (the raw run output), `aux_*` (lookup tables used for the annotation)
+- `validation/` - 280k stratified pairs at 65,536 classes + 400k at 16,384 (the model error and world-total estimates)
+- `noise/` - the 12,639-spot noise set with its 9M-seed truth
+
+## tools/
+
+`hotspot_scan.cu` (source snapshot: `--heat-class`, `--heat-plan`), `hs_plan.exe` (the binary used), `load.py`,
+`sep.py`, `make_plan.py`, `val_sample.py`, `val_report.py`, `chart_data.py`, `catalog_build.cpp`, `export_aux.py`,
+`run.sh`, `analyze_z.py`. Rebuild the tier files: `catalog_build.exe <outdir> band_12_inf_raw.csv` next to the aux files.
+
+Integrity: `MANIFEST.sha256` (sha256sum -c MANIFEST.sha256).

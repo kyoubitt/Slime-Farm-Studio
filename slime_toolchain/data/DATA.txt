@@ -1,0 +1,94 @@
+WHAT DATA THIS SHARE DOES AND DOES NOT INCLUDE
+==============================================
+
+INCLUDED
+--------
+known_answers.csv   5 farms, each one measured in game with /perimeterinfo. This is the test fixture: a
+                    correct build reproduces every `estimate_blocks39`, `cq` and `chunks` value in it.
+                    Four of the five estimates matched the in-game reading exactly; the fifth was +32.
+                    The `why` column says what each row proves.
+
+NOT INCLUDED - ASK THE SENDER IF YOU WANT THEM
+----------------------------------------------
+The heat catalogue (2.8 GB)      109,040,528 measured spots, split by heat band. The hunt reads a
+                                 heat-sorted spot list derived from it.
+universe_tier1.csv (9.5 MB)      the 331,595-spot tier-1 list (heat40 22+) the hunt screens.
+The farm archive (153 MB)        9,764 filed farms, the -39 ranking, the galleries and the record files.
+                                 These are RESULTS, not method - what was found, not how.
+The heat45 tail-heat read         7,525,585 tier-2 spots re-read at T=45. This is what found the record.
+
+The method for producing all of it IS included. If you want the data itself rather than regenerating it,
+just ask - it is a folder copy, not a rebuild.
+
+HOW TO PRODUCE THE SPOT LIST YOURSELF
+-------------------------------------
+1. Build the catalogue tools (see catalogue/tools/ and docs/HEAT_CATALOGUE.txt). `hotspot_scan --heat-plan`
+   with a plan file measures every candidate spot with the class estimator; `catalog_build` splits the raw
+   output into per-heat-band files.
+2. `docs/HEAT_CATALOGUE.txt` gives the exact run: which pairs were measured (separable prediction >= 12),
+   the class count (16,384), the keep threshold (read >= 6.5) and the measured rate (~18,000 pairs/s on a
+   laptop-class GPU, 1.5 h for all 109M).
+3. Convert the band file you want into the three-column form the hunt reads - `cx,cz,heat` sorted by heat,
+   best first - and save it as `main\theory\prediction\universe_tier1.csv` under this folder.
+4. For tier 2, read tail heat at T=45 instead (docs/HEATMAP.txt, "heat45 test" and step 3b). This is the
+   single highest-value step in the whole project: it is what produced the 20,506 record, from a spot whose
+   ordinary heat40 was 17.361 and which heat40 ordering would have ranked roughly 9-millionth.
+
+FOLDER TREE THE SCRIPTS EXPECT
+------------------------------
+The scripts resolve paths relative to this share folder, so they want:
+
+  main\theory\prediction\universe_tier1.csv   <- the only input you must supply
+  main\theory\prediction\                     screen output lands here
+  main\theory\heat\                           exact-search output
+  main\records\                               filed farms, ledgers, galleries
+  main\logs\                                  run logs
+  main\work\                                  scratch
+
+Everything except universe_tier1.csv is created on demand. Empty placeholders are present so the layout is
+obvious.
+
+HOW TO PRODUCE THE TAIL-HEAT (heat45) ORDER - the step that found the record
+---------------------------------------------------------------------------
+This is the highest-value recipe in the project and it is worth reading before the rest. Ordinary heat
+(heat40) is MEAN slime density. heat45 is TAIL heat: it asks how good a spot's best case is, not its
+average. The 20,506 record came from a spot whose heat40 is 17.361 - mid-range, far below the 22+ band
+hunted first - because its tail heat put it in the top 2% of the ordering.
+
+Measured on 2026-10-16 over 7,525,585 spots: 5,814 spots/s, 21.6 minutes, 0 failed reads.
+
+1. Pick the spots. Take every catalogue spot at heat40 >= 17 (that bound covers heat45's whole top 10%:
+   measured, the top 10% by heat45 all have heat40 >= 17.3). From the per-band catalogue files, emit
+   "cx,cz" one per line:
+
+     gunzip -c heat_20_22.csv.gz heat_18_20.csv.gz heat_16_18.csv.gz \
+       | awk -F, 'NR>1 && $6+0>=17 {print $2","$3}' > spots.txt
+
+2. Read tail heat at T = 45, 65,536 classes:
+
+     hotspot_scan.exe --heat-survey --heat-spots spots.txt --heat-class ^
+                      --heat-t 45 --heat-seeds 65536 --heat-out heat45.csv
+
+   Output columns: cx,cz,heat45,classes,sd,hit_classes. Check hit_classes - at 65,536 classes none of the
+   7.5M spots read zero, so the ordering is not noise-limited. At T = 50 and above it IS (15% zero reads at
+   65,536, 88% at T = 55), which is why 45 is the chosen value. See docs\HEATMAP.txt "heat45 test".
+
+3. Sort best-first. Use a real sort, NOT PowerShell's Sort-Object - on 7.5M rows it reached 3.6 GB
+   resident and never finished. This takes about 3 minutes:
+
+     (echo cx,cz,heat45; tail -n +2 heat45.csv | awk -F, '{print $1","$2","$3}' | sort -t, -k3,3gr) > order.csv
+
+4. Screen in that order, in batches, and watch the quality per batch:
+
+     powershell -ExecutionPolicy Bypass -File heat\tier2_skim.ps1 -Batches 6
+
+   tier2_skim.ps1 reads order.csv, screens 25,000 spots a batch, exact-searches anything at the gate, and
+   prints the heat45 range and the 74+/76+/78+ counts for each batch so you can stop when it stops paying.
+   It auto-stops below half of the reference rates. Measured batch curve, for comparison: 208 at 74+ in the
+   first batch (heat45 2.263-1.272), settling to 107 by batch 6 (heat45 1.105-1.085), which is where it
+   matched the exhausted heat40 22+ band and the run was stopped.
+
+WHAT TO ASK THE SENDER FOR
+--------------------------
+If you would rather not spend the ~22 minutes plus a catalogue rebuild: the finished heat45 read, the
+catalogue, the tier-1 list and the farm archive all exist and are a folder copy away. Just ask.

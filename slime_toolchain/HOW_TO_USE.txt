@@ -1,0 +1,53 @@
+HOW TO USE - the short version
+==============================
+
+    ./slime gui        the app, full screen right in this terminal: a live slime-chunk map (its Floor tab
+                       shows the obsidian, magma and glass the commands build), the best spot, the
+                       perimeter commands with Copy buttons, the build guide. Mouse or keyboard.
+                       The map is a real picture in Ghostty, kitty, Windows Terminal 1.22+, WezTerm and
+                       iTerm2; macOS Terminal and the old Windows console draw it with characters
+                       (SLIME_MAP=text ./slime gui does that anywhere).
+    ./slime            a menu: pick a number, it asks for what it needs and explains the result
+
+First time on a machine:  ./build.sh   then   ./slime doctor   (checks everything, says how to fix it)
+On Windows: build.ps1, then  python slime gui  or  python slime  (needs Python 3, nothing else to
+install) - or the .ps1 commands in README.txt.
+
+
+THE COMMON JOBS (the menu runs these for you and prints them so you can type them next time)
+
+  Best farm in my world       ./slime best-spot --seed <seed>
+                              searches 10k / 100k / 1M blocks around spawn and recommends the
+                              closest good spot. Text seeds work too, the same way the game reads them.
+
+  Check one farm              ./slime check --seed <seed> --x <x> --z <z>
+                              its score, its best standing height (feet y -63 to -39), and what
+                              the number means.
+
+  Build it in game            ./slime perimeter --seed <seed> --x <x> --z <z> --version 1.21.11
+                              writes the commands (you need WorldEdit + Carpet) and the steps.
+
+  Save an in-game reading     ./slime measured --seed <seed> --x <x> --z <z> --ingame <N>
+                              what /perimeterinfo showed; it then ranks above the model everywhere.
+
+  Hunt for a record           ./slime hunt --cycles 12          progress: ./slime status
+                              exact phase search: ./slime search  (needs main/best_spots.csv)
+
+  My best farms               ./slime farms                     picture: ./slime farms --open 1
+
+  Stop everything             ./slime stop    - always this, never just close the window: a
+                              leftover GPU process breaks the next run.
+
+
+GOOD TO KNOW
+
+- Close Minecraft before hunting or best-spot. Heavy GPU work next to Minecraft can make a
+  laptop reset on the spot.
+- cq = spawning spaces / 256. A normal world's best spot is usually 44-47 cq, 60+ is excellent,
+  66+ is record class. When the model and /perimeterinfo disagree, the game wins.
+- Standing height matters. At y -39 slimes spawn right under you (no 24-block hole), but some
+  farms are better lower. ./slime check tells you which, and by how much.
+- Results live in main/records/ (a .txt and .png per farm), main/cycles.txt (the hunt log) and
+  main/y_phase.csv (best heights).
+- Deeper docs: README.txt (every flag), STEP_BY_STEP_GUIDE.txt (why it works), LINUX.md (Linux),
+  AI_CONTEXT.md (start here) and docs\ (every number).

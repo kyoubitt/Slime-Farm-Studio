@@ -1,4 +1,4 @@
-﻿# hunt_pipeline.ps1 - the whole loop in one command.
+# hunt_pipeline.ps1 - the whole loop in one command.
 #
 #   scan candidates -> hunt each briefly -> score in REAL cq -> ranked table
 #
@@ -41,6 +41,11 @@ param(
     # it just costs 5s. The ledger still records the spot's unswept best, so
     # nothing is lost except time on seeds that cannot win.
     [double]$ClimbMinCQ = 63.0,
+    # DEEP CLIMB bar: seeds at or above this also get the wide 28-bit climb
+    # (bits 20-47, ~90-200 s on the laptop). ~2.2 below the 67.24 record: the
+    # standard climb adds at most ~2.1 and the deep one ~0.8 on top, so a seed
+    # much below this cannot reach the record. About one seed per heat cycle.
+    [double]$DeepClimbMinCQ = 65.0,
     # RECORD PUSH: after the ranked table, the top -PushTop spots get a second
     # hunt at floor -PushFloor for -PushSeconds each. Learned from run 2: the
     # leaders keep producing when revisited (64.06 -> 65.06 came from exactly
@@ -86,6 +91,25 @@ param(
     # layouts with gaps 2-3x worse than 70c, so they dilute rather than help.
     [int]$PushTop     = 3,
     [int]$PushFloor   = 69,
+    # RICH-FAMILY EXHAUST (2026-09-11; replaces the push when on). Record farms come
+    # from rare "rich" 20-bit families: at the 68.28 / 67.32 / 67.24 / 67.22 spots the
+    # record's family had 29k-47k hits >=64 in 20M seeds while 48 other top-ranked
+    # families had ~0. Triage samples a 14-bit family (64 of these 20-bit families at
+    # once), so its hits pile up in the rich one - but it only ever tests ~0.25% of it.
+    # This stage reads which 20-bit family the spot's triage hits came from and walks
+    # all 2^28 of its seeds (slime_gpu --enumerate --fix-mask 0xFFFFF, ~38 s laptop,
+    # ~5 s PRO 6000). Checked: exhausting the 68.28's family re-finds 68.28 and adds
+    # 67.28, 67.28, 66.73, 66.56 at that spot. Climbs are unnecessary (every high-bit
+    # variant is enumerated). Ledgered as 0xFFFFF|val@x,z.
+    [int]$RichTop     = 6,          # spots per cycle, richest triage families first
+    [int]$RichSeconds = 45,         # per family (2^28 seeds)
+    [int]$RichMinHits = 3,          # triage hits in one 20-bit family to count as rich
+    [int]$RichFloor   = 70,         # keep layouts from this many chunks up
+    # Only spots whose triage already reached this. Measured (cycle #414, 6 exhausts): the
+    # exhaust matched triage's best 4 times and beat it by +0.52 / +0.24 twice, for +35% cycle
+    # time - triage usually finds its family's best already. So it is kept as near-record
+    # insurance only, where +0.5 can turn a 67.8 into a record.
+    [double]$RichMinCQ = 66.0,
     # 15s, was 40s. Same reasoning as record_cycle.ps1's -Seconds: this is a
     # wall-clock budget and the hunt now runs at 41.9M seeds/s (measured), so
     # 15s draws ~630M seeds where the original 40s drew ~160M - still ~4x the
@@ -121,6 +145,24 @@ param(
     # Hard cap on straight-line distance from spawn, in blocks. A scan built
     # with --range-x 10000 --range 10000 bounds a 10k BOX, whose corners reach
     # 14142 blocks - so "10k scan" alone does not mean "within 10k". 0 = no cap.
+    # -ForceMask: override the DERIVED mask before the family sweep. Measured
+    # 2026-09-10: across 13 spots the derivation is the sweep-best family 7
+    # times, but it MISSED AT BOTH RECORD SPOTS - at 40752,5424 by one bit
+    # (rank 40), and at 3696,6992 by choosing a DIFFERENT MASK, which no
+    # val-sweep can recover from. A bad val is recoverable; a bad mask is not.
+    # 0xFDE0F won 4 of 5 spots tested and beat 40752,5424's own native mask
+    # (274 vs 235 hits). Empty string = keep the derived mask.
+    [string]$ForceMask  = "",
+    # seeds per family for the LIGHT triage sweep under -ForceMask (the push
+    # sweep uses 400000). 1/8 the cost; it only has to rank vals, not measure them.
+    [int]$TriageSweepSeeds = 50000,
+    # WINDOWED triage sweep (hotspot_scan --sweep-rx/--sweep-rz): a family is ranked by its
+    # best AFK chunk within +-TriageRx X / +-TriageRz Z of the spot, not the centre alone -
+    # the hunt that follows searches that whole neighbourhood. Paired test, 30 hot spots, one
+    # 14-bit mask (experiments\triage_window_test.ps1): picks differed at 22; windowed family
+    # better at 9, centre at 6; spots whose pick had any 64+ layout 18 vs 14. Weak but
+    # one-sided; costs ~1.5 s/spot. 0/0 = the old centre-only sweep.
+    [int]$TriageRx = 3, [int]$TriageRz = 2,
     [int]$MaxDist     = 10000,
     # Falls back to the old one-process-per-spot behaviour (Start-Process +
     # poll + kill). Use this if the persistent worker misbehaves; every spot
@@ -130,7 +172,11 @@ param(
 )
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# Start-Process -WindowStyle exists only on Windows; PowerShell 7 on Linux rejects it and the process never
+# starts (seen: a spot's seeds went unscored). Splat it in on Windows only.
+$hideWin = if ($PSVersionTable.PSEdition -ne 'Core' -or $IsWindows) { @{ WindowStyle = 'Hidden' } } else { @{} }
 Set-Location $root
+$script:runStart = Get-Date   # scratch this run creates in main\work is removed at the end
 New-Item -ItemType Directory -Force -Path main\work | Out-Null
 
 if (-not $Commands) {
@@ -254,8 +300,11 @@ function Invoke-SlimeWorker($w, $argLine) {
 # used to pay this as a SECOND separate ~199ms spawn, even after the hunt
 # itself moved onto the worker - slime_gpu.cu's runWorkerLoop now accepts a
 # --climb-scan line exactly like a plain hunt line (see runClimbScan there).
-function Invoke-ClimbScan($seedVal, $cx, $cz) {
-    $argLine = "--climb-scan --seed $seedVal --center-x $cx --center-z $cz --m-chunks 6 --climb-lo 24 --climb-bits 24 --climb-top 5"
+# --climb-top 20, was 5: the top few GPU variants are usually exact ties (same
+# chunk-aligned layout - measured: all 5 tied at 16642 blocks), so 5 gave refine
+# one real candidate. 20 costs ~0.3 s more of refine and gives it several.
+function Invoke-ClimbScan($seedVal, $cx, $cz, $lo = 24, $bits = 24, $top = 20) {
+    $argLine = "--climb-scan --seed $seedVal --center-x $cx --center-z $cz --m-chunks 6 --climb-lo $lo --climb-bits $bits --climb-top $top"
     if ($script:worker) {
         if (Send-SlimeWorker $script:worker $argLine) {
             $r = Read-SlimeWorkerLines $script:worker
@@ -266,7 +315,41 @@ function Invoke-ClimbScan($seedVal, $cx, $cz) {
         $script:worker = $null
     }
     return & (Join-Path $root "slime_gpu.exe") --climb-scan --seed $seedVal --center-x $cx --center-z $cz `
-        --m-chunks 6 --climb-lo 24 --climb-bits 24 --climb-top 5 2>&1
+        --m-chunks 6 --climb-lo $lo --climb-bits $bits --climb-top $top 2>&1
+}
+
+# Climb one scored seed ($row: a slime_refine csv row) and return the best refined
+# row - the seed itself when no variant beats it. Used for the standard 24-bit
+# climb, the deep 28-bit climb, and on push results (which were never climbed).
+function Climb-Seed($row, $cx, $cz, $lo, $bits, $label) {
+    $cs = Invoke-ClimbScan $row.seed $cx $cz $lo $bits 20
+    # A deep climb (bits $lo..47) covers EVERY seed sharing this seed's low $lo bits,
+    # so re-climbing any of them - including its own result - repeats the same search.
+    # Log the coverage so reclimb_top.ps1 can skip it.
+    if ($lo -le 20) {
+        $dc = Join-Path $root "main\records\deep_climbed.csv"
+        if (-not (Test-Path $dc)) { Set-Content $dc "SpotX,SpotZ,Lo,LowBits,Seed" -Encoding ascii }
+        Add-Content $dc -Encoding ascii ("{0},{1},{2},{3},{4}" -f $cx, $cz, $lo, ([int64]$row.seed -band ((1L -shl $lo) - 1)), $row.seed)
+    }
+    $vseeds = @(foreach ($ln in $cs) {
+        # variant rows: "<blocks> <cq> (<x>,<z>) <seed>"
+        if ($ln -match '^\s*\d+\s+[0-9.]+\s+\(\s*-?\d+,\s*-?\d+\)\s+(-?\d+)\s*$' -and $Matches[1] -ne $row.seed) { $Matches[1] }
+    }) | Select-Object -Unique
+    if (-not $vseeds) { return $row }
+    $cf = Join-Path $root ("main\work\climb_{0}_{1}.csv" -f $cx,$cz)
+    [System.IO.File]::WriteAllText($cf, ($vseeds -join ","))
+    $csum = Join-Path $root ("main\work\climbcq_{0}_{1}.csv" -f $cx,$cz)
+    $ca = @("--seeds",$cf,"--center-x",$cx,"--center-z",$cz,"--radius",$Radius,
+            "--csv",$csum,"--quiet","--family",("pipe_{0}_{1}" -f $cx,$cz),"--no-images","--no-logs")
+    & (Join-Path $root "slime_refine.exe") @ca *> $null
+    if (Test-Path $csum) {
+        $vb = Import-Csv $csum | Sort-Object { [double]$_.cq } -Descending | Select-Object -First 1
+        if ($vb -and [double]$vb.cq -gt [double]$row.cq) {
+            Write-Host ("      {0}: {1} -> {2} cq (variant)" -f $label,$row.cq,$vb.cq) -ForegroundColor Yellow
+            return $vb
+        }
+    }
+    return $row
 }
 
 function Stop-SlimeWorker($w) {
@@ -297,7 +380,7 @@ function Invoke-Hunt($a, $out, $secs, $before) {
     # safety net for hunts --give-up-after can't judge (e.g. the anchor,
     # which disables it) rather than the main defense it used to be.
     $p = Start-Process -FilePath ".\slime_gpu.exe" -ArgumentList $a `
-         -WorkingDirectory $root -PassThru -WindowStyle Hidden
+         -WorkingDirectory $root -PassThru @hideWin
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while (-not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt $secs) {
         Start-Sleep -Milliseconds 500
@@ -306,6 +389,14 @@ function Invoke-Hunt($a, $out, $secs, $before) {
     if (-not $p.HasExited) { try { $p.Kill() } catch {}; $p.WaitForExit() }
 }
 
+# The family sweep defaults to a FIXED rng seed, so with -ForceMask the same
+# spot would re-derive the same best val every run. Rotate it per run so a
+# fixed mask still samples the 16384 families differently each time.
+# Derived from the COMMANDS FILE name (which carries the cycle's rng-seed),
+# not the clock: the same rng-seed now gives the same sweep, so a cycle is
+# reproducible and two arms of a controlled test sample vals identically.
+# Still rotates per cycle, because the rng-seed does.
+$script:sweepRng = 0; foreach ($ch in ([IO.Path]::GetFileName($Commands)).ToCharArray()) { $script:sweepRng = (($script:sweepRng * 31) + [int]$ch) -band 0x7FFFFFFF }
 $worker = if ($NoWorker) { $null } else { Start-SlimeWorker $root }
 if ($worker) { Write-Host "persistent GPU worker started (one CUDA context for this whole run)" -ForegroundColor DarkGray }
 else { Write-Host "worker disabled - one process per spot (slower, ~199ms/spawn)" -ForegroundColor DarkGray }
@@ -327,30 +418,180 @@ function SaveImage($seed, $cx, $cz, $family, $radius, $root) {
     [System.IO.File]::WriteAllText($f, [string]$seed)
     & (Join-Path $root "slime_refine.exe") --seeds $f --center-x $cx --center-z $cz `
         --radius $radius --quiet --family $family *> $null
+    Remove-Item $f -ErrorAction SilentlyContinue   # one-seed temp file (one per spot used to pile up in main\work)
 }
 
-# File a finished result into main\records\ so the good ones are not buried
-# among thousands of ordinary scores. ONE flat folder, no tier split - every
-# filename is prefixed with its own cq so the best results sort together and
-# stay easy to scan at a glance. Only the peak position for that seed is
-# kept - one txt + one png per result, no high-bit duplicates. Called after
-# the best position for a seed is settled.
-function ArchiveResult($cq, $seed, $cx, $cz, $family, $radius, $root) {
+# File a finished result into main\records\<tier>\ so the good ones are not
+# buried among thousands of ordinary scores. Was ONE flat folder; heat mode
+# yields ~10 results of 64+ per cycle, so a flat folder would bury the top ones
+# under hundreds of 64s within a week. Now:
+#   main\records\index.csv      one row per result - the thing to sort/filter
+#   main\records\<tier>\        <cq>_<seed>.txt/.png, tier = floor(cq): 64\ 65\ 66\ 67\
+#   main\records\RECORD.*       only results VERIFIED IN GAME (filed by hand)
+# Only the peak position per seed is kept, and a seed already indexed at the
+# same position is not indexed twice. The artefacts are MOVED out of
+# main\scores\ (scoring there runs --no-logs; SaveImage writes them just for
+# this seed), so nothing is left behind twice.
+# IN-PROCESS INDEX (2026-10-03). The duplicate tests below used to hit index.csv per filed farm: two
+# Select-String passes plus a full Import-Csv, ~1.8 s per searched spot at 4.42 farms/spot and growing with
+# the file (measured 3.31 s/farm at 65k rows = 3.5x the GPU cost - an O(spots^2) term). Now index.csv is
+# parsed ONCE per process with the same Import-Csv as before, so the parse semantics are unchanged, and the
+# maps are kept current as rows are appended. Assumes one filer per process, which is how the filing worker
+# runspace is built; if filing is ever split across runspaces, each would need to share these maps.
+$script:IdxPos = $null   # "seed|x|z" -> $true          (was: Select-String -SimpleMatch ",$seed,$x,$z,")
+$script:IdxCq = $null    # cq string -> list of {X,Z}   (was: Import-Csv | Where CQ -eq ... )
+$script:IdxLen = -1      # index.csv length when the maps were last in sync with the file
+function Ensure-Index($idx) {
+    # Rebuild if ANOTHER writer appended since we last looked. phase_spots.ps1 has two session states that both
+    # call ArchiveResult (the filing worker runspace and Test-Cut on the main runspace), each with its own copy of
+    # these maps, so "one filer per process" is not true; a second filing process would be invisible too. The
+    # length check costs one stat per farm instead of a full re-read, and keeps the duplicate test honest.
+    if ($null -ne $script:IdxPos) {
+        $len = if (Test-Path $idx) { (Get-Item -LiteralPath $idx).Length } else { 0 }
+        if ($len -eq $script:IdxLen) { return }
+    }
+    $script:IdxPos = @{}; $script:IdxCq = @{}
+    if (Test-Path $idx) {
+        foreach ($r in (Import-Csv $idx)) {
+            $script:IdxPos["$($r.Seed)|$($r.X)|$($r.Z)"] = $true
+            if ($r.X) {
+                if (-not $script:IdxCq.ContainsKey($r.CQ)) {
+                    $script:IdxCq[$r.CQ] = New-Object System.Collections.Generic.List[object] }
+                $script:IdxCq[$r.CQ].Add([pscustomobject]@{ X = [long]$r.X; Z = [long]$r.Z }) } } }
+    $script:IdxLen = if (Test-Path $idx) { (Get-Item -LiteralPath $idx).Length } else { 0 }
+}
+function Add-IndexEntry($cqStr, $seed, $x, $z, $idx) {
+    if ($null -eq $script:IdxPos) { return }
+    $script:IdxPos["$seed|$x|$z"] = $true
+    if ($x) {
+        if (-not $script:IdxCq.ContainsKey($cqStr)) {
+            $script:IdxCq[$cqStr] = New-Object System.Collections.Generic.List[object] }
+        $script:IdxCq[$cqStr].Add([pscustomobject]@{ X = [long]$x; Z = [long]$z }) }
+    # our own append must not look like someone else's
+    if ($idx -and (Test-Path $idx)) { $script:IdxLen = (Get-Item -LiteralPath $idx).Length }
+}
+function ArchiveResult($cq, $seed, $cx, $cz, $family, $radius, $root, $fkey = "") {
     $tier = [math]::Floor([double]$cq)
-    if ($tier -lt 64) { return }
-    $dir = Join-Path $root "main\records"
+    if ($tier -lt 66) { return }   # 66+ only (2026-09-12: the 64/65 tiers were retired; 66+ is the kept data)
+    $recDir = Join-Path $root "main\records"
+    $dir = Join-Path $recDir ([string]$tier)
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    # ensure the artefacts exist (scoring runs image-free, so the png may not)
     SaveImage $seed $cx $cz $family $radius $root
     $src = Join-Path $root ("main\scores\{0}" -f $family)
-    if (-not (Test-Path $src)) { return }
     $cqStr = "{0:0.00}" -f [double]$cq
-    Get-ChildItem $src -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.BaseName -match ([regex]::Escape($seed) + '$') } |
-        ForEach-Object {
-            Copy-Item $_.FullName -Destination (Join-Path $dir ("{0}_{1}{2}" -f $cqStr, $seed, $_.Extension)) `
-                -Force -ErrorAction SilentlyContinue
-        }
+    # exact name match: "-123" must not be taken for seed "123"
+    $arts = @(if (Test-Path $src) { Get-ChildItem $src -File -ErrorAction SilentlyContinue | Where-Object { $_.BaseName -eq [string]$seed } })
+    # index row, parsed from the result's own log so it matches the files exactly - read BEFORE filing,
+    # so a duplicate is never filed (was: files moved first, duplicate check after - 12 farms' files sat
+    # in the tier folders with no index row)
+    $x = ""; $z = ""; $chunks = ""; $blocks = ""
+    $srcTxt = $arts | Where-Object { $_.Extension -eq '.txt' } | Select-Object -First 1
+    if ($srcTxt) {
+        $l = Select-String -Path $srcTxt.FullName -Pattern 'BEST BY BLOCKS:\s+(\d+) blocks \(([\d.]+) cq\) / (\d+) chunks at \((-?\d+),(-?\d+)\)' | Select-Object -First 1
+        if ($l) { $m = $l.Matches[0].Groups; $blocks = $m[1].Value; $chunks = $m[3].Value; $x = $m[4].Value; $z = $m[5].Value }
+    }
+    $idx = Join-Path $recDir "index.csv"
+    Ensure-Index $idx
+    $dup = $script:IdxPos.ContainsKey("$seed|$x|$z")
+    # Same farm under another seed: seeds that agree in their low 48 bits make the same world, a family
+    # exhaust (--enumerate) finds the 48-bit form of a farm the hunt found with random high bits, and the
+    # phase search refines up to 3 seeds per layout - same cq at the same AFK point, or a few blocks off
+    # when the best point shifts with chunks outside the searched window. One row, one set of files per farm.
+    # (2026-10-03) the cq bucket replaces the text pre-filter and the full parse: same rows, same test
+    if (-not $dup -and $x -and $script:IdxCq.ContainsKey($cqStr)) {
+        $lx = [long]$x; $lz = [long]$z
+        foreach ($p in $script:IdxCq[$cqStr]) {
+            if ([math]::Abs($p.X - $lx) -le 8 -and [math]::Abs($p.Z - $lz) -le 8) { $dup = $true; break } } }
+    # slime_refine's scratch folder (main\scores\<family>) is empty once this farm's files are filed or dropped -
+    # remove it here: the exact search borrows only these functions, never the end-of-run tidy below, so
+    # one empty folder per spot piled up (111 by 2026-09-13)
+    $dropSrc = { if ((Test-Path $src) -and -not (Get-ChildItem $src -Force -ErrorAction SilentlyContinue)) { Remove-Item $src -Force -ErrorAction SilentlyContinue } }
+    if ($dup) { $arts | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }; & $dropSrc; return }   # this call's own fresh output
+    $txt = $null
+    foreach ($a in $arts) {
+        $dst = Join-Path $dir ("{0}_{1}{2}" -f $cqStr, $seed, $a.Extension)
+        Move-Item $a.FullName -Destination $dst -Force -ErrorAction SilentlyContinue
+        if ($a.Extension -eq '.txt') { $txt = $dst }
+    }
+    & $dropSrc
+    if (-not (Test-Path $idx)) {
+        Set-Content -Path $idx -Value "Date,CQ,Eff,Chunks,Blocks,Seed,X,Z,Family,SpotX,SpotZ,Run,File" -Encoding ascii
+    }
+    $eff = if ($chunks) { "{0:0.0}" -f ([double]$cq / [double]$chunks * 100) } else { "" }
+    $run = [IO.Path]::GetFileNameWithoutExtension($Commands) -replace '^commands_',''
+    $rel = if ($txt) { $txt.Substring($root.Length).TrimStart('\', '/') } else { "" }   # '/' too: Linux paths
+    Add-Content -Path $idx -Encoding ascii -Value ("{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12}" -f `
+        (Get-Date -Format 'yyyy-MM-dd HH:mm'), $cqStr, $eff, $chunks, $blocks, $seed, $x, $z, ($fkey -replace ',', ';'), $cx, $cz, $run, $rel)   # keys like PHASE@X,Z carry a comma; the row is not quoted
+    Add-IndexEntry $cqStr $seed $x $z $idx
+    Log-Over66 $cqStr $seed $x $z $cx $cz $chunks $eff $fkey $run $root
+}
+
+# main\records\over70_y-39\<estimate>-<cq>-<seed>.png for a newly filed 66+ farm: afk_rescan.exe's estimate of what
+# /perimeterinfo reads with the player's feet at y -39 over the -64 floor (no inner circle, outer 125.7, best AFK
+# point within +-48 blocks). A side hint, not a ranking; ~0.1 s per new 66+ farm. afk_rescan.ps1 backfills and
+# renames measured farms to their in-game number. Prints "BIG (estimate ...)" above the best in-game count.
+function Add-Y39Image($png, $seed, $x, $z, $cq, $root) {
+    $exe = Join-Path $root "afk_rescan.exe"
+    if (-not (Test-Path $exe) -or -not (Test-Path -LiteralPath $png) -or -not $x) { return }
+    $dir = Join-Path $root "main\records\over70_y-39"; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $in = Join-Path $root ("main\work\y39_{0}.csv" -f $seed); $out = "$in.out"
+    [IO.File]::WriteAllText($in, "seed,x,z`n$seed,$x,$z`n")
+    & $exe --in $in --out $out --dy 24 --window 48 | Out-Null
+    $r = $null; if (Test-Path $out) { $r = Import-Csv $out | Select-Object -First 1 }
+    Remove-Item $in, $out -ErrorAction SilentlyContinue
+    if (-not $r) { return }
+    $est = [int]$r.blocks_dy_best; $p = Join-Path $dir ("{0}-{1}-{2}.png" -f $est, $cq, $seed)   # peri-score-seed (the project owner's format)
+    Copy-Item -LiteralPath $png $p -Force      # one image per farm: slime_refine draws no inner ring any more
+    $stamp = ([datetime]'2026-01-01').AddSeconds(5 * $est); (Get-Item -LiteralPath $p).LastWriteTime = $stamp; (Get-Item -LiteralPath $p).CreationTime = $stamp
+    $mf = Join-Path $root "main\records\measured_in_game.csv"
+    if (Test-Path $mf) {
+        $meas = @(Import-Csv $mf); $top = [int]($meas | ForEach-Object { [int]$_.ingame } | Measure-Object -Maximum).Maximum
+        $twin = @($meas | Where-Object { [math]::Abs([long]$_.x - [long]$x) -le 64 -and [math]::Abs([long]$_.z - [long]$z) -le 64 }).Count
+        if ($top -and $est -gt $top -and -not $twin) { "BIG (estimate - worth an in-game check): {0} seed {1} - tool estimates {2} at -39 (AFK {3},{4}); best measured so far {5}" -f $cq, $seed, $est, $r.best_x, $r.best_z, $top }
+    }
+}
+
+# Every 66+ farm, in one short file (main\records\over66.csv) with its spot's heat and
+# hot line, plus a ready-to-paste in-game setup (perimeter_setup) beside its record.
+function Log-Over66($cq, $seed, $x, $z, $cx, $cz, $chunks, $eff, $fkey, $run, $root) {
+    if ([double]$cq -lt 66 -or -not $x) { return }
+    $f = Join-Path $root "main\records\over66.csv"
+    if (-not (Test-Path $f)) { Set-Content $f "Date,CQ,Chunks,Eff,Seed,X,Z,Heat40,Line,Family,SpotX,SpotZ,Run,Perimeter" -Encoding ascii }
+    if (Select-String -Path $f -SimpleMatch -Pattern ",$seed," -Quiet) { return }
+    $scx = [int][math]::Floor([double]$cx / 16); $scz = [int][math]::Floor([double]$cz / 16)
+    # the spot's heat40: the MEASURED spot list first (spot_top.csv, the list the exact search runs on), then
+    # the old model-era heat_cache.csv (loaded only on a miss). Was: heat_cache only, re-read (3.3 MB, ~1 s)
+    # for every farm - and the measured spots are not in it, so Heat40 came out blank for them.
+    if ($null -eq $script:spotHeat) { $script:spotHeat = @{}
+        $st = Join-Path $root "main\theory\heat\spot_top.csv"
+        if (Test-Path $st) { foreach ($r in (Import-Csv $st)) { $script:spotHeat["$([int]$r.cx),$([int]$r.cz)"] = [double]$r.heat40 } } }
+    $k = "$scx,$scz"
+    if (-not $script:spotHeat.ContainsKey($k) -and -not $script:spotHeatOld) { $script:spotHeatOld = $true
+        $hc = Join-Path $root "main\theory\heat\heat_cache.csv"
+        if (Test-Path $hc) { foreach ($r in (Import-Csv $hc)) { $k2 = "$([int]$r.cx),$([int]$r.cz)"
+            if (-not $script:spotHeat.ContainsKey($k2)) { $script:spotHeat[$k2] = [double]$r.p40 / 2.1e-5 } } } }
+    $heat = $(if ($script:spotHeat.ContainsKey($k)) { "{0:0.0}" -f $script:spotHeat[$k] } else { "" })
+    $line = [math]::Round(($scz - 48.5) / 96.875)
+    $dir = Join-Path $root ("main\records\{0}" -f [math]::Floor([double]$cq))
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    # perimeter setups are made ON REQUEST only (2026-09-12), not for every farm:
+    #   perimeter_setup.exe --seed <seed> --center-x <x> --center-z <z>  > main\records\perimeter\<cq>_<seed>_perimeter.txt
+    # and its image into the one-folder gallery of every 66+ farm
+    $png = Join-Path $dir ("{0:0.00}_{1}.png" -f [double]$cq, $seed)
+    # galleries (the normal over70_images and over70_y-39) only for 70+ cq (project owner, 2026-09-22); 66-69 farms are still filed
+    if ((Test-Path $png) -and [double]$cq -ge 70) {
+        $gal = Join-Path $root "main\records\over70_images"
+        New-Item -ItemType Directory -Force -Path $gal | Out-Null
+        Copy-Item $png $gal -Force
+        # gallery file date = a stamp from its cq (all on 2026-01-05/06), so Explorer shows ONE date group
+        # and "sort by date, newest first" = best cq first; the real find date is in over66.csv
+        $stamp = ([datetime]'2026-01-01').AddMinutes([double]$cq * 100)
+        $gp = Join-Path $gal (Split-Path $png -Leaf); (Get-Item $gp).LastWriteTime = $stamp; (Get-Item $gp).CreationTime = $stamp
+        # side folder over70_y-39: the same image named by the raised-AFK estimate - a hint only; a failure here never stops filing
+        try { Add-Y39Image $png $seed $x $z $cq $root } catch { }
+    }
+    Add-Content $f -Encoding ascii ("{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13}" -f `
+        (Get-Date -Format 'yyyy-MM-dd HH:mm'), $cq, $chunks, $eff, $seed, $x, $z, $heat, $line, ($fkey -replace ',', ';'), $cx, $cz, $run, "")   # no raw comma in the key (unquoted row)
 }
 
 function NewSeedsFile($path, $before, $tmp) {
@@ -388,6 +629,11 @@ $ledger = @{}
 if (Test-Path $ledgerPath) {
     foreach ($e in (Import-Csv $ledgerPath)) { $ledger[$e.Key] = $e }
 }
+# NEVER RUN A FAMILY TWICE: every (mask,val) in a PRIOR run's ledger is off-limits.
+# $usedThisRun stops two spots in this run picking the same family - the key has
+# no spot in it, so family X at spot A and family X at spot B is one family.
+$priorKeys = @{}; foreach ($k in $ledger.Keys) { $priorKeys[$k] = 1 }
+$usedThisRun = @{}
 
 # ---- PHASE 1: filter candidates (mined-family / distance skips), exactly as
 # before, but WITHOUT hunting yet - this separates "which spots are eligible"
@@ -410,12 +656,47 @@ foreach ($line in (Get-Content $Commands | Where-Object { $_.Trim() -ne "" -and 
         Write-Host ("  skip ({0,6},{1,6})  {2} blocks out, past -MaxDist {3}" -f $cx,$cz,$spotDist,$MaxDist) -ForegroundColor DarkGray
         continue
     }
-    # mined family? keep its known best in the ranking, spend the hunt elsewhere
+    # ---- -ForceMask at TRIAGE, not only at push. Before this, triage hunted the
+    # DERIVED family and the push gate (-PushMinCQ) read that triage cq, so the
+    # derivation - which missed at BOTH record spots, once by choosing a mask the
+    # record family did not exist under - still decided which spots the forced
+    # mask ever got to try. Now a light sweep under the forced mask picks the val,
+    # and the forced family is what gets triaged and gated.
+    if ($ForceMask) {
+        $tsf = Join-Path $root ("main\work\tsweep_{0}_{1}.csv" -f $cx,$cz)
+        & (Join-Path $root "hotspot_scan.exe") --family-sweep --center-x $cx --center-z $cz `
+            --sweep-mask $ForceMask --sweep-n 16384 --sweep-seeds $TriageSweepSeeds `
+            --sweep-floor $SweepFloor --sweep-rx $TriageRx --sweep-rz $TriageRz --rng-seed $script:sweepRng --sweep-out $tsf *> $null
+        $picked = $null
+        if (Test-Path $tsf) {
+            # the sweep writes hits-descending; take the best val whose family has
+            # NEVER been run - not in any prior run and not picked by another spot
+            foreach ($sv in (Import-Csv $tsf)) {
+                if ([int]$sv.hits -le 0) { break }
+                $k = "$ForceMask|$($sv.val)"
+                if (-not $priorKeys.ContainsKey($k) -and -not $usedThisRun.ContainsKey($k)) { $picked = $sv.val; break }
+            }
+        }
+        if (-not $picked) {
+            Write-Host ("  skip ({0,6},{1,6})  no never-run family with hits under {2}" -f $cx,$cz,$ForceMask) -ForegroundColor DarkGray
+            continue
+        }
+        $mask = $ForceMask; $val = $picked
+        $line = ($line -replace '--fix-mask\s+\S+', "--fix-mask $ForceMask") -replace '--fix-val\s+\S+', "--fix-val $picked"
+    }
+    # NEVER RUN A FAMILY TWICE. Replaces the old rule ("mined" only at Times >= 2,
+    # and an improving family reset to Times=1 so it kept being re-hunted). Any
+    # (mask,val) from a prior run is now skipped outright. Within one run a family
+    # still gets its triage AND its push - one treatment, not a repeat.
     $fkey = "$mask|$val"
-    if ($ledger.ContainsKey($fkey) -and [int]$ledger[$fkey].Times -ge 2) {
+    # A FULL 20-bit family (record_cycle -Families) is a spot-specific search: the same
+    # 2^28 seeds at another spot are a different farm, and family_spots.ps1 picks each
+    # spot's own best families. So its key carries the spot. Older keys are unchanged.
+    if ($mask -eq '0xFFFFF') { $fkey = "$mask|$val@$cx,$cz" }
+    if ($priorKeys.ContainsKey($fkey) -or $usedThisRun.ContainsKey($fkey)) {
         $L = $ledger[$fkey]
-        Write-Host ("  skip ({0,6},{1,6})  family {2} mined ({3} passes, best {4})" -f $cx,$cz,$mask,$L.Times,$L.BestCQ) -ForegroundColor DarkGray
-        if ([double]$L.BestCQ -gt 0) {
+        Write-Host ("  skip ({0,6},{1,6})  family {2}|{3} already run" -f $cx,$cz,$mask,$val) -ForegroundColor DarkGray
+        if ($L -and [double]$L.BestCQ -gt 0) {
             $rows += [pscustomobject]@{
                 CQ=[double]$L.BestCQ; Eff=[double]$L.Eff; Chunks=[int]$L.Chunks
                 X=[int]$L.X; Z=[int]$L.Z; Seed=$L.Seed; SpotX=$cx; SpotZ=$cz
@@ -425,6 +706,7 @@ foreach ($line in (Get-Content $Commands | Where-Object { $_.Trim() -ne "" -and 
         }
         continue
     }
+    $usedThisRun[$fkey] = 1
     $a = $line -replace '^\s*slime_gpu\.exe\s*',''
     if ($Floor -gt 0) {
         $a = $a -replace '--record-floor\s+\d+', "--record-floor $Floor"
@@ -505,13 +787,17 @@ for ($idx = 0; $idx -lt $eligible.Count; $idx++) {
     $tmpNew = Join-Path $root ("main\work\new_{0}_{1}.csv" -f $cx,$cz)
     $scoreSrc = NewSeedsFile $out $before $tmpNew
     if (-not $scoreSrc) { $scoreSrc = $out }
+    # which 20-bit family did this spot's hits come from? (see -RichTop)
+    $richVal = ""; $richHits = 0
+    $rg = @(SeedList $scoreSrc) | Group-Object { [int64]$_ -band 0xFFFFF } | Sort-Object Count -Descending | Select-Object -First 1
+    if ($rg) { $richVal = '0x{0:X5}' -f [int64]$rg.Name; $richHits = $rg.Count }
     $ra = @("--seeds",$scoreSrc,"--center-x",$cx,"--center-z",$cz,"--radius",$Radius,
-            "--csv",$sum,"--quiet","--family",("pipe_{0}_{1}" -f $cx,$cz),"--no-images")
+            "--csv",$sum,"--quiet","--family",("pipe_{0}_{1}" -f $cx,$cz),"--no-images","--no-logs")
     if ($pending) {
         # A hunt is in flight on the worker - score in the BACKGROUND so this
         # CPU-only step overlaps the GPU's time instead of sitting after it.
         $scoreProc = Start-Process -FilePath (Join-Path $root "slime_refine.exe") -ArgumentList $ra `
-                     -WorkingDirectory $root -PassThru -WindowStyle Hidden
+                     -WorkingDirectory $root -PassThru @hideWin
         $scoreProc.WaitForExit()
     } else {
         & (Join-Path $root "slime_refine.exe") @ra *> $null
@@ -557,29 +843,14 @@ for ($idx = 0; $idx -lt $eligible.Count; $idx++) {
             }
             $pending.SentinelRead = $true
         }
-        $cs = Invoke-ClimbScan $best.seed $cx $cz
-        $vseeds = @()
-        foreach ($ln in $cs) {
-            # variant rows: "<blocks> <cq> (<x>,<z>) <seed>"
-            if ($ln -match '^\s*\d+\s+[0-9.]+\s+\(\s*-?\d+,\s*-?\d+\)\s+(-?\d+)\s*$') {
-                if ($Matches[1] -ne $best.seed) { $vseeds += $Matches[1] }
-            }
-        }
-        if ($vseeds.Count -gt 0) {
-            $cf = Join-Path $root ("main\work\climb_{0}_{1}.csv" -f $cx,$cz)
-            [System.IO.File]::WriteAllText($cf, (($vseeds | Select-Object -Unique) -join ","))
-            $csum = Join-Path $root ("main\work\climbcq_{0}_{1}.csv" -f $cx,$cz)
-            $ca = @("--seeds",$cf,"--center-x",$cx,"--center-z",$cz,"--radius",$Radius,
-                    "--csv",$csum,"--quiet","--family",("pipe_{0}_{1}" -f $cx,$cz),"--no-images")
-            & (Join-Path $root "slime_refine.exe") @ca *> $null
-            if (Test-Path $csum) {
-                $vb = Import-Csv $csum | Sort-Object { [double]$_.cq } -Descending | Select-Object -First 1
-                if ($vb -and [double]$vb.cq -gt [double]$best.cq) {
-                    Write-Host ("      climb: {0} -> {1} cq (variant)" -f $best.cq,$vb.cq) -ForegroundColor Yellow
-                    $best = $vb
-                }
-            }
-        }
+        $best = Climb-Seed $best $cx $cz 24 24 "climb"
+        # DEEP CLIMB - only for a seed with a real shot at the record. The standard
+        # 24-bit window tops out at about +2.1 cq; re-climbing its result again
+        # gains nothing (measured on 5 seeds: 0 improvements). A 16x wider window
+        # (bits 20-47, 268M variants, still outside the family mask) found what it
+        # could not: 65.55 -> 66.31, 64.71 -> 65.05, 64.00 -> 64.44, 3 of 5 seeds,
+        # at ~90-200 s each on the laptop. Worth that only near the record.
+        if ([double]$best.cq -ge $DeepClimbMinCQ) { $best = Climb-Seed $best $cx $cz 20 28 "deep climb" }
     }
 
     # Import-Csv yields STRINGS. In PowerShell "5426" * 5426 is string
@@ -591,6 +862,7 @@ for ($idx = 0; $idx -lt $eligible.Count; $idx++) {
         X=[int]$bx; Z=[int]$bz; Seed=$best.seed; SpotX=$cx; SpotZ=$cz
         Seeds=$found; Mask=$mask; Val=$val
         Dist=[int][math]::Sqrt($bx*$bx + $bz*$bz)
+        RichVal=$richVal; RichHits=$richHits
     }
     # picture only for results actually worth looking at
     if (-not $NoImages -and [double]$best.cq -ge $ImageMinCQ) {
@@ -598,8 +870,8 @@ for ($idx = 0; $idx -lt $eligible.Count; $idx++) {
     }
     # peak settled for this seed - file it if it is 64+
     if ([double]$best.cq -ge 64.0) {
-        ArchiveResult $best.cq $best.seed $cx $cz ("pipe_{0}_{1}" -f $cx,$cz) $Radius $root
-        Write-Host "      kept -> main\records\" -ForegroundColor DarkCyan
+        ArchiveResult $best.cq $best.seed $cx $cz ("pipe_{0}_{1}" -f $cx,$cz) $Radius $root "$mask|$val"
+        Write-Host ("      kept -> main\records\{0}\" -f [math]::Floor([double]$(if ($pb) { $pb.cq } else { $best.cq }))) -ForegroundColor DarkCyan
     }
     $col = if ([double]$best.cq -gt $Record) { "Magenta" } elseif ([double]$best.cq -ge 64) { "Green" } else { "Gray" }
     Write-Host ("[{0,2}/{1}] ({2,6},{3,6})  {4,3} seeds -> best {5} cq  {6}% pack  {7}c  ({8},{9})" `
@@ -624,12 +896,72 @@ for ($idx = 0; $idx -lt $eligible.Count; $idx++) {
 if ($rows.Count -eq 0) {
     Write-Host "no spot produced a scoreable seed" -ForegroundColor Yellow
     Stop-SlimeWorker $worker
+    # Still save the ledger (the dead families were logged above - skipping this made the
+    # next cycle re-hunt them) and an EMPTY pipeline.csv (record_cycle reads it; leaving the
+    # previous cycle's file in place made this cycle report that cycle's best as its own).
+    $ledger.Values | Export-Csv -Path $ledgerPath -NoTypeInformation
+    Set-Content -Path main\pipeline.csv -Value '"CQ","Eff","Chunks","X","Z","Seed","SpotX","SpotZ","Seeds","Mask","Val","Dist"' -Encoding ascii
+    Get-ChildItem (Join-Path $root "main\work") -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -ge $script:runStart } | Remove-Item -Force -ErrorAction SilentlyContinue
     exit 0
 }
 $rows = $rows | Sort-Object CQ -Descending
 
+# ---- RICH-FAMILY EXHAUST: walk every seed of the family the hits came from -------
+if ($RichTop -gt 0 -and $RichSeconds -gt 0) {
+    $outOf = @{}; foreach ($e in $eligible) { $outOf["$($e.Cx)_$($e.Cz)"] = $e.Out }
+    $richTargets = @($rows | Where-Object { [int]$_.Seeds -gt 0 -and [int]$_.RichHits -ge $RichMinHits -and [double]$_.CQ -ge $RichMinCQ } |
+                     Sort-Object { [int]$_.RichHits } -Descending | Select-Object -First $RichTop)
+    foreach ($r in $richTargets) {
+        $rkey = "0xFFFFF|$($r.RichVal)@$($r.SpotX),$($r.SpotZ)"
+        if ($priorKeys.ContainsKey($rkey) -or $usedThisRun.ContainsKey($rkey)) {
+            Write-Host ("  skip rich ({0},{1})  family {2} already exhausted" -f $r.SpotX,$r.SpotZ,$r.RichVal) -ForegroundColor DarkGray; continue }
+        $usedThisRun[$rkey] = 1
+        $out = $outOf["$($r.SpotX)_$($r.SpotZ)"]; if (-not $out) { continue }
+        Write-Host ("rich family ({0},{1})  {2}: {3} of the spot's {4} triage seeds -> all 2^28 seeds, floor {5}, {6}s" `
+            -f $r.SpotX,$r.SpotZ,$r.RichVal,$r.RichHits,$r.Seeds,$RichFloor,$RichSeconds) -ForegroundColor Cyan
+        $a = "--seed-count 0 --center-x $($r.SpotX) --center-z $($r.SpotZ) --m-chunks 24 --fix-mask 0xFFFFF --fix-val $($r.RichVal) " +
+             "--record-floor $RichFloor --seeds-floor $RichFloor --report-every 1000000000 --give-up-after 0 --enumerate --enum-start 0 --seeds-out $out"
+        $before = SeedCount $out
+        Invoke-Hunt $a $out $RichSeconds $before
+        $found = (SeedCount $out) - $before
+        $scored = @()
+        if ($found -gt 0) {
+            $sum = Join-Path $root ("main\work\rich_{0}_{1}.csv" -f $r.SpotX,$r.SpotZ)
+            $tmpR = Join-Path $root ("main\work\rnew_{0}_{1}.csv" -f $r.SpotX,$r.SpotZ)
+            $rSrc = NewSeedsFile $out $before $tmpR
+            if (-not $rSrc) { $rSrc = $out }
+            $ra = @("--seeds",$rSrc,"--center-x",$r.SpotX,"--center-z",$r.SpotZ,"--radius",$Radius,
+                    "--csv",$sum,"--quiet","--family",("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ),"--no-images","--no-logs")
+            & (Join-Path $root "slime_refine.exe") @ra *> $null
+            if (Test-Path $sum) { $scored = @(Import-Csv $sum | Sort-Object { [double]$_.cq } -Descending) }
+        }
+        $rb = if ($scored.Count) { $scored[0] } else { $null }
+        # ledger the exhaust: every seed of this family at this spot has now been checked
+        $ledger[$rkey] = [pscustomobject]@{ Key=$rkey; Mask='0xFFFFF'; Val=$r.RichVal; SpotX=$r.SpotX; SpotZ=$r.SpotZ
+            BestCQ=$(if ($rb) { $rb.cq } else { 0 }); Eff=$(if ($rb) { $rb.eff_pct } else { 0 }); Chunks=$(if ($rb) { $rb.chunks_at_best_blocks } else { 0 })
+            X=$(if ($rb) { $rb.x } else { 0 }); Z=$(if ($rb) { $rb.z } else { 0 }); Seed=$(if ($rb) { $rb.seed } else { "" }); Times=1 }
+        if (-not $rb) { Write-Host "      no layout >= $RichFloor chunks anywhere in the family" -ForegroundColor DarkGray; continue }
+        Write-Host ("      family holds {0} layouts >= {1}; best {2} cq (triage had {3})" -f $scored.Count, $RichFloor, $rb.cq, $r.CQ) -ForegroundColor $(if ([double]$rb.cq -gt $r.CQ) { 'Yellow' } else { 'DarkGray' })
+        # archive every 66+ layout the family holds (the best first), not only the best
+        $seen = @{}
+        foreach ($s in ($scored | Where-Object { [double]$_.cq -ge 66.0 } | Select-Object -First 5)) {
+            if ($seen.ContainsKey("$($s.x),$($s.z),$($s.cq)")) { continue }; $seen["$($s.x),$($s.z),$($s.cq)"] = 1
+            ArchiveResult $s.cq $s.seed $r.SpotX $r.SpotZ ("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ) $Radius $root $rkey
+        }
+        if ([double]$rb.cq -gt $r.CQ) {
+            if ([double]$rb.cq -lt 66.0 -and [double]$rb.cq -ge 64.0) { ArchiveResult $rb.cq $rb.seed $r.SpotX $r.SpotZ ("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ) $Radius $root $rkey }
+            $r.CQ = [double]$rb.cq; $r.Eff = [double]$rb.eff_pct; $r.Chunks = [int]$rb.chunks_at_best_blocks
+            $r.X = [int]$rb.x; $r.Z = [int]$rb.z; $r.Seed = $rb.seed
+            $r.Dist = [int][math]::Sqrt([double]$rb.x*[double]$rb.x + [double]$rb.z*[double]$rb.z)
+        }
+    }
+    $rows = $rows | Sort-Object CQ -Descending
+}
+
 # ---- RECORD PUSH: second, floor-raised hunt on the leaders ------------------
-if ($PushTop -gt 0 -and $PushSeconds -gt 0) {
+# Off while the rich-family exhaust is on: it hunts the same family more precisely.
+if ($PushTop -gt 0 -and $PushSeconds -gt 0 -and $RichTop -le 0) {
     $cmdLines = Get-Content $Commands | Where-Object { $_.Trim() -ne "" -and -not $_.StartsWith('#') }
     $pushTargets = @($rows | Select-Object -First $PushTop)
     # Anchor first: it is the only family that reliably yields 70c draws, so it
@@ -680,17 +1012,22 @@ if ($PushTop -gt 0 -and $PushSeconds -gt 0) {
         # is ~15s of known-answer.
         $isAnchor = ($AnchorSpot -match '^\s*(-?\d+)\s*,\s*(-?\d+)\s*$') -and
                     ($r.SpotX -eq [int]$Matches[1]) -and ($r.SpotZ -eq [int]$Matches[2])
-        if (-not $NoSweep -and -not $isAnchor -and $r.Mask -ne "-") {
+        $useMask = if ($ForceMask) { $ForceMask } else { $r.Mask }
+        # Under -ForceMask the val was already chosen at TRIAGE (best never-run
+        # family under the forced mask). Re-sweeping here could switch to a val
+        # some earlier run already used, breaking never-run-twice - so keep it.
+        if (-not $NoSweep -and -not $isAnchor -and $useMask -ne "-" -and -not $ForceMask) {
             $sf = Join-Path $root ("main\work\sweep_{0}_{1}.csv" -f $r.SpotX,$r.SpotZ)
             & (Join-Path $root "hotspot_scan.exe") --family-sweep --center-x $r.SpotX --center-z $r.SpotZ `
-                --sweep-mask $r.Mask --sweep-n 16384 --sweep-seeds 400000 --sweep-floor $SweepFloor `
+                --sweep-mask $useMask --sweep-n 16384 --sweep-seeds 400000 --sweep-floor $SweepFloor `
+                --rng-seed $script:sweepRng `
                 --sweep-out $sf *> $null
             if (Test-Path $sf) {
                 # NOT $top - PowerShell is case-insensitive, so that silently
                 # aliases the [int]$Top parameter and the assignment throws,
                 # leaving the push on the un-swept family.
                 $swBest = Import-Csv $sf | Select-Object -First 1
-                if ($swBest -and [int]$swBest.hits -gt 0 -and $swBest.val -ne $r.Val) {
+                if ($swBest -and [int]$swBest.hits -gt 0) {
                     Write-Host ("      sweep: family {0} -> {1} ({2} hits, best {3} cq in sample)" `
                         -f $r.Val,$swBest.val,$swBest.hits,$swBest.best_cq) -ForegroundColor Cyan
                     $useVal = $swBest.val
@@ -702,6 +1039,46 @@ if ($PushTop -gt 0 -and $PushSeconds -gt 0) {
         $a = $a -replace '--record-floor\s+\d+', "--record-floor $PushFloor"
         $a = $a -replace '--seeds-floor\s+\d+',  "--seeds-floor $PushFloor"
         $a = $a -replace '--fix-val\s+\S+',      "--fix-val $useVal"
+        # Apply the forced mask to the hunt itself, not just the sweep - the
+        # sweep picked $useVal from THIS mask's 16384 vals, so the hunt has to
+        # use the same mask or the val means something else entirely. Placed
+        # before the enum-progress filename is derived so the key matches.
+        # NEVER the anchor: it exists to push one specific known record family
+        # (0xFDE0F|0x70802). Forcing another mask onto it silently re-masks its
+        # val - e.g. 0x70802 & 0xEF70F = 0x60002 - hunting a meaningless family.
+        if ($ForceMask -and -not $isAnchor) { $a = $a -replace '--fix-mask\s+\S+', "--fix-mask $ForceMask" }
+        # EXHAUSTIVE PUSH. Only the low 48 bits of a seed reach the slime
+        # function, so a b-bit --fix-mask is a FINITE family of exactly 2^(48-b)
+        # layouts. Random sampling draws WITH replacement: ~4.6F draws for 99%
+        # coverage, and it can never prove a family is empty. --enumerate walks
+        # each layout exactly once at ~97.5% of random throughput (measured
+        # 7.03M vs 7.21M seeds/s once the scatter moved into the kernel), so it
+        # is ~4.5x more efficient per unit of coverage AND converges on proof.
+        #
+        # RESUME IS THE WHOLE POINT: enumeration restarts at index 0 every run,
+        # and the anchor family is pushed EVERY cycle, so without --enum-start
+        # this would re-test one identical prefix forever - strictly worse than
+        # random. slime_gpu checkpoints its index every 64 batches (it gets
+        # killed on the timeout, so it cannot checkpoint at exit); resuming from
+        # the last checkpoint re-tests a few seconds at worst, never skips.
+        $enumDir = Join-Path $root "main\enum"
+        if (-not (Test-Path $enumDir)) { New-Item -ItemType Directory -Force -Path $enumDir | Out-Null }
+        $emask = if ($a -match '--fix-mask\s+(\S+)') { $matches[1] } else { "nomask" }
+        # RELATIVE and UNQUOTED on purpose. The persistent worker tokenizes spot
+        # lines on plain whitespace and does not strip quotes (its own comment:
+        # "never quoted, never spaced within one value"), so a quoted path
+        # reaches fopen with literal quote characters and fails - silently,
+        # because the writer guards on `if (pf)`. This path has no spaces and
+        # the worker runs with $root as its working directory.
+        $ef = 'main\enum\{0}_{1}_{2}_{3}.txt' -f $r.SpotX, $r.SpotZ, $emask, $useVal
+        $estart = 0
+        $efFull = Join-Path $root $ef
+        if (Test-Path $efFull) {
+            $raw = (Get-Content $efFull -Raw).Trim()
+            if ($raw -match '^\d+$') { $estart = $raw }
+        }
+        $a = "$a --enumerate --enum-start $estart --enum-progress $ef"
+        if ($estart -ne 0) { Write-Host ("      resuming enumeration at {0}" -f $estart) -ForegroundColor DarkGray }
         $before = SeedCount $out
         Invoke-Hunt $a $out $PushSeconds $before
         $found = (SeedCount $out) - $before
@@ -712,18 +1089,25 @@ if ($PushTop -gt 0 -and $PushSeconds -gt 0) {
         $pSrc = NewSeedsFile $out $before $tmpP
         if (-not $pSrc) { $pSrc = $out }
         $ra = @("--seeds",$pSrc,"--center-x",$r.SpotX,"--center-z",$r.SpotZ,"--radius",$Radius,
-                "--csv",$sum,"--quiet","--family",("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ),"--no-images")
+                "--csv",$sum,"--quiet","--family",("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ),"--no-images","--no-logs")
         & (Join-Path $root "slime_refine.exe") @ra *> $null
         if (-not (Test-Path $sum)) { continue }
         $pb = Import-Csv $sum | Sort-Object { [double]$_.cq } -Descending | Select-Object -First 1
+        # Push seeds were never climbed, so they lost to the spot's already-climbed
+        # triage best every time (cycle #404: 5 pushes, 0 improvements). Same
+        # climbs as triage: standard at -ClimbMinCQ, deep at -DeepClimbMinCQ.
+        if ($pb -and -not $NoClimb -and [double]$pb.cq -ge $ClimbMinCQ) {
+            $pb = Climb-Seed $pb $r.SpotX $r.SpotZ 24 24 "push climb"
+            if ([double]$pb.cq -ge $DeepClimbMinCQ) { $pb = Climb-Seed $pb $r.SpotX $r.SpotZ 20 28 "push deep climb" }
+        }
         if ($pb -and [double]$pb.cq -gt $r.CQ) {
             Write-Host ("      push: {0} -> {1} cq" -f $r.CQ,$pb.cq) -ForegroundColor Yellow
             if (-not $NoImages -and [double]$pb.cq -ge $ImageMinCQ) {
                 SaveImage $pb.seed $r.SpotX $r.SpotZ ("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ) $Radius $root
             }
             if ([double]$pb.cq -ge 64.0) {
-                ArchiveResult $pb.cq $pb.seed $r.SpotX $r.SpotZ ("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ) $Radius $root
-                Write-Host "      kept -> main\records\" -ForegroundColor DarkCyan
+                ArchiveResult $pb.cq $pb.seed $r.SpotX $r.SpotZ ("pipe_{0}_{1}" -f $r.SpotX,$r.SpotZ) $Radius $root "$useMask|$useVal"
+                Write-Host ("      kept -> main\records\{0}\" -f [math]::Floor([double]$(if ($pb) { $pb.cq } else { $best.cq }))) -ForegroundColor DarkCyan
             }
             $r.CQ = [double]$pb.cq; $r.Eff = [double]$pb.eff_pct; $r.Chunks = [int]$pb.chunks_at_best_blocks
             $r.X = [int]$pb.x; $r.Z = [int]$pb.z; $r.Seed = $pb.seed
@@ -750,15 +1134,25 @@ if ($b.CQ -gt $Record) {
     $log += ("*** NEW RECORD  {0} cq  at ({1},{2})  seed {3}  /tp {1} ~ {2} ***" -f $b.CQ,$b.X,$b.Z,$b.Seed)
 } else {
     $log += ("best {0} cq at ({1},{2}), short of {3}." -f $b.CQ,$b.X,$b.Z,$Record)
-    $log += "THE TARGET IS ONE FRONTIER CELL: 70 chunks at >=94.4% packing (or 71c at"
-    $log += ">=93.2%). Packing falls monotonically with count - 95.9% @68c, 94.9% @69c,"
-    $log += "94.3% @70c, 91.4% @71c - so count x packing peaks at exactly 70c, where the"
-    $log += "record sits. More chunks is NOT progress; a better-packed 70c draw is."
+    $log += "cq = chunks x packing. On ordinary spots packing falls with count and the"
+    $log += "product peaked at 70c (94.3% @70c, 91.4% @71c). On HEAT spots the frontier"
+    $log += "sits higher: the 67.24 is 72c @ 93.4%, so 71-72c draws are live targets there."
 }
-$log += "","Per-seed logs main\scores\seeds\pipe_<x>_<z>\, images main\scores\images\, cq CSVs main\work\."
+$log += "","Results of 64+ cq: main\records\<tier>\ (txt + png) and one row each in main\records\index.csv."
 $log | Set-Content -Encoding UTF8 main\pipeline.txt
 $rows | Export-Csv -Path main\pipeline.csv -NoTypeInformation
 $ledger.Values | Export-Csv -Path $ledgerPath -NoTypeInformation
 Write-Host ""
 $log | ForEach-Object { Write-Host $_ }
 Write-Host "`nwrote main\pipeline.txt" -ForegroundColor Green
+
+# ---- tidy this run's scratch --------------------------------------------------
+# Per-spot temp files (cq_/new_/tsweep_/climb_/climbcq_/push_/pnew_/img_...) only
+# matter while their spot is in flight; heat mode touches ~120 new spots a cycle,
+# ~5 files each, so without this main\work grows by ~600 files per cycle. Only
+# files THIS run wrote are removed, and score folders it left empty.
+Get-ChildItem (Join-Path $root "main\work") -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -ge $script:runStart } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem (Join-Path $root "main\scores") -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.CreationTime -ge $script:runStart -and -not (Get-ChildItem $_.FullName -Force -ErrorAction SilentlyContinue) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue

@@ -1,0 +1,57 @@
+# THE CUTOFF: what is worth looking for? (2026-10-03)
+
+Question (project owner): does a random spot with no heat have a shot at the record through sheer numbers, and where is
+the cutoff? Numbers: `main\work\coverage\cutoff.ps1` -> `main\work\coverage\cutoff.json`.
+
+Inputs, all existing data: the 1M-spot pred-band samples (`main\work\heat2\cov\`), the validation bins below
+pred 7 (`main\heatmap_v2\inputs\validation\`), the catalogue totals (`main\work\heat2\chart_final.json`), the
+measured P(74+ chunks) per heat band (`main\work\lowheat\bands.json`), and the tier-1 anchor of 2 farms at
+19,000+ per 74,000 spots searched (sections 1-2).
+
+| band | spots world-wide | P(74+) | 19,000+ farms that exist | hours to sweep | h per farm |
+|---|---|---|---|---|---|
+| tier 1 (22+) | 331,595 | 4.5e-3 | 10.8 | 5 | **0.5** |
+| tier 2 (13-21) | 245,029,621 | 1-3e-3 | 2,631 | 3,056 | **1.2** |
+| tier 3 (9-12) | 11,001,224,598 | 2.8-10e-4 | 59,286 | 127,071 | **2.1** |
+| heat 5-8 | 130,809,359,583 | 6e-5-5e-4 | 161,143 | 1,417,247 | **8.8** |
+| heat 1-4 | 687,016,179,844 | 1.8e-6-3.7e-5 (fit) | 51,607 (range 51,607-428,756) | 7,306,529 | **141.6** |
+
+## The answer
+
+1. **Yes, record-sized farms exist at no heat, in huge numbers.** ~51,600 farms at 19,000+ sit in heat 1-4 and
+   ~161,100 in heat 5-8, against 10.8 in the whole of tier 1. The best farm in heat 1-4 alone should be around
+   19,000 + 350*(ln 51,607 + 0.5772) ~ **23,000 blocks** - bigger than anything tier 1 or 2 can produce.
+2. **They are unreachable.** Sweeping heat 1-4 is 7.3 million GPU-hours (834 years); 142 h per farm against
+   0.5 h in tier 1, a 280x worse exchange rate. We hunt high heat not because the best farms are there, but
+   because they are the only ones we can afford to find.
+3. **The cliff is between heat 5-8 and heat 1-4** (8.8 -> 142 h/farm, 16x), not at the tier boundaries. Above it
+   the slope is gentle: tier 3 at 2.1 h/farm is only 4x worse than tier 1.
+
+## Caveat that keeps this provisional
+
+Tier 3 and below rest on two weak legs: the measured P(74+) at those bands comes from **1-2 hits in 2,000 spots**
+a band (Poisson error ~+-100%), and the farm counts assume P(19,000+ | a 74+ spot) does not depend on heat -
+probably optimistic, since a low-heat spot that just reaches 74 chunks is at the edge of its capability while a
+tier-1 spot at 74 is not. The tier-1 anchor is itself only 2 events. So treat "tier 3 = 2.1 h/farm" as an upper
+bound on attractiveness, not a plan.
+
+## What would settle it (step 7 in docs\HEATMAP.txt "AGREED ORDER", ~30 min)
+
+Measure heat on ~2M random world spots (~2 min), screen the ~100,000 that land at heat 1-4 (~25 min), exact-search
+any 74+. That replaces the fitted P(74+) - where the power-law and exponential fits disagree 100x (~35,000 vs
+~800,000 farms at heat 1-4) - with a measured rate, and it tests the independence assumption directly. Two
+outcomes, both useful: it closes everything below tier 2 for good, or it shows tier 3 is a real hunting ground,
+which would be the biggest strategic change available.
+
+## Coverage: what the table does and does not count (project owner's question, 2026-10-03)
+
+The table counts spots with **heat40 >= 1** only: 829,072,125,241 of the world's 14,062,492,500,001
+(column,row) pairs = **5.90%**. The other 94.1% read below 1, i.e. less slime than a random place, and heat40
+is normalised so 1 = random. They are ruled out by measurement, not assumption: at heat 1-6, 0 of 2,000 spots
+reached 74 chunks (best counts 69-71, `main\work\lowheat\bands.json`), and heat < 1 is strictly worse. So every
+spot that could physically hold a 19,000+ farm is in the table.
+
+Caveat in the other direction: the heat 1-4 row is a FLOOR. The pred 7-8 sample's minimum heat is 2.118, so the
+heat 1-2 population comes almost entirely from the validation bins below pred 7, which sampled only part of that
+space. The true heat 1-4 count is probably higher than 687 billion - which means more 19,000+ farms exist down
+there, all equally unreachable. It strengthens the conclusion rather than weakening it.

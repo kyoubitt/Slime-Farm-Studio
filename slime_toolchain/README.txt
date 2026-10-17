@@ -2,15 +2,16 @@
  RECORD COMMANDS, IN ORDER  (kept up to date here - this is the section to
  check first; update it whenever the toolchain gains/changes a step)
 ================================================================================
+New here? Run ./slime gui (the app, right in your terminal) or ./slime for a menu, or read HOW_TO_USE.txt
+(one page) first. On Windows: python slime gui.
 This file is the command reference. FEATURES.txt has a quick capability
 checklist, STEP_BY_STEP_GUIDE.txt explains the concepts from easy to hard,
-and AI_CONTEXT.md is the dense, everything-in-one-place reference (the
-fastest path if an AI assistant is available: just point it at this folder
-and ask directly).
+AI_CONTEXT.md is where to start, docs\ holds the detail, and docs\REFERENCE.md
+is the older everything-in-one-place reference.
 ================================================================================
-[STOP] BUILD FIRST. The .exe files shipped alongside this file are compiled
-  with -arch=native and WILL NOT RUN on a different GPU than the one that
-  built them. On a new machine you get this, with no hint that rebuilding is
+[STOP] BUILD FIRST. This copy ships NO .exe files, on purpose: they are compiled
+  with -arch=native, which bakes in the GPU model, so a binary built on one card
+  WILL NOT RUN on another. On the wrong card you get this, with no hint that rebuilding is
   the fix:
       CUDA error: no kernel image is available for execution on the device
   Verified for real: binaries built on the RTX PRO 6000 (sm_120) fail exactly
@@ -19,6 +20,11 @@ and ask directly).
   below:
 
       powershell -ExecutionPolicy Bypass -File build.ps1
+
+  LINUX: ./build.sh instead, then run every .ps1 below with pwsh
+  (PowerShell 7): pwsh -File record_cycle.ps1 -Status. Needs the CUDA
+  toolkit + g++ (Arch: sudo pacman -S cuda) and pwsh. See LINUX.md,
+  which also covers the Y phase (y_phase.ps1) and the vanilla parity tests.
 
   Two prerequisites, neither of which ships here:
     * CUDA Toolkit (for nvcc). A toolkit-ONLY CUDA 13 install is missing
@@ -89,17 +95,77 @@ and ask directly).
   must include the cuda_crt and libnvvm components or nvcc cannot compile a .cu
   at all (CUDA 13 split them out of cuda_nvcc).
 
-[*] THE WHOLE HUNT IN ONE COMMAND (steps 1-4 below, automated and resumable):
-  powershell -ExecutionPolicy Bypass -File record_cycle.ps1            one cycle
-  powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Repeat 12 queue N
-  powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Status    progress
-  powershell -ExecutionPolicy Bypass -File stop_all.ps1                stop ALL
+[*] THE RECORD SEARCH - EXACT PHASE SEARCH (the main mode):
+  powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -PhaseSearch -BestFamilySpots main\best_spots.csv -Repeat 1000   run (resumable, new spots only)
+  New-Item main\STOP_WR                                                  stop after the current spot (clean)
+  powershell -ExecutionPolicy Bypass -File stop_all.ps1                  stop everything at once
+  powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Status      progress
+    Per spot: every seed of the top 5% of families by possible chunks (ranked separately at each AFK
+    position), at the 10 best of 15 AFK positions, solved EXACTLY with the phase model
+    (docs\PHASE_MODEL.txt) - no sampling; the top ~600 layouts refined to block precision
+    (slime_refine, Z radius 7). ~12.8 s per spot on the laptop RTX 4050 (1.44x kernel).
+    Every 66+ farm is filed into main\records\ (tier folders, over66.csv, over66_images, and
+    over66_y-39 named by its -39 estimate - see RAISED-AFK FOLDER). Logs: main\cycles.txt (one line
+    per 10 spots), main\theory\heat\phase_search.csv (one row per spot).
+  SPOT LIST: main\best_spots.csv - 500 spots, already ranked hottest-first, shipped with this copy.
+  Pass it explicitly: -BestFamilySpots main\best_spots.csv. The whole-world survey that built it
+  (heat\spot_top.ps1) is not included, but its survey modes (hotspot_scan --heat-survey /
+  --heat-rows / --heat-spots) are. Any CSV with X,Z,Line,Heat40 columns works as a spot list.
+  SAFETY: a family-cut check every 50 spots (main\theory\heat\cut_checks.csv). The regression gate
+  (heat\phase_regress.ps1) that the original project ran before changing the search is not shipped.
+  IN GAME: perimeter setups on request (perimeter_setup.exe -> main\records\perimeter\); your
+  measurements go in main\records\measured_in_game.csv - the game's number always wins.
+  PREDICTION SEARCH (separate) - picks WHICH spots the exact search visits:
+  (NOT AVAILABLE IN THIS COPY: it needs the whole-world heat survey main\theory\heat\spot_measured.csv - 183,536 spots - which is not shipped, so predict_cycle.ps1 prints a notice and exits. The method is described below for reference; use the shipped 500-spot list instead: record_cycle.ps1 -PhaseSearch -BestFamilySpots main\best_spots.csv)
+  powershell -ExecutionPolicy Bypass -File predict_cycle.ps1 -Repeat 1000          run (resumable)
+    Per cycle (~22 min): 2,000 fresh spots from the whole-world survey (heat 20+: half the hottest not yet
+    screened, half random - rich spots hide at low heat), screened by phase_prepass (PROBE screen:
+    8 classes on every family of the top 0.25%, then all 32,768 classes of the best 64 -
+    0.24 s/spot), the top 10% again wider (top 1%, best 128), scored (stage-2 best + log2(1 + pairs
+    reaching 68)), and the top 50 exact-searched by the normal exact search. First test: its picks held
+    67+ at 30% of spots vs 7% for the heat list, 68+ 14% vs 1%, four farms of 69.9+ from 50 spots.
+    The probe screen finds a spot's TRUE exact best (within 2) at 84-94%, against 34% for the old 512-class
+    sample at the same price (180 spots of known exact best) - the picks are now the chunk's real best spots.
+  (heat\rescreen.ps1, a one-shot re-screen of old spots, is not shipped in this copy.)
+    Logs: main\predict_cycles.txt, main\theory\prediction\screened.csv (every screened spot). Stop:
+    main\STOP_WR or stop_all.ps1. The exact search itself is unchanged; unpicked spots stay available.
+  Plain record_cycle.ps1 (no mode) is the OLD square-scan hunt, kept for reference below.
+  RECORD HUNT - BEST-FAMILY MODE (previous):
+  powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -BestFamily -BestFamilySpots main\best_spots.csv -Repeat 100
+    Each spot is searched in the seed family it is BEST in. Spots: the hottest
+    in the world from re-measured X and line values (heat\best_spots.ps1). Per
+    spot: all 1,048,576 20-bit families swept (best AFK chunk within +-3 X / +-2
+    Z), the top 8 re-checked, the best walked seed by seed (2^28 each). ~4 min
+    per spot on a laptop, resumable, 10 spots per logged cycle. Stop: create
+    main\STOP_WR. First test (23 spots): new 67.28, 66.73, 66.56, 66.61, 66.17.
+  RECORD HUNT - HEAT MODE: RETIRED (record_cycle -Heat now only prints a pointer to
+  -PhaseSearch; heat_spots.ps1 / record_odds.ps1 are in heat\old). History, for reference:
+    found 67.24 on its first run.
+    Hunted the hottest never-hunted spots in the WORLD: top X columns x top Z
+    lines, ranked by an exact model of Java's slime formula. Measured head to
+    head (same mask, one cycle): 60 hot spots 82% productive, 9 at >=63 cq,
+    67.24 best - 60 typical spots 3% productive, best 58.26.
+    Spots can be millions of blocks out (inside the 30M border): distance along
+    a line does not change quality. See docs\REFERENCE.md "LINE / X / HEAT MODEL".
+    Each cycle: a fresh list (no farm is ever hunted twice), its heat range, and
+    its RECORD ODDS ("1 in N cycles", logged to main\logs\record_odds.csv - when
+    N climbs too high, the hot spots are used up). Seeds >= 65 get a DEEP climb
+    (bits 20-47, ~2-3 min) that the normal climb cannot match: 65.55 -> 66.31.
+    Tune with -DeepClimbMinCQ; see docs\REFERENCE.md "CLIMBS" and "RECORD ODDS".
+  (The heat helper scripts - heat_of, heat_spots, heat_ledger, record_odds - are not shipped in this copy.)
+  LINE MODE (chosen Z lines only, long X, equal spots per line):
+  powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Lines 3,4,5 -RangeX 150000 -AutoMask -NoAnchor -ReuseScan -Repeat 3
+    Line n is centred on chunk row 48.5 + 96.875 n (period 1550 blocks, NOT the
+    old 1552): line 3 = Z ~5426, 4 = ~6976, 5 = ~8526. Any n works.
+  SQUARE SCAN (the older method):
+  powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Range 50000 -AutoMask -NoAnchor -ReuseScan -Repeat 3
     Cycles are NUMBERED and resume across sessions - main\cycles.txt is the run
     log, main\families.csv the ledger of every (mask,val) already hunted, so a
     session days later never re-hunts old ground. Each cycle: scan -> 12s triage
     hunt per spot -> score -> GPU climb -> family sweep -> record push on the
     leaders, plus a guaranteed push on the record family itself. Anything 64+ is
-    filed automatically into main\records\, named "<cq>_<seed>.{txt,png}" and
+    filed automatically into main\records\ (66+ today), named "<cq>_<seed>.{txt,png}"
+    - its image also goes to over66_y-39\ (see RAISED-AFK FOLDER) - and
     deduplicated by pattern. A new record stops the queue and prints the /tp
     line.
     ALWAYS use stop_all.ps1 to stop - killing the script by hand leaves
@@ -205,11 +271,11 @@ Stress report (self-tests, benchmarks, timed hunts, refine batch + one image):
   powershell -ExecutionPolicy Bypass -File stress_toolchain.ps1
   powershell -ExecutionPolicy Bypass -File stress_toolchain.ps1 -Quick
 
-auto_shootout.ps1 no longer exists - it was superseded by hunt_pipeline.ps1 /
-record_cycle.ps1 (see RECORD COMMANDS at the top of this file), which do the
-same "hands-off hunt+score, ranked by real cq" job plus climb/family-sweep/
-push/ledger. Any command below still referencing auto_shootout.ps1 means
-"use record_cycle.ps1 instead."
+auto_shootout.ps1 is superseded by hunt_pipeline.ps1 / record_cycle.ps1 (see RECORD COMMANDS
+at the top of this file), which do the same hands-off "hunt+score, ranked by real cq" job plus
+climb/family-sweep/push/ledger. It still works and is shipped: it hunts every spot in
+main\commands\commands_*.csv (written by a normal scan cycle) and writes main\shootout.txt
+ranked by cq. Prefer record_cycle.ps1.
 ================================================================================
 
 SLIME TOOLCHAIN
@@ -245,8 +311,7 @@ Output layout - everything under main\:
   main\work\                          SCRATCH: per-cycle pipeline intermediates
                                        (cq_/new_/climb_/push_/sweep_ CSVs per spot),
                                        safe to clear - nothing here is a final result
-  (main\shootout.txt and auto_shootout's use of main\work\ are stale - that
-  script no longer exists, see note above)
+  (main\shootout.txt is written by auto_shootout.ps1 - see note above)
 
 <name> is --name on the scan (defaults to <x>_<z>_r<range>).
 <family> is --family on slime_refine (defaults to the centre, <x>_<z>).
@@ -318,13 +383,117 @@ Images are on by default. --no-images when batch-scoring thousands of seeds.
 
 
 ==================================================================================
+ RAISED-AFK FOLDER (main\records\over66_y-39) - a minor side hint, not a second ranking
+==================================================================================
+Next to over66_images and the tier folders: every 66+ farm's image named by the number
+/perimeterinfo would read with your feet at y -39 over the -64 floor (no inner no-spawn
+circle, outer circle 125.7, AFK point free to move +-48 blocks):
+    18598-69.39-71791501344359.png            the tool's ESTIMATE (peri-score-seed)
+    18409-70.34-136253019324379-measured.png   your in-game count - it wins
+Sort by name (or by date, newest first) = highest first. A farm the model ranks low but
+that sits high here is the thing to look at (a 67 that could play like a 69). New 66+
+farms are added when the search files them (hunt_pipeline Add-Y39Image, ~0.1 s, never
+blocks filing); no background loop. After an in-game measurement goes into
+main\records\measured_in_game.csv, run   powershell -File afk_rescan.ps1   once to rename
+that farm to its measured number (it also backfills; on a fresh copy there is no main\records\over66.csv yet, so it prints a notice and does nothing until your own hunt files a 70+ farm). "BIG (estimate ...)" is printed when
+an unmeasured farm is estimated above the best in-game count. Track record: full floor
+49,669 exact; exact for 72.22 / 69.39 / 70.82 / 69.30 / 68.28 / 66.04, +20 for 70.64, off ~200 for 70.34 / 69.09.
+afk_rescan.exe --disc prints the full-floor count (calibration).
+
+PERIMETER SETUPS: on request only, written to main\records\perimeter\<cq>_<seed>_perimeter.txt. The void box is CHUNK-BORDERED: it covers exactly the chunks the floor is built in (never cutting a chunk), for any centre - checked on 300 random centres incl. negatives and the world border.
+FARM IMAGES: no inner 24-block ring (measured at y -39 there is none); one image per farm, copied to the gallery and over66_y-39.
+
+==================================================================================
  KNOWN RECORDS
 ==================================================================================
 Ranked by IN-GAME measurement, not by model cq. The highest model number in
 main/records/ is NOT automatically the record - the file prefixed RECORD. is.
 A model cq is a geometric prediction; Carpet's /perimeterinfo is the game's
-own count, and where they disagree the game wins.
+own count, and where they disagree the game wins. data\known_answers.csv holds the
+top five with what each one proves - a correct build reproduces every estimate in it.
 
+  76.23 cq   block (16598714,-28207684)   seed 182568670158536
+             MEASURED IN GAME: 20,506 spawning spaces (estimate 20,506 exact) - #1 IN GAME, +740 over the 19,766.
+             Spot 16598688,-28207696, heat40 only 17.4 (tier 2): found by the heat45 tail-heat skim
+             (heat\tier2_skim.ps1) - ordinary heat40 ordering would have ranked the spot ~9-millionth.
+  76.38 cq   block (9060723,-15431012)    seed 130738905053232
+             MEASURED IN GAME: 19,766 (estimate 19,734, +32). Tier 1: the best heat40 22+ has produced.
+  72.03 cq   block (14432930,5926460)     seed 230337960196917
+             MEASURED IN GAME: 19,103 (estimate exact). Found by the universe screen at the 74 gate.
+  71.08 cq   block (-19032517,15423291)   seed 267397934802442
+             MEASURED IN GAME: 18,885 (estimate exact).
+
+  72.22 cq   78c           block (28616800,-2104120)    seed 245821300723973
+             MEASURED IN GAME: 18,727 spawning spaces (model 18,488; +239, +1.3%) - #1 IN GAME, 129 above the 69.39.
+             Exactly the raised-AFK estimate. Found by the PREDICTION SEARCH (predict_cycle.ps1 cycle #3),
+             spot (28616768,-2104112), heat 28.7; 71.34 at the same spot (est 18,675).
+             Perimeter setup: main\records\perimeter\72.22_245821300723973_perimeter.txt. /tp 28616801 ~ -2104118
+  73.19 cq                 block (7339521,-2104095)     seed 23298179214765
+             HIGHEST MODEL SCORE. -39 ESTIMATE 18,970 - above the in-game record (BIG); 72.98 at the same spot
+             (seed 255157693722029, est 18,853). Same Z line as the 72.22. Prediction search cycle #9. NOT YET MEASURED.
+  72.90 cq   76c           block (12107056,7518294)     seed 68999818179391
+             HIGHEST MODEL SCORE. -39 estimate 18,582. Found by the
+             PREDICTION SEARCH (predict_cycle.ps1 cycle #3), spot heat 29.8. NOT YET MEASURED.
+  69.39 cq   76c @ 91.3%   block (-21323306,17855231)   seed 71791501344359
+             MEASURED IN GAME: 18,598 spawning spaces (model 17,764; +834, +4.7%) - #2 in game (behind the 72.22),
+             189 above the 70.34. Measured with the rig centred on its best -39 point
+             (-21323307,17855222) - exactly the raised-AFK estimate (over66_y-39). Found
+             by the exact phase search (cycle #66), spot (-21323312,17855248),
+             line 11519, heat 28.8 (254 layouts of 70+ chunks; X column of the 68.86).
+             Perimeter setup: main\records\perimeter\69.39_71791501344359_perimeter.txt. /tp -21323307 ~ 17855222
+  70.34 cq   79c @ 89.0%   block (-8546740,16457220)    seed 136253019324379
+             MEASURED IN GAME: 18,409 spawning spaces (model 18,007; +402, +2.2%) - #2 in game,
+             189 behind the 69.39, 2 above the 69.30 (18,407). Model #2, first 70+.
+             Found by the exact phase search (cycle #47), spot (-8546768,16457136),
+             line 10617, heat 29.9 - a very rich spot: 84 layouts of 70+ chunks, and 69.78,
+             69.34, 69.24, 69.08 there too (all family 0x0FFDB).
+             Perimeter setup: on request (main\records\perimeter\). /tp -8546740 ~ 16457220
+  69.30 cq   72c @ 96.3%   block (-25146501,4528323)    seed 173087838020963
+             MEASURED IN GAME: 18,407 spawning spaces (model 17,740; +667, +3.8%) - #3 in game,
+             2 behind the 70.34, 191 behind the 69.39. Model #3. Found by the
+             exact phase search (cycle #42), spot (-25146448,4528320), line 2921, heat 30.3.
+             Why it beat its model by so much (called from its image, before measuring):
+             4 slime chunks sit inside the middle no-spawn sphere - with a higher AFK y those
+             add spawning blocks. The model scores at y-offset 0, so it cannot see this.
+             Perimeter setup: on request (main\records\perimeter\). /tp -25146501 ~ 4528323
+  70.64 cq   76c @ 92.9%   block (-27565075,26600328)   seed 51829727074880
+             MEASURED IN GAME: 18,293 spawning spaces (model 18,083; +210, +1.2%) - #4 in game,
+             116 behind the 70.34. Model #2. Found by the exact phase search (cycle #55),
+             spot (-27565088,26600352), line 17161, heat 29.3; family 0x89A40 (69.64 there too).
+             Perimeter setup: on request (main\records\perimeter\). /tp -27565075 ~ 26600328
+  70.82 cq   73c         block (-25747483,12069090)   seed 18234105440443
+             MEASURED IN GAME: 18,261 spawning spaces (model 18,131; +130, +0.7%) - #5 in game.
+             HIGHEST MODEL SCORE - and exactly the raised-AFK estimate (18,261). Found
+             by the exact phase search, spot (-25747424,12069088), line 7786, heat 28.5.
+             Perimeter setup: main\records\perimeter\70.82_18234105440443_perimeter.txt. /tp -25747483 ~ 12069088
+  69.09 cq   73c @ 94.6%   block (26657801,20130652)    seed 39347866698447
+             MEASURED IN GAME: 17,740 spawning spaces (model 17,686; +54, +0.3%) - #7 in game,
+             behind the 70.34, 69.30, 70.64 and 68.28. Model #3. Found by the
+             exact phase search, spot (26657824,20130640), line 12987, heat 25.1. The same
+             spot also holds 68.57 (seed 33747233538767, /tp 26657800 ~ 20130652).
+             Perimeter setup: generated on request (perimeter_setup.exe). /tp 26657801 ~ 20130652
+  68.38 cq   (16054700,20130673)  seed 163238104073275  - exact search, line 12987. NOT YET MEASURED.
+  68.54 cq   75c @ 91.4%   block (-26008735,16457166)   seed 187561908205390
+             NOT YET MEASURED IN GAME. Found by
+             the EXACT PHASE SEARCH (record_cycle -PhaseSearch, cycle #4) in its first
+             batch: spot (-26008736,16457136), line 10617, heat 29.1. 17,545 blocks.
+             Perimeter setup: generated on request (perimeter_setup.exe). /tp -26008735 ~ 16457166
+  68.39 cq   71c @ 96.3%   block (-15087422,-22325443)  seed 157366496822294
+             Same batch, spot (-15087408,-22325440), line -14404. NOT YET MEASURED.
+             Perimeter setup: generated on request (perimeter_setup.exe). /tp -15087422 ~ -22325443
+  68.28 cq   72c @ 94.8%   block (-20106128,16457142)   seed 6343398036581507192
+             MEASURED IN GAME: 17,771 spawning spaces (model 17,479 blocks; +292, +1.7%) -
+             #6 in game (behind the 69.39, 70.34, 69.30, 70.64 and 70.82). Found
+             (cycle #408) by a heat-mode hunt on line 10617 (Z ~16.46M). Exact-model
+             check: 76 slime chunks in the r=9 disc (67.24: 74, 66.04: 73).
+             Perimeter setup: generated on request (perimeter_setup.exe). /tp -20106128 ~ 16457142
+  67.24 cq   72c @ 93.4%   block (-22078158,15423280)   seed 4508542591492402376
+             NOT YET MEASURED IN GAME. Found
+             (cycle #402) by the HEAT model's very first hunt of predicted-hot
+             spots - see docs\REFERENCE.md "LINE / X / HEAT MODEL". Its lead over
+             66.04 (1.2 cq, ~300 blocks) is larger than any model/game gap seen
+             so far (~200 blocks), but it holds the title only once Carpet's
+             /perimeterinfo confirms it. /tp -22078158 ~ 15423280
   66.04 cq   70c @ 94.3%   block (3680,6989)    seed 9029506488461633794   <- THE RECORD
              VERIFIED IN GAME: 17,112 spawning spaces. Filed as
              RECORD.66.04_9029506488461633794 in main/records/.
@@ -371,7 +540,7 @@ be checked against reality directly. This matters at record margins: a
 spot the model ranks higher can measure WORSE in game (see the AFK-HEIGHT
 CAVEAT below) - when the two disagree, the game wins, not the model.
 
-REQUIRES: the Carpet mod (for /perimeterinfo) and WorldEdit (for the //fast
+REQUIRES: the Carpet mod (for /perimeterinfo) and WorldEdit (for the
 //pos1 //pos2 //set void commands) both installed on the world being
 tested. Neither is optional - without Carpet there is no way to read the
 result, and without WorldEdit the void step has no vanilla equivalent that
@@ -384,8 +553,12 @@ Build:  nvcc -O3 perimeter_setup.cpp -o perimeter_setup.exe
 
 Usage:
     perimeter_setup.exe --seed <s> --center-x <x> --center-z <z>
-                        [--y -64] [--radius 200] [--block obsidian]
-                        [--void-top 120] [--afk-y 100]
+                        [--y -64] [--radius 152] [--block obsidian]
+                        [--void-top -40] [--afk-y -50]
+  The defaults assume a superflat world on Minecraft 1.20.4 - just
+  pass seed and centre. Change a default in perimeter_setup.cpp, not by
+  flags: the old 200 / 120 defaults kept coming back because the fix only
+  ever lived in a command line.
 
   --seed              required, the world seed
   --center-x/z        the AFK spot, BLOCK precision - take it from
@@ -393,14 +566,14 @@ Usage:
                        chunk-aligned scan centre. Example: the 66.04 scan
                        spot is (3680,6992) but the AFK spot is (3680,6989).
   --y                 Y of the obsidian floor. -64 for 1.18+, 0 for older
-  --radius            half-width of the rig in blocks. Default 200 is a
-                       deliberate margin over the 128-block despawn sphere
+  --radius            half-width of the voided box AND of the obsidian
+                       floor, in blocks. Default 152 (3 chunks
+                       in from the old 200 on every side) - still 24 blocks
+                       past the 128-block despawn sphere
   --block              floor material, default obsidian
-  --void-top/--afk-y   top of the voided box / player standing height.
-                       For a superflat world where terrain is only a few
-                       blocks thick, setting both to the same value (e.g.
-                       -40) avoids voiding hundreds of wasted blocks above
-                       real terrain
+  --void-top          top of the voided box. Default -40: superflat world,
+                       nothing above to clear
+  --afk-y             Y that /tp puts you at (default -50, 14 above the floor)
 
 The rig, conceptually: void a large box around the AFK spot, lay one layer
 of floor block at the world floor in slime chunks ONLY (everything else
@@ -411,17 +584,20 @@ directly comparable to slime_refine's block count for the same position.
 One floor layer is enough - a spawn position needs solid beneath and air
 above, so one layer with void above satisfies exactly one position/column.
 
-Output, six sections in execution order (0-2 and 4 paste into chat, 3 goes
+Output, five sections in execution order (0-2 and 4 paste into chat, 3 goes
 into a command block):
     0. SEED                    the seed, on its own line
-    1. TELEPORT + SPAWNPOINT    /tp, /spawnpoint, /gamerule, /seed
-    2. VOID THE AREA            //fast //pos1 //pos2 //set air  (WorldEdit)
-    3. SLIME CHUNK FLOOR        a chain-command-block form (re-triggerable)
-                                AND a one-command "monolith" (below)
-    4. MEASURE                  /perimeterinfo
+    1. TELEPORT                 /tp (y -50), /gamerule, /seed  (no /spawnpoint)
+    2. VOID THE AREA            //pos1 //pos2 //set air  (WorldEdit)
+    3. SLIME CHUNK FLOOR        the command-minecart "monolith" (below) - the
+                                only form; the chain-command-block form was
+                                removed (never used)
+    4. MEASURE                  /give of the measuring block: repeating,
+                                unconditional, always active, running
+                                "execute at @p run perimeterinfo" (1.20.4 NBT)
 
 Why a "monolith": the floor needs one /fill per slime chunk, typically
-~100-125 commands for radius 200. Chat caps at 256 characters and one line
+~70-110 commands for radius 152. Chat caps at 256 characters and one line
 per Enter; a command block holds ~32,500 characters but executes exactly
 ONE command regardless of length; semicolon-chaining needs a plugin or
 client mod most setups don't have. The fix is the classic "one-command
@@ -432,13 +608,10 @@ and that is a correctness requirement, not tidiness: command blocks are
 solid, so leaving the rig's own blocks in place adds bogus spawnable
 surfaces and inflates the exact count being measured.
 
-The /give for a pre-loaded repeating command block is deliberately NOT
-emitted (version-dependent NBT/component syntax, see below) - add it
-separately for whatever Minecraft version applies:
-    1.20.4 and older:
-    /give @p repeating_command_block{BlockEntityTag:{Command:"execute at @p run perimeterinfo",auto:1b}}
-    1.20.5+ (components replaced NBT):
-    /give @p repeating_command_block[block_entity_data={id:"minecraft:command_block",Command:"execute at @p run perimeterinfo",auto:1b}]
+Section 4's /give is the 1.20.4 form - this emitter targets 1.20.4 and earlier:
+    /give @p minecraft:repeating_command_block{BlockEntityTag:{Command:"execute at @p run perimeterinfo",auto:1b}}
+(1.20.5+ would need components instead: repeating_command_block[block_entity_data={id:"minecraft:command_block",...}].)
+The section-3 command cannot be given this way - far too long for chat.
 /perimeterinfo takes no mob argument here - with one (e.g. "slime") Carpet
 dumps every spawnable coordinate and buries the summary; without it, just
 the three summary lines print.
@@ -465,7 +638,7 @@ toolchain's sphere-distance math does not model, so any y-sweep result
 should be checked against a real in-game measurement, not trusted from the
 geometry alone.
 
-Worked example - the 66.04 record:
+Worked example - the 66.04 record (HISTORICAL: run with the old radius 200 - today just pass seed and centre):
     perimeter_setup.exe --seed -3918692359804081918 --center-x 3680 --center-z 6989 --y -64 --radius 200 --afk-y -40 --void-top -40
 Produces 109 slime chunks of 676 scanned (16.1%), 27,904 blocks of floor,
 a 10,458-character monolith. In-game result: 17,112 spawning spaces,
@@ -481,12 +654,12 @@ someone building the rig - learned the hard way, worth following:
   - File attachments (the monolith) go at the END, after every chat
     command, not interleaved.
   - Every command gets its OWN block, no exceptions - including each of
-    the 4 WorldEdit lines individually. One block holding several lines is
+    the 3 WorldEdit lines individually. One block holding several lines is
     harder to copy cleanly than four small ones, even if each line inside
     it looks separately selectable.
   - Minimal commentary between blocks - the goal is pasting, not reading.
-Typical shape: seed, /tp, /spawnpoint, /gamerule, /seed, the WorldEdit
-four, the /give, /perimeterinfo - then the monolith attached last.
+Typical shape: seed, /tp, /gamerule, /seed, the WorldEdit three, the /give
+- then the monolith attached last.
 
 
 ==================================================================================
@@ -654,7 +827,10 @@ slime_gpu     --self-test --seed --seed-count --center-x --center-z --m-chunks
                              saved per spot). hunt_pipeline.ps1 uses this by
                              default; a bad line reports to stderr and does
                              NOT kill the worker. Accepts --climb-scan lines
-                             too, not just hunts.
+                             too, and bare --seed S --m-chunks M --center-x X
+                             --center-z Z position searches (one Best: line each)
+                             - how ./slime gui scans the whole 30M world: 13,924
+                             tiles at ~0.04 s each instead of ~0.3 s per process.
               --time-limit-ms N   wall-clock cutoff checked inside the hunt
                              loop itself - what lets a --worker spot be time-
                              capped without killing the shared process.
@@ -663,6 +839,11 @@ slime_gpu     --self-test --seed --seed-count --center-x --center-z --m-chunks
                              throughput, ~15% less host/GPU idle gap from the
                              blocking D2H hit-count copy). Byte-identical
                              output to the non-streamed path.
+              --no-prune     score every position of a bare --seed position search.
+                             By default it skips strips whose upper bound is
+                             below the best already found - exact (same best,
+                             same tie-break; 3,000-tile A/B vs the old build,
+                             0 differences), 1.4x faster per full tile.
               --climb-scan   GPU-coarse high-bit neighbor sweep at chunk
                              resolution (see BUILT: GPU-ACCELERATED CLIMB
                              below). Needs --seed as the base.
@@ -849,8 +1030,8 @@ validated in --self-test [5/5] against slime_core.h's scoreCenterBlocks/
 scoreCenterChunks.
 
 == BUILT: HIGH-BIT NEIGHBOR CLIMB (--climb in slime_refine) =====================
-A Discord finding (mr.diktor / xvyz), checked against this project's own
-isSlimeChunk and confirmed real: java.util.Random's LCG step is
+A finding from the Minecraft seed-hunting community, checked against this
+project's own isSlimeChunk and confirmed real: java.util.Random's LCG step is
     state = state*MULT + ADD  (mod 2^48),  MULT odd (~35 bits)
 Flip seed bit b and the product changes by (MULT<<b) mod 2^48 - a left-shift-
 then-truncate can only ever ADD bits at position >= b (truncation drops the

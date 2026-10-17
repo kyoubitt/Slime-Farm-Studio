@@ -22,7 +22,7 @@ try { (nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,nohe
 catch { "no nvidia-smi" | Add-Content $R }
 "" | Add-Content $R
 
-$emptyIn = Join-Path $env:TEMP "slime_stress_empty.txt"
+$emptyIn = Join-Path ([IO.Path]::GetTempPath()) "slime_stress_empty.txt"
 "" | Set-Content $emptyIn
 
 function Run($label, $exe, $argList, $TimeoutSec = 180) {
@@ -32,8 +32,8 @@ function Run($label, $exe, $argList, $TimeoutSec = 180) {
         Write-Host ("{0,-42} {1,>10}" -f $label, "MISSING") -ForegroundColor Red
         return
     }
-    $so = Join-Path $env:TEMP ("slime_stress_out_{0}.txt" -f [guid]::NewGuid())
-    $se = Join-Path $env:TEMP ("slime_stress_err_{0}.txt" -f [guid]::NewGuid())
+    $so = Join-Path ([IO.Path]::GetTempPath()) ("slime_stress_out_{0}.txt" -f [guid]::NewGuid())
+    $se = Join-Path ([IO.Path]::GetTempPath()) ("slime_stress_err_{0}.txt" -f [guid]::NewGuid())
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $p = Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $root `
          -PassThru -NoNewWindow -RedirectStandardOutput $so -RedirectStandardError $se `

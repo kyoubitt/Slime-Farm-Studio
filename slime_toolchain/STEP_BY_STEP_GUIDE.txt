@@ -1,3 +1,7 @@
+NOTE: the main record search is the EXACT PHASE SEARCH (record_cycle.ps1 -PhaseSearch) - STEP 12 explains
+it and STEP 13 the in-game number that decides records. Steps 5-10 teach the earlier sampling tools, which
+the concepts build on; README.txt '[*] THE RECORD SEARCH' has the commands.
+
 ================================================================================
  STEP-BY-STEP GUIDE - from "what is this project" to "how the record was found"
 ================================================================================
@@ -6,9 +10,9 @@ assumes only the ones before it. If you just need commands, use README.txt's
 "RECORD COMMANDS" section instead - this file is for understanding WHY those
 commands do what they do.
 
-STOP - BUILD BEFORE ANY COMMAND IN THIS FILE. The .exe files shipped here
-are compiled with -arch=native and WILL NOT RUN on a different GPU than the
-one that built them; you get "CUDA error: no kernel image is available for
+STOP - BUILD BEFORE ANY COMMAND IN THIS FILE. This copy ships NO .exe files, on purpose:
+they are compiled with -arch=native and WILL NOT RUN on a different GPU than the one that
+built them; on the wrong card you get "CUDA error: no kernel image is available for
 execution on the device" with no hint that rebuilding is the fix (verified:
 RTX PRO 6000 sm_120 binaries fail on an RTX 4050 sm_89, and the same
 build.ps1 on that laptop rebuilt everything and passed all self-tests):
@@ -27,7 +31,7 @@ universal truth. This project's own history proves the gap can be huge -
 the same unmodified code went from ~4M to ~54-58M seeds/s (13x+) between
 two real GPUs already used here. On new hardware, re-measure with --bench
 and a short timed hunt before trusting or reusing any timing-based
-setting. See AI_CONTEXT.md's top section for the full explanation.
+setting. See docs/REFERENCE.md's top section for the full explanation.
 
 ================================================================================
  STEP 1 - What is a slime chunk, and why do we care where they are
@@ -90,7 +94,7 @@ it's misleading: a chunk that's only PARTIALLY inside the eligible annulus
 if it fully qualifies as a slime chunk - so two spots with the same chunk
 COUNT can differ by several cq depending on how well those chunks' USABLE
 AREA packs into the ring. This project calls that packing efficiency, and it
-falls the more chunks you have (see AI_CONTEXT.md's THE FRONTIER section for
+falls the more chunks you have (see docs/REFERENCE.md's THE FRONTIER section for
 the exact numbers) - which is why "more slime chunks" is not automatically
 "a better farm," and why the real record search targets cq directly, not
 chunk count.
@@ -212,7 +216,7 @@ reason about this trade-off precisely instead of by feel.
 ================================================================================
 It turns out real slime-chunk math (an artifact of how Minecraft computes
 it — a 32-bit integer truncation quirk on one axis but not the other, see
-AI_CONTEXT.md's THE COORDINATE LATTICE section for the actual code and the
+docs/REFERENCE.md's THE COORDINATE LATTICE section for the actual code and the
 exact bug) means GOOD SPOTS ARE NOT UNIFORMLY LIKELY
 ACROSS THE MAP. Specifically, along the Z axis, only chunk-rows where
 `chunkZ mod 97` is 48 or 49 can ever host one of this project's good spots
@@ -234,7 +238,7 @@ CLOSE VARIANT of it scores even better, without hunting from scratch. It
 relies on how Minecraft's random-number generator actually works
 internally (a Linear Congruential Generator - LCG): flipping a HIGH bit of
 the seed only ever perturbs the TOP few bits of the generator's internal
-state (never the bottom ones - see AI_CONTEXT.md's THE HIGH-BIT CLIMB
+state (never the bottom ones - see docs/REFERENCE.md's THE HIGH-BIT CLIMB
 section for the exact mechanism). That means a seed differing only in its
 high bits renders an ALMOST-identical slime layout - not a fresh random
 roll.
@@ -253,7 +257,7 @@ seed has exactly 65,536 true duplicates, free, with no hunting or climbing
 needed at all. Confirmed, not just theorized: refining the 66.21 record
 seed against 4 top-bit-flipped variants, each in a separate process, all
 landed on the exact same 16950 blocks / 66.21 cq / position - see
-AI_CONTEXT.md's EXACT SEED DUPLICATES section for the proof and why it
+docs/REFERENCE.md's EXACT SEED DUPLICATES section for the proof and why it
 matters.
 
 ================================================================================
@@ -289,7 +293,7 @@ The actual commands, in the order you'd use them:
 
     What it does: runs the whole scan->hunt->score->climb->sweep->push loop
     above up to 100 times back to back, over a window +/-100000 blocks from
-    the origin. Stops early ONLY on a genuine new best (see AI_CONTEXT.md's
+    the origin. Stops early ONLY on a genuine new best (see docs/REFERENCE.md's
     GOTCHAS for a bug that used to make it stop on FALSE new-bests, since
     fixed) - otherwise it just keeps going, skipping any family
     main\families.csv already marked "mined." -Range must be passed
@@ -333,13 +337,16 @@ the spot's real slime capacity, directly comparable to what slime_refine
 predicted for the same position.
 
     perimeter_setup.exe --seed <s> --center-x <x> --center-z <z>
-      --y -64 --radius 200 --afk-y -40 --void-top -40
+
+    (The defaults build the reference rig: a 152-block half-width box, voided up
+    to y=-40 in a superflat world, /tp to y=-50, Minecraft 1.20.4.)
 
     What it does: scans the same isSlimeChunk math already validated
     elsewhere in this toolchain across a box around (center-x,center-z),
     and prints the exact in-game commands to build the rig above - a
-    teleport/spawnpoint/gamerule setup, a WorldEdit void command, and a
-    slime-chunk floor. The floor alone typically needs 100+ /fill commands,
+    teleport/gamerule setup, a WorldEdit void command, a
+    slime-chunk floor, and a /give for the repeating perimeterinfo block
+    you measure with. The floor alone typically needs 70-110 /fill commands,
     which is a real engineering problem on its own (chat and command blocks
     both cap how much can be pasted in one shot) - solved with a classic
     "one-command monolith" trick: one summon command that fires all the
@@ -363,11 +370,57 @@ prediction of 16,905; a 66.21-cq spot has measured WORSE in game than the
 is the first thing to check, not the last.
 
 ================================================================================
+ STEP 12 - How records are found now: the exact phase search
+================================================================================
+Steps 5-10 describe SAMPLING: try millions of seeds, keep the best. The
+search that found every current record (70.82, 70.64, 70.34, 69.39, 69.30)
+does not sample at all.
+
+The trick (docs/PHASE_MODEL.txt): split a seed into a "family" (its
+lowest 20 bits), a "class" (the next 15) and a top part (13 bits, 8,192
+values). For one family and class, changing the top part moves EVERY chunk's
+slime test in lockstep - so all 8,192 seeds of a class are decided by just
+222 numbers, one per chunk. The best farm of a whole class falls out of
+those 222 numbers directly. No seed is tried one by one.
+
+So the search walks classes, not seeds: at each of the 10 most promising AFK
+positions around a spot, every class of the top 5% of families (the ones
+that can make the most chunks slime there). A cheap upper bound throws away
+almost every class, and the exact calculation runs on the rest. The best
+~600 layouts are then scored to the block with slime_refine, and anything
+66+ is filed. About 13 seconds per spot on a laptop GPU.
+
+Speed-ups are only accepted if they change NOTHING: identical output, row
+for row, and the regression gate (heat\phase_regress.ps1) must re-find every
+known farm. Faster but able to miss a farm = rejected.
+
+================================================================================
+ STEP 13 - What actually counts: the in-game number at y -39
+================================================================================
+Step 11 showed the model and the game can disagree. The fix turned out to be
+simple geometry. The model scores with the player level with the floor. In
+the reference rig you stand at y -39, 24 blocks above the slime floor - and at
+exactly 24 blocks up, the 24-block no-spawn sphere just touches the floor.
+The inner dead circle disappears (even the column straight below you counts),
+while the outer circle shrinks from 128 to 125.7 blocks.
+
+afk_rescan does that geometry. A full obsidian floor at -39 reads 49,669 in
+game; afk_rescan says 49,669. For five measured farms its best AFK point
+gives the in-game count exactly. That is why every 66+ farm also lands in
+main\records\over66_y-39, named by that estimate: a farm with a modest model
+cq but lots of slime near the middle can beat higher-cq farms in game -
+the 69.39 did, and holds the in-game record at 18,598.
+
+The game's number always wins. When a measurement disagrees with the
+estimate (it did twice, by ~200), the estimate is the one that is wrong.
+
+================================================================================
  WHERE TO GO NEXT
 ================================================================================
 - README.txt: the actual command reference, kept current, read top-down.
 - FEATURES.txt: a scannable checklist of everything this toolchain can do.
-- AI_CONTEXT.md: every hard number, the exact code for the trickier finds,
+- AI_CONTEXT.md (start here) and docs/ - docs/REFERENCE.md is the older full
+  reference: every hard number, the exact code for the trickier finds,
   and rejected ideas, no narrative - written to be sufficient on its own if
   you (or an AI) only read one file.
 

@@ -1,27 +1,13 @@
+NOTE: the main record search is the EXACT PHASE SEARCH (record_cycle.ps1 -PhaseSearch) - its features are
+in the first section below; README.txt '[*] THE RECORD SEARCH' has the commands. Later sections describe the
+earlier sampling-based tools, still built and working.
+
 ================================================================================
  FEATURES - what this toolchain can actually do, at a glance
 ================================================================================
 A checklist, not an explanation. See STEP_BY_STEP_GUIDE.txt for why each of
-these exists, README.txt for the exact flags, AI_CONTEXT.md for the deep
+these exists, README.txt for the exact flags, AI_CONTEXT.md and docs\ for the deep
 numbers.
-
-TWO WAYS TO USE THIS
-  1. STANDALONE. Fully self-contained - every capability listed below is
-     reachable from the commands in README.txt. No AI, no account, no
-     internet. Build it, run the commands, read the output. The docs are
-     written to be sufficient on their own.
-  2. WITH CLAUDE (or any AI assistant) - much easier, and recommended.
-     Point it at this folder and ask in plain English. It reads every source
-     file and doc here and answers immediately, including things written
-     down nowhere ("what does --climb-scan do," "where do results get
-     saved," "how do I widen the search area"). It can also DO the work: run
-     hunts, score a seed you paste in, find the best spot near spawn,
-     generate the in-game commands, explain any number it produced, retune
-     for your GPU, or add features outright.
-     The difference is real - standalone means finding the right flag across
-     four docs and four tools and interpreting the output yourself; with an
-     assistant you say what you want. This project was built that way.
-     Try: "read AI_CONTEXT.md, then hunt for a record"
 
 *** STOP - BUILD FIRST. The .exe files here are compiled with -arch=native
 and WILL NOT RUN on a different GPU than the one that built them: you get
@@ -43,8 +29,32 @@ measured on ONE specific GPU. On different hardware these numbers can be
 off by an order of magnitude (measured fact: the same code went from ~4M
 to ~54-58M seeds/s between two real GPUs already used on this project) -
 re-measure with --bench and a short timed hunt on the actual target
-machine before trusting or tuning anything time-based. See AI_CONTEXT.md's
+machine before trusting or tuning anything time-based. See docs\REFERENCE.md's
 top section for the full explanation. ***
+
+--------------------------------------------------------------------------------
+ THE RECORD SEARCH (current) - EXACT PHASE SEARCH
+--------------------------------------------------------------------------------
+- Exact, not sampled: for one family and class, all 8,192 top seed values give
+  layouts fixed by 222 numbers (the phase model, docs\PHASE_MODEL.txt), so
+  every seed of a class is solved at once - the best farm of each class, and
+  every other layout that reaches the floor, from the math alone.
+- Searches the top 5% of families at each of the 10 most promising AFK
+  positions around a spot (ranked by a cheap exact statistic), ~12.8 s per
+  spot on a laptop GPU; the top ~600 layouts refined to block precision.
+- Proven-exact speed-ups only: every change must produce identical output
+  (row for row) and pass the regression gate (heat\phase_regress.ps1 re-finds
+  every archived farm at 14 record spots). Self-tests [7] and [8] check the
+  phase model against brute force and the GPU against the CPU.
+- Live guards: every reported layout is recounted with the reference check;
+  a family-cut check every 50 spots logs anything the 5% cut would miss.
+- Resumable and new-spots-only: every spot searched once, logged
+  (main\cycles.txt, main\theory\heat\phase_search.csv); every 66+ farm filed
+  with its image and its -39 in-game estimate (main\records\over66_y-39).
+- In-game rig on request: perimeter_setup writes the WorldEdit + command-
+  minecart setup and the /give for the repeating perimeterinfo block (1.20.4).
+- Raised-AFK estimate (afk_rescan): what /perimeterinfo reads with your feet at
+  y -39 - calibrated in game (full floor 49,669 exact; exact for 5 measured farms).
 
 --------------------------------------------------------------------------------
  FINDING WHERE TO LOOK
@@ -95,7 +105,7 @@ top section for the full explanation. ***
   64-bit world seed are PROVABLY inert - proven from the code AND
   independently confirmed by refining the 66.21 record seed against 4
   top-bit-flipped variants in separate processes, all landing on the exact
-  same 16950 blocks / 66.21 cq / position (see AI_CONTEXT.md's EXACT SEED
+  same 16950 blocks / 66.21 cq / position (see docs\REFERENCE.md's EXACT SEED
   DUPLICATES section). Every seed sharing the same low 48 bits produces the
   byte-identical slime-chunk map everywhere in that world - that's 65,536
   true duplicates of any record seed for the cost of a loop, no hunting
@@ -125,14 +135,14 @@ Requires the Carpet mod (for /perimeterinfo) and WorldEdit (for the void
 step) both installed on the world being tested - neither is optional.
 
 - One command generates a full physical test rig for any (seed, spot):
-  teleport/spawnpoint/gamerule setup, a WorldEdit void of the surrounding
+  teleport/gamerule setup, a WorldEdit void of the surrounding
   area, and a slime-chunk-only obsidian floor - measurable directly with
   Carpet mod's /perimeterinfo, the game's own spawn-space count
   (perimeter_setup.exe).
 - Ships the floor as a single pasteable "one-command monolith" (a classic
-  falling-block/activator-rail trick) so a rig needing 100+ /fill commands
-  still only needs ONE command block - plus a re-triggerable chain-block
-  form as an alternative.
+  falling-block/activator-rail trick with command minecarts) so a rig
+  needing 70-110 /fill commands still only needs ONE command block, plus a
+  /give for the repeating perimeterinfo block used to measure (1.20.4).
 - Self-destructing rig: the floor-placing structure removes itself after
   running, since leftover command blocks are solid and would otherwise
   inflate the very spawn count being measured.

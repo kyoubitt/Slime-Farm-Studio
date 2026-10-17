@@ -1,0 +1,8 @@
+Linux / macOS (gcc or clang):
+gcc -o SlimeChunkPerimeterGen -std=c11 -O2 ./src/*.c ./src/*/*.c
+
+Windows (MinGW-w64):
+gcc -o SlimeChunkPerimeterGen.exe -std=c11 -O2 ./src/*.c ./src/*/*.c
+
+Windows (MSVC, from a Developer Command Prompt):
+build.bat

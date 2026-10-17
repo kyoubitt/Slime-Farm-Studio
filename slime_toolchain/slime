@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+"""slime - the easy way to drive the slime-farm toolchain.
+
+  ./slime                                   menu: pick a number, answer a few questions
+  ./slime gui                               Slime Farm Studio: the app, right in this terminal, with a map
+
+Or straight from the command line (the menu prints these for you as it goes):
+
+  ./slime best-spot --seed S                best farm in YOUR world (10k / 100k / 1M blocks)
+  ./slime check --seed S --x X --z Z        one farm: score, best standing height, what it means
+  ./slime perimeter --seed S --x X --z Z    commands to build the farm floor in game
+  ./slime hunt [--cycles 12]                hunt for a record (stops itself on one)
+  ./slime search [--spots main/best_spots.csv]   the exact phase search (needs a spot list)
+  ./slime status                            hunt progress so far
+  ./slime stop                              stop every hunt process, check the GPU is idle
+  ./slime farms [--top 15] [--open N]       your best farms, one table
+  ./slime measured --seed S --x X --z Z --ingame N   record a /perimeterinfo reading
+  ./slime doctor [--full]                   check your setup, with the fix for anything wrong
+
+  more:  score, y (every standing height), climb, dupes, verify (measurement rig)
+
+Seeds can be typed as text too ("my world") - converted the way Minecraft does.
+Add --device N before the command to pick the GPU on a multi-GPU machine.
+Nothing here scores anything itself: every number comes from the tools, exactly as before.
+"""
+import argparse
+import glob
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from slime_common import (PERIMETER_BANDS, ROOT, die, load_prefs, num, perimeter_band,  # noqa: E402
+                          ps_command, read_csv, require_tools, run_capture, run_perimeter_gen,
+                          save_prefs, say, tool, write_text)
+
+WORK = os.path.join(ROOT, "main", "work")
+RECORDS = os.path.join(ROOT, "main", "records")
+MASK48 = (1 << 48) - 1
+
+
+# ---- seeds ------------------------------------------------------------------------
+def parse_seed(text):
+    """A world seed the way Minecraft reads the seed box (WorldOptions.parseSeed): String.trim(),
+    then a whole number that fits a 64-bit long is used as is (Long.parseLong), anything else
+    becomes the Java String.hashCode() of the text. Returns (seed, read_as_text)."""
+    s = str(text).strip("".join(map(chr, range(33))))   # trim() drops code units <= U+0020 only
+    if not s:
+        raise ValueError("empty seed")
+    # parseLong reads one UTF-16 unit per digit: a digit outside the BMP is not a number to it
+    if re.fullmatch(r"[+-]?\d+", s) and all(ord(c) < 0x10000 for c in s):
+        v = int(s)
+        if -(1 << 63) <= v < (1 << 63):
+            return v, False
+    h = 0
+    b = s.encode("utf-16-be")                 # Java chars are UTF-16 code units
+    for i in range(0, len(b), 2):
+        h = (31 * h + ((b[i] << 8) | b[i + 1])) & 0xFFFFFFFF
+    return (h - (1 << 32) if h >> 31 else h), True
+
+
+def seed_value(text):
+    return parse_seed(text)[0]
+
+
+def seed_arg(text):
+    try:
+        return seed_value(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("a seed is a number or any text")
+
+
+def to_signed64(v):
+    v &= (1 << 64) - 1
+    return v - (1 << 64) if v >> 63 else v
+
+
+# ---- what a number means ------------------------------------------------------------
+def verdict(cq):
+    cq = num(cq)
+    if cq >= 66:
+        return "record class (66+) - among the best ever found; the best farm measured in game reads 20,506 at y -39 (76.23 cq)"
+    if cq >= 60:
+        return "excellent (60+) - only seed hunting finds farms like this"
+    if cq >= 50:
+        return "very good (50+) - better than what almost any normal world offers"
+    if cq >= 40:
+        return "good for a normal world - a world's best spot within 1M blocks is usually 44-47 cq"
+    return "ordinary - most spots in any world reach this; try ./slime best-spot for this seed"
+
+
+# ---- tool calls ---------------------------------------------------------------------
+def gpu_best(seed, x, z, m_chunks):
+    """Fixed-seed position search on the GPU -> (chunks, bx, bz)."""
+    rc, lines = run_capture([tool("slime_gpu"), "--seed", str(seed), "--center-x", str(x),
+                             "--center-z", str(z), "--m-chunks", str(m_chunks)])
+    for l in lines:
+        m = re.match(r"Best: score=(\d+) at x=(-?\d+) z=(-?\d+)", l)
+        if m:
+            return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    die("slime_gpu gave no result:\n  " + "\n  ".join(lines[-8:]) + "\n(./slime doctor checks your setup)")
+
+
+def refine(seeds, x, z, radius=6, family=None, images=False, tag="score"):
+    """slime_refine at block precision -> list of csv rows, best cq first."""
+    os.makedirs(WORK, exist_ok=True)
+    sf = os.path.join(WORK, "%s_%d_%d_seeds.csv" % (tag, x, z))
+    cf = os.path.join(WORK, "%s_%d_%d_cq.csv" % (tag, x, z))
+    write_text(sf, ",".join(str(s) for s in seeds))
+    if os.path.exists(cf):
+        os.remove(cf)
+    args = [tool("slime_refine"), "--seeds", sf, "--center-x", str(x), "--center-z", str(z),
+            "--radius", str(radius), "--csv", cf, "--quiet"]
+    if family:
+        args += ["--family", family]
+    if not images:
+        args.append("--no-images")
+    rc, out = run_capture(args)
+    rows = read_csv(cf)
+    if not rows:
+        die("slime_refine produced nothing:\n  " + "\n  ".join(out[-8:]))
+    return sorted(rows, key=lambda r: num(r["cq"]), reverse=True)
+
+
+def climb_scan(seed, x, z, lo, bits, top):
+    rc, lines = run_capture([tool("slime_gpu"), "--climb-scan", "--seed", str(seed), "--center-x", str(x),
+                             "--center-z", str(z), "--m-chunks", "6", "--climb-lo", str(lo),
+                             "--climb-bits", str(bits), "--climb-top", str(top)])
+    out = []
+    for l in lines:
+        m = re.match(r"^\s*(\d+)\s+[0-9.]+\s+\(\s*-?\d+,\s*-?\d+\)\s+(-?\d+)\s*$", l)
+        if m:
+            out.append((int(m.group(1)), int(m.group(2))))
+    if rc != 0 and not out:
+        die("slime_gpu --climb-scan failed:\n  " + "\n  ".join(lines[-8:]))
+    return out
+
+
+def height_sweep(seed, x, z, window=48, floor_y=-64):
+    """afk_rescan: every feet height from the floor to 24 above it, best AFK point within
+    +-window at each. Rows with dy, feet_y, blocks_vanilla, blocks_carpet, best_x, best_z, blocks_y0."""
+    import csv
+    require_tools("afk_rescan")
+    os.makedirs(WORK, exist_ok=True)
+    fin, fout = os.path.join(WORK, "y_in.csv"), os.path.join(WORK, "y_out.csv")
+    write_text(fin, "seed,x,z\n%d,%d,%d\n" % (seed, x, z))
+    if os.path.exists(fout):
+        os.remove(fout)
+    run_capture([tool("afk_rescan"), "--in", fin, "--out", fout, "--dy-from", "0", "--dy-to", "24",
+                 "--window", str(window), "--spawn-y", str(floor_y + 1)])
+    with open(fout) if os.path.exists(fout) else open(os.devnull) as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        die("afk_rescan produced nothing (./slime doctor checks your setup)")
+    return rows
+
+
+def best_height(rows):
+    return max(rows, key=lambda r: (int(r["blocks_vanilla"]), int(r["blocks_carpet"])))
+
+
+def remember_farm(seed, x, z, best=None):
+    farm = {"seed": seed, "x": int(x), "z": int(z)}
+    if best:
+        farm.update(feet_y=int(best["feet_y"]), best_x=int(best["best_x"]), best_z=int(best["best_z"]),
+                    spaces=int(best["blocks_vanilla"]))
+    save_prefs(seed=seed, farm=farm)
+
+
+# ---- best-spot ------------------------------------------------------------------------
+def cmd_best_spot(o):
+    require_tools("slime_gpu", "slime_refine")
+    passes = [("10k", 625, [(0, 0)]), ("100k", 6250, [(0, 0)])]
+    if not o.no_million:
+        # --m-chunks caps at 16000 (+/-256k blocks), so 1M is a 4x4 grid of
+        # tiles: centres at +/-256k and +/-768k cover +/-1,024,000 blocks.
+        offs = [-768000, -256000, 256000, 768000]
+        passes.append(("1M", 16000, [(dx, dz) for dx in offs for dz in offs]))
+    results = []
+    for label, m, tiles in passes:
+        say("searching %-4s blocks around (%d,%d) on the GPU..." % (label, o.x, o.z), "cyan")
+        cands = []
+        for dx, dz in tiles:
+            c, bx, bz = gpu_best(o.seed, o.x + dx, o.z + dz, m)
+            cands.append((c, bx, bz))
+        # refine every tile's winner - the chunk count is the coarse key, cq the real one
+        cands.sort(reverse=True)
+        best = None
+        for c, bx, bz in cands[:4]:
+            r = refine([o.seed], bx, bz, tag="best")[0]
+            if best is None or num(r["cq"]) > num(best["cq"]):
+                best = r
+        x, z = int(best["x"]), int(best["z"])
+        dist = int(((x - o.x) ** 2 + (z - o.z) ** 2) ** 0.5)
+        results.append((label, best, dist))
+
+    say()
+    say("    within    cq     chunks  pack    AFK spot                distance", "cyan")
+    for label, r, d in results:
+        say("    %-6s  %6s    %3s   %5s%%   %-22s %10s" % (label, r["cq"], r["chunks_at_best_blocks"],
+                                                           r["eff_pct"], "(%s, %s)" % (r["x"], r["z"]),
+                                                           format(d, ",")))
+    # Best-found grows LOGARITHMICALLY with area, travel LINEARLY: recommend
+    # the nearest result within ~1 cq of the best, not the biggest number.
+    top = max(num(r["cq"]) for _, r, _ in results)
+    label, r, d = min((t for t in results if num(t[1]["cq"]) >= top - 1.0), key=lambda t: t[2])
+    say()
+    say("RECOMMENDED: %s cq at (%s, %s), %s blocks from (%d,%d)" % (r["cq"], r["x"], r["z"], format(d, ","),
+                                                                     o.x, o.z), "green")
+    say("  what it means: " + verdict(r["cq"]))
+    if num(r["cq"]) < top:
+        say("  %.2f cq short of the best found, for a much shorter trip - each extra cq costs" % (top - num(r["cq"])),
+            "darkgray")
+        say("  exponentially more ground, so it rarely justifies the distance.", "darkgray")
+    remember_farm(o.seed, r["x"], r["z"])
+    say("\nnext:  ./slime check --seed %d --x %s --z %s     (best standing height)" % (o.seed, r["x"], r["z"]))
+    say("       ./slime perimeter --seed %d --x %s --z %s (build it in game)" % (o.seed, r["x"], r["z"]))
+    return 0
+
+
+# ---- score / check / y --------------------------------------------------------------------
+def cmd_score(o):
+    require_tools("slime_refine")
+    r = refine([o.seed], o.x, o.z, radius=o.radius, family=o.family, images=not o.no_images, tag="score")[0]
+    say("%s cq  (%s blocks)  %s chunks at %s%% packing  AFK at (%s, %s)" % (
+        r["cq"], r["blocks"], r["chunks_at_best_blocks"], r["eff_pct"], r["x"], r["z"]), "green")
+    say("  what it means: " + verdict(r["cq"]))
+    fam = o.family or "%d_%d" % (o.x, o.z)
+    say("log%s: main/scores/%s/%d.txt" % ("" if o.no_images else " + map", fam, o.seed), "darkgray")
+    save_prefs(seed=o.seed)
+    return 0
+
+
+def cmd_check(o):
+    """One farm in plain words: its score on the floor, its best standing height, what it means."""
+    require_tools("slime_refine", "afk_rescan")
+    r = refine([o.seed], o.x, o.z, radius=o.radius, images=True, tag="check")[0]
+    x, z = int(r["x"]), int(r["z"])
+    rows = height_sweep(o.seed, x, z, o.window, o.floor_y)
+    b = best_height(rows)
+    at24 = next((h for h in rows if int(h["dy"]) == 24), None)
+    floor_spaces = int(rows[0]["blocks_y0"])
+    say("Farm  seed %d  around (%d, %d)" % (o.seed, o.x, o.z), "cyan")
+    say("  standing on the floor:  %s cq = %s spawning spaces  (%s chunks, %s%% packed, AFK %d,%d)" % (
+        r["cq"], format(floor_spaces, ","), r["chunks_at_best_blocks"], r["eff_pct"], x, z))
+    say("  best standing height:   feet y %s at (%s, %s) = %s spaces  (%+d vs the floor)" % (
+        b["feet_y"], b["best_x"], b["best_z"], format(int(b["blocks_vanilla"]), ","),
+        int(b["blocks_vanilla"]) - floor_spaces), "green")
+    say("                          /perimeterinfo there reads %s" % format(int(b["blocks_carpet"]), ","))
+    if at24 and at24 is not b:
+        say("  at y %s (24 above the floor, the usual spot): %s spaces" % (at24["feet_y"], format(int(at24["blocks_vanilla"]), ",")),
+            "darkgray")
+    say("  what it means: " + verdict(r["cq"]))
+    say("  map: main/scores/%d_%d/%d.png" % (o.x, o.z, o.seed), "darkgray")
+    remember_farm(o.seed, x, z, b)
+    say("\nnext:  ./slime perimeter --seed %d --x %s --z %s   (build it in game)" % (o.seed, b["best_x"], b["best_z"]))
+    return 0
+
+
+def cmd_y(o):
+    """afk_rescan's height sweep for one farm - the same numbers y_phase.ps1 prints per cycle."""
+    rows = height_sweep(o.seed, o.x, o.z, o.window, o.floor_y)
+    say("feet y   vanilla  /perimeterinfo  best AFK point (within +-%d)" % o.window, "cyan")
+    best = best_height(rows)
+    for r in rows:
+        mark = "  <- best" if r is best else ""
+        say("  %4s   %7s   %13s   (%s, %s)%s" % (r["feet_y"], r["blocks_vanilla"], r["blocks_carpet"],
+                                                r["best_x"], r["best_z"], mark), "green" if mark else None)
+    at24 = next((r for r in rows if int(r["dy"]) == 24), rows[-1])
+    floor_spaces = int(rows[0]["blocks_y0"])
+    say("\nStand with your feet at y %s at (%s, %s): %s spawning spaces." % (
+        best["feet_y"], best["best_x"], best["best_z"], format(int(best["blocks_vanilla"]), ",")), "green")
+    say("  that's %+d vs y %s and %+d vs standing on the floor (%s). Above y %d it only drops." % (
+        int(best["blocks_vanilla"]) - int(at24["blocks_vanilla"]), at24["feet_y"],
+        int(best["blocks_vanilla"]) - floor_spaces, format(floor_spaces, ","), o.floor_y + 25), "darkgray")
+    remember_farm(o.seed, o.x, o.z, best)
+    return 0
+
+
+# ---- climb / dupes ------------------------------------------------------------------------
+def cmd_climb(o):
+    """GPU coarse sweep of a seed's high bits, then the exact number for the
+    top variants - the 2-step manual pipeline that found 66.21, as one step."""
+    require_tools("slime_gpu", "slime_refine")
+    if o.lo + o.bits > 48:
+        die("--lo + --bits must be <= 48 (bits above 47 do not touch the slime map)")
+    say("sweeping bits %d-%d of %d (%s variants) on the GPU..." % (o.lo, o.lo + o.bits - 1, o.seed,
+                                                                  format(1 << o.bits, ",")), "cyan")
+    var = climb_scan(o.seed, o.x, o.z, o.lo, o.bits, o.top)
+    seeds = [o.seed] + [s for _, s in var if s != o.seed]
+    rows = refine(seeds, o.x, o.z, radius=o.radius, tag="climb")
+    base = next(r for r in rows if int(r["seed"]) == o.seed)
+    say("\n      cq   pack    c   AFK spot             seed", "cyan")
+    for r in rows[:o.show]:
+        mark = "  <- base" if int(r["seed"]) == o.seed else ""
+        say("  %6s  %5s%%  %3s   %-20s %s%s" % (r["cq"], r["eff_pct"], r["chunks_at_best_blocks"],
+                                               "(%s,%s)" % (r["x"], r["z"]), r["seed"], mark))
+    best = rows[0]
+    if num(best["cq"]) > num(base["cq"]):
+        say("\nclimb: %s -> %s cq  seed %s" % (base["cq"], best["cq"], best["seed"]), "yellow")
+        refine([int(best["seed"])], o.x, o.z, radius=o.radius, images=True, tag="climbimg")
+        say("map: main/scores/%d_%d/%s.png" % (o.x, o.z, best["seed"]), "darkgray")
+    else:
+        say("\nno variant beats the base seed (%s cq) - it is a local plateau" % base["cq"], "darkgray")
+    return 0
+
+
+def cmd_dupes(o):
+    """Bits 48-63 of a world seed never reach isSlimeChunk (it masks to 48
+    bits after only add/xor), so every seed sharing the low 48 bits has the
+    byte-identical slime map EVERYWHERE - 65,536 per layout, exactly. With
+    --x/--z, also find the NEAR duplicates: other low-48 values that score
+    identically AT THAT SPOT (bits 24-47 swept on the GPU, each confirmed at
+    block precision), each multiplying out to another 65,536."""
+    layouts = [o.seed & MASK48]
+    if o.x is not None and o.z is not None:
+        require_tools("slime_gpu", "slime_refine")
+        say("sweeping bits 24-47 (16,777,216 variants) at (%d,%d)..." % (o.x, o.z), "cyan")
+        var = climb_scan(o.seed, o.x, o.z, 24, 24, o.scan_top)
+        rows = refine([o.seed] + [s for _, s in var if s != o.seed], o.x, o.z, radius=o.radius, tag="dupes")
+        base = next(r for r in rows if int(r["seed"]) == o.seed)
+        same = [r for r in rows if r["blocks"] == base["blocks"] and r["x"] == base["x"] and r["z"] == base["z"]]
+        for r in same:
+            low = int(r["seed"]) & MASK48
+            if low not in layouts:
+                layouts.append(low)
+        say("%d distinct world%s reproduce %s cq at (%s,%s) exactly" % (
+            len(layouts), "" if len(layouts) == 1 else "s", base["cq"], base["x"], base["z"]), "green")
+        if len(var) >= o.scan_top:
+            say("  (the GPU sweep returned its full --scan-top %d - raise it if you want to be sure"
+                " none were cut off)" % o.scan_top, "darkgray")
+    elif (o.x is None) != (o.z is None):
+        die("--x and --z go together")
+
+    total = len(layouts) << 16
+    out = o.out or os.path.join(ROOT, "main", "dupes_%d.txt" % o.seed)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    limit = o.count if o.count else total
+    n = 0
+    with open(out, "w") as f:
+        for hi in range(1 << 16):
+            for low in layouts:
+                if n >= limit:
+                    break
+                f.write("%d\n" % to_signed64(low | (hi << 48)))
+                n += 1
+    say("%s seeds share this slime map; wrote %s to %s" % (format(total, ","), format(n, ","), out), "green")
+    say("  Terrain/biomes/structures differ between them (1.18+ worldgen uses all 64 bits),", "darkgray")
+    say("  so pick whichever puts the farm next to what you want.", "darkgray")
+    return 0
+
+
+# ---- building it in game ------------------------------------------------------------------
+def known_height(seed, x, z):
+    """The best standing height ./slime check or y found for this farm, if it was this one."""
+    f = load_prefs().get("farm") or {}
+    if f.get("seed") == seed and "feet_y" in f and \
+            (abs(f.get("best_x", 1e18) - x) <= 48 and abs(f.get("best_z", 1e18) - z) <= 48 or
+             abs(f.get("x", 1e18) - x) <= 48 and abs(f.get("z", 1e18) - z) <= 48):
+        return f
+    return None
+
+
+def cmd_perimeter(o):
+    band = perimeter_band(o.version)
+    if band is None:
+        die("--version %s: the perimeter generator supports 1.13 and later (e.g. 1.21.11, 26.1.2)" % o.version)
+    try:
+        path, out = run_perimeter_gen(o.seed, o.x, o.z, band, os.path.join(ROOT, "main", "perimeters"))
+    except RuntimeError as e:
+        die(str(e))
+    save_prefs(seed=o.seed, version=o.version)
+    say("version band: %s (game %s)" % (PERIMETER_BANDS[band][1], o.version), "darkgray")
+    lines = out.splitlines()
+    i = next(k for k, l in enumerate(lines) if l.startswith("perimeter_"))
+    for l in lines[i + 1:]:
+        say(l, "yellow" if "WARNING" in l else None)
+    say("\ncommands: %s" % os.path.relpath(path, ROOT), "green")
+    say("""
+What to do in game (you need WorldEdit and Carpet):
+  0. make a world with this seed - superflat is easiest, there's almost nothing to clear
+  1. paste the section 1 lines in chat: teleport there, mob spawning off
+  2. section 2: WorldEdit clears the area
+  3. section 3: paste it into ONE command block and power it (a button) - builds the obsidian floor
+  4. section 4: same again, after 3 finished - the magma border
+  5. section 5: WorldEdit lays the glass skirt
+  6. section 6: get the measuring block, place it and read /perimeterinfo""")
+    floor = 0 if band == 0 else -64
+    h = known_height(o.seed, o.x, o.z)
+    if h:
+        say("Stand with your feet at y %d at (%d, %d) - this farm's best height (%s spaces)." % (
+            h["feet_y"], h["best_x"], h["best_z"], format(h["spaces"], ",")), "green")
+        say("  section 1 teleports you to y %d; move to that spot and height before measuring." % (floor + 14), "darkgray")
+    else:
+        say("Best standing height for this farm:  ./slime check --seed %d --x %d --z %d" % (o.seed, o.x, o.z), "darkgray")
+    say("Then save what /perimeterinfo said:   ./slime measured --seed %d --x <where you stood> --z <...> --ingame <N>"
+        % o.seed, "darkgray")
+    return 0
+
+
+def cmd_verify(o, extra):
+    """perimeter_setup with its own reference-rig defaults (radius 152, feet 14 above the floor),
+    the syntax for --version, and anything else passed straight through (--afk-y, --radius, ...)."""
+    require_tools("perimeter_setup")
+    save_prefs(seed=o.seed, version=o.version)
+    args = [tool("perimeter_setup"), "--seed", str(o.seed), "--center-x", str(o.x), "--center-z", str(o.z),
+            "--game-version", o.version] + extra
+    sys.stdout.flush()
+    return subprocess.call(args, cwd=ROOT)
+
+
+# ---- your farms ---------------------------------------------------------------------------
+BEST_RE = re.compile(r"BEST BY BLOCKS:\s+(\d+) blocks \(([\d.]+) cq\) / (\d+) chunks at \((-?\d+),(-?\d+)\)")
+
+
+def filed_farms():
+    """Every farm in main/records/ (the flat old layout and the <tier>/ folders), read from the
+    farm's own log so nothing depends on an index being complete."""
+    farms, seen = [], set()
+    paths = sorted(glob.glob(os.path.join(RECORDS, "*.txt")) + glob.glob(os.path.join(RECORDS, "*", "*.txt")),
+                   key=lambda p: not os.path.basename(p).startswith("RECORD."))
+    for p in paths:
+        m = re.match(r"^(RECORD\.)?[\d.]+_(-?\d+)\.txt$", os.path.basename(p))
+        if not m:
+            continue
+        try:
+            with open(p, errors="replace") as f:
+                b = BEST_RE.search(f.read(4000))
+        except OSError:
+            continue
+        if not b:
+            continue
+        key = (m.group(2), b.group(4), b.group(5))
+        if key in seen:
+            continue
+        seen.add(key)
+        png = p[:-4] + ".png"
+        farms.append(dict(seed=m.group(2), cq=b.group(2), blocks=int(b.group(1)), chunks=b.group(3),
+                          x=int(b.group(4)), z=int(b.group(5)), record=bool(m.group(1)),
+                          png=png if os.path.exists(png) else ""))
+    return farms
+
+
+def measured_rows():
+    return read_csv(os.path.join(RECORDS, "measured_in_game.csv"))
+
+
+def cmd_farms(o):
+    farms = filed_farms()
+    if not farms:
+        say("No farms filed yet. Hunts file every good farm into main/records/ - start one with ./slime hunt.", "yellow")
+        return 0
+    ys = {(r["Seed"], r["X"], r["Z"]): r for r in read_csv(os.path.join(ROOT, "main", "y_phase.csv"))}
+    meas = measured_rows()
+    for f in farms:
+        y = ys.get((f["seed"], str(f["x"]), str(f["z"])))
+        f["height"] = (y["BestFeetY"], int(y["BestVanilla"])) if y and y.get("BestVanilla") else None
+        # a reading belongs to this farm only if it is the SAME slime map (equal low 48 bits - the
+        # top 16 never reach the slime check) and the same spot; a different seed nearby is a
+        # different layout, however close
+        m = next((r for r in meas if re.fullmatch(r"-?\d+", r.get("seed", "")) and
+                  (int(r["seed"]) & MASK48) == (int(f["seed"]) & MASK48) and
+                  abs(int(num(r.get("x"))) - f["x"]) <= 64 and abs(int(num(r.get("z"))) - f["z"]) <= 64), None)
+        f["ingame"] = int(num(m["ingame"])) if m and m.get("ingame") else None
+        # best thing we know: the game's own count, then the best-height estimate, then the floor model
+        f["known"], f["basis"] = (f["ingame"], "measured in game") if f["ingame"] else \
+            ((f["height"][1], "best height, feet y %s" % f["height"][0]) if f["height"] else (f["blocks"], "standing on the floor"))
+    farms.sort(key=lambda f: (f["known"], num(f["cq"])), reverse=True)
+    say("   #      cq   spawning spaces (from)                     seed                  AFK spot", "cyan")
+    for i, f in enumerate(farms[:o.top], 1):
+        say("  %2d  %6s   %6s  %-32s  %-20s  %d,%d%s" % (
+            i, f["cq"], format(f["known"], ","), f["basis"], f["seed"], f["x"], f["z"],
+            "   (RECORD)" if f["record"] else ""), "green" if f["ingame"] else None)
+    say("\n%d farms filed. Ranked by the best number known: in game > best height > floor." % len(farms), "darkgray")
+    say("  check one:  ./slime check --seed S --x X --z Z     picture:  ./slime farms --open <#>", "darkgray")
+    if o.open:
+        if not 1 <= o.open <= len(farms):
+            die("--open wants a number from the table (1-%d)" % len(farms))
+        f = farms[o.open - 1]
+        if not f["png"]:
+            die("no picture filed for #%d" % o.open)
+        say("opening %s" % os.path.relpath(f["png"], ROOT))
+        opener = "xdg-open" if os.name != "nt" else "explorer"
+        subprocess.Popen([opener, f["png"]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
+def save_measured(seed, x, z, ingame):
+    """Append one /perimeterinfo reading to main/records/measured_in_game.csv (keeping that file's own
+    columns and line endings); refuses a second reading of the same farm. Returns the path."""
+    path = os.path.join(RECORDS, "measured_in_game.csv")
+    for r in measured_rows():
+        if r.get("seed") == str(seed) and abs(int(num(r.get("x"))) - x) <= 8 and abs(int(num(r.get("z"))) - z) <= 8:
+            die("already saved: seed %s at (%s,%s) = %s in game. Edit %s by hand to change it." % (
+                r["seed"], r["x"], r["z"], r.get("ingame"), os.path.relpath(path, ROOT)))
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        nl = "\r\n" if b"\r\n" in raw else "\n"
+        header = raw.decode("utf-8-sig").splitlines()[0].split(",")
+        for need in ("seed", "x", "z", "ingame"):
+            if need not in header:
+                die("%s has no '%s' column - can't add to it safely" % (os.path.relpath(path, ROOT), need))
+        vals = {"seed": str(seed), "x": str(x), "z": str(z), "ingame": str(ingame)}
+        line = ",".join(vals.get(c, "") for c in header)
+        with open(path, "ab") as f:
+            f.write(((nl if not raw.endswith(b"\n") else "") + line + nl).encode())
+    else:
+        os.makedirs(RECORDS, exist_ok=True)
+        write_text(path, "seed,x,z,ingame\n%d,%d,%d,%d\n" % (seed, x, z, ingame))
+    return path
+
+
+def estimate_at(seed, x, z, feet_y, floor_y=-64):
+    """The tool's /perimeterinfo estimate standing exactly at (x, feet_y, z), or None."""
+    rows = height_sweep(seed, x, z, window=0, floor_y=floor_y)
+    h = next((r for r in rows if int(r["feet_y"]) == feet_y), None)
+    return int(h["blocks_carpet"]) if h else None
+
+
+def cmd_measured(o):
+    """Save a /perimeterinfo reading into main/records/measured_in_game.csv (what y_phase, the y -39
+    gallery and ./slime farms read), and compare it with the tool's own estimate at that spot."""
+    path = save_measured(o.seed, o.x, o.z, o.ingame)
+    say("saved: seed %d at (%d,%d) measured %s in game -> %s" % (o.seed, o.x, o.z, format(o.ingame, ","),
+                                                                  os.path.relpath(path, ROOT)), "green")
+    # the tool's estimate at exactly that spot and height, as a cross-check
+    est = estimate_at(o.seed, o.x, o.z, o.feet_y, o.floor_y)
+    if est is not None:
+        say("  the tool's /perimeterinfo estimate there (feet y %d): %s  (%+d vs your reading)" % (
+            o.feet_y, format(est, ","), o.ingame - est), "darkgray")
+        if abs(o.ingame - est) > 50:
+            say("  a big gap usually means a different standing spot/height, or something solid in the area", "darkgray")
+    if os.path.exists(os.path.join(RECORDS, "over66.csv")):
+        say("  rename its gallery image to the measured number:  pwsh -File afk_rescan.ps1", "darkgray")
+    return 0
+
+
+# ---- hunting (the .ps1 scripts) -------------------------------------------------------------
+def run_ps(script, *args):
+    cmd = ps_command()
+    if not cmd:
+        die("PowerShell 7 (pwsh) not found - see LINUX.md 'What you need', or ./slime doctor")
+    sys.stdout.flush()
+    try:
+        return subprocess.call(cmd + [os.path.join(ROOT, script)] + [str(a) for a in args], cwd=ROOT)
+    except KeyboardInterrupt:
+        say("\ninterrupted - run ./slime stop to make sure nothing is left on the GPU", "yellow")
+        return 130
+
+
+def cmd_hunt(o):
+    say("Hunting for a record: %d cycle(s), each scans for promising spots, hunts seeds there, scores them," % o.cycles, "cyan")
+    say("and files every 66+ farm into main/records/. It stops early if it finds a new record.", "cyan")
+    say("Stop any time with Ctrl+C, then ./slime stop.   Progress: ./slime status\n", "darkgray")
+    args = ["-Repeat", o.cycles]
+    if o.range:
+        args += ["-Range", o.range]
+    return run_ps("record_cycle.ps1", *args)
+
+
+def cmd_search(o):
+    spots = o.spots
+    if not os.path.exists(os.path.join(ROOT, spots)):
+        die("the exact phase search needs a spot list: %s is missing.\n"
+            "  it ships with the Windows copy of this toolchain (main/best_spots.csv, 500 pre-ranked spots);\n"
+            "  copy it into main/, or use the normal hunt instead: ./slime hunt" % spots)
+    say("Exact phase search: %d batch(es) of %d spots from %s." % (o.cycles, o.batch, spots), "cyan")
+    say("Stop any time with Ctrl+C, then ./slime stop.\n", "darkgray")
+    return run_ps("record_cycle.ps1", "-PhaseSearch", "-BestFamily", "-BestFamilySpots", spots,
+                  "-BestFamilyBatch", o.batch, "-Repeat", o.cycles)
+
+
+def cmd_status(o):
+    return run_ps("record_cycle.ps1", "-Status")
+
+
+def cmd_stop(o):
+    return run_ps("stop_all.ps1")
+
+
+# ---- doctor ------------------------------------------------------------------------------
+TOOL_SOURCES = {
+    "hotspot_scan": ["hotspot_scan.cu", "cuda_device.h"], "slime_gpu": ["slime_gpu.cu", "cuda_device.h"],
+    "phase_prepass": ["phase_prepass.cu", "cuda_device.h"], "slime_refine": ["slime_refine.cpp", "png_writer.h"],
+    "perimeter_setup": ["perimeter_setup.cpp"], "afk_rescan": ["afk_rescan.cpp"], "geo_rank": ["geo_rank.cpp"],
+    "perimeter_gen/perimeter_gen": ["perimeter_gen/src/Perimeter.c", "perimeter_gen/src/main.c",
+                                    "perimeter_gen/src/util/Inputs.c", "perimeter_gen/slime_core_shim.cpp"],
+}
+
+
+def cmd_gui(o):
+    import slime_studio
+    return slime_studio.main(cli_module=sys.modules[__name__])
+
+
+def cmd_doctor(o):
+    import shutil
+    problems = []
+    win = os.name == "nt"
+    build = "powershell -ExecutionPolicy Bypass -File build.ps1" if win else "./build.sh"
+
+    def line(ok, what, detail, fix=None):
+        say("  %-5s %-24s %s" % ("ok" if ok else ("FIX" if fix else "info"), what, detail),
+            None if ok else ("red" if fix else "darkgray"))
+        if not ok and fix:
+            say("        -> " + fix, "yellow")
+            problems.append(what)
+
+    say("Checking your setup...", "cyan")
+    smi = shutil.which("nvidia-smi")
+    gpu = ""
+    if smi:
+        r = subprocess.run([smi, "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
+        gpu = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
+    line(bool(gpu), "NVIDIA GPU", gpu or "not found", "install the NVIDIA driver (Arch: nvidia-open or nvidia)")
+    nvcc = shutil.which("nvcc") or next((p for p in ["/opt/cuda/bin/nvcc", "/usr/local/cuda/bin/nvcc"] if os.path.exists(p)), None)
+    ver = ""
+    if nvcc:
+        m = re.search(r"release ([\d.]+)", subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout)
+        ver = m.group(1) if m else "?"
+    line(bool(nvcc), "CUDA toolkit (nvcc)", ver or "not found", "install the CUDA toolkit (Arch: sudo pacman -S cuda)")
+    cxx = shutil.which("g++") or shutil.which("cl")
+    line(bool(cxx), "C++ compiler", os.path.basename(cxx) if cxx else "not found",
+         "install gcc (Arch: sudo pacman -S gcc)" if not win else "install VS Build Tools (C++ workload)")
+    ps = ps_command()
+    line(bool(ps), "PowerShell", ps[0] if ps else "not found",
+         "PowerShell 7: unpack Microsoft's linux-x64 tarball into ~/.local/share and link pwsh into ~/.local/bin (LINUX.md)")
+    java = shutil.which("java")
+    line(bool(java), "Java (parity tests)", java or "not found - only ./vanilla_parity.py needs it")
+
+    say("\nThe tools:", "cyan")
+    built_ok = True
+    for name, srcs in TOOL_SOURCES.items():
+        exe = os.path.join(ROOT, name + (".exe" if win else ""))
+        if not os.path.exists(exe):
+            line(False, os.path.basename(name), "not built", build)
+            built_ok = False
+            continue
+        common = ["slime_core.h", "portable_paths.h"]
+        newest = max((os.path.getmtime(os.path.join(ROOT, s)) for s in srcs + common if os.path.exists(os.path.join(ROOT, s))), default=0)
+        stale = os.path.getmtime(exe) < newest
+        line(not stale, os.path.basename(name), "older than its source - rebuild" if stale else "built", build if stale else None)
+        built_ok &= not stale
+    if os.path.exists(tool("slime_gpu")):
+        rc, out = run_capture([tool("slime_gpu"), "--seed", "1", "--m-chunks", "1"], timeout=60)
+        txt = " ".join(out)
+        if any(l.startswith("Best:") for l in out):
+            line(True, "runs on this GPU", "yes")
+        elif "no kernel image" in txt:
+            line(False, "runs on this GPU", "built for a different GPU", build)
+        else:
+            line(False, "runs on this GPU", (out[-1] if out else "no output")[:70], build + "   (then ./slime doctor again)")
+    if os.path.exists(tool("slime_refine")):
+        rc, out = run_capture([tool("slime_refine"), "--self-test"], timeout=120)
+        line(any("SELF TEST PASSED" in l for l in out), "scoring self-test", "passed" if rc == 0 else "FAILED", build)
+    if o.full:
+        for t in ("hotspot_scan", "slime_gpu"):
+            if os.path.exists(tool(t)):
+                say("  running %s --self-test..." % t, "darkgray")
+                rc, out = run_capture([tool(t), "--self-test"], timeout=600)
+                line(any("SELF TEST PASSED" in l for l in out), "%s self-test" % t, "passed" if rc == 0 else "FAILED", build)
+
+    say("\nYour data:", "cyan")
+    farms = filed_farms()
+    line(True, "farms filed", "%d in main/records/" % len(farms))
+    line(True, "in-game readings", "%d in main/records/measured_in_game.csv" % len(measured_rows()))
+    bs = os.path.exists(os.path.join(ROOT, "main", "best_spots.csv"))
+    line(bs, "spot list", "main/best_spots.csv " + ("present" if bs else "missing - only ./slime search needs it"))
+
+    say()
+    if problems:
+        say("%d thing(s) to fix - do the -> lines above, then run ./slime doctor again." % len(problems), "red")
+        return 1
+    say("All good. Run ./slime for the menu." if built_ok else "All good.", "green")
+    return 0
+
+
+# ---- the menu -------------------------------------------------------------------------------
+def ask(label, default=None, conv=str, hint=""):
+    while True:
+        shown = (" [%s]" % default) if default not in (None, "") else ""
+        try:
+            s = input("  %s%s%s: " % (label, (" (" + hint + ")") if hint else "", shown)).strip()
+        except EOFError:
+            say()
+            raise SystemExit(0)
+        if not s and default not in (None, ""):
+            s = str(default)
+        if not s:
+            say("    an answer is needed here", "yellow")
+            continue
+        try:
+            return conv(s)
+        except (ValueError, argparse.ArgumentTypeError) as e:
+            say("    that doesn't work: %s" % (e or "try again"), "yellow")
+
+
+def ask_xz(label, default=None):
+    def conv(s):
+        p = re.split(r"[\s,]+", s.strip())
+        if len(p) != 2:
+            raise ValueError("type two numbers, x then z (like 3680 6989)")
+        return int(p[0]), int(p[1])
+    d = "%d %d" % default if default else None
+    return ask(label, d, conv, "x z")
+
+
+def menu():
+    while True:
+        p = load_prefs()
+        farm = p.get("farm") or {}
+        say()
+        say("slime - slime farm finder", "cyan")
+        if p.get("seed") is not None:
+            say("  remembered: seed %s%s" % (p["seed"], ("   farm %s,%s" % (farm["x"], farm["z"])) if farm else ""), "darkgray")
+        say("""
+  1  Find the best farm in my world          6  My best farms
+  2  Check one farm (score + best height)    7  I measured a farm in game
+  3  Build a farm in game (commands)         8  Stop everything
+  4  Hunt for a record                       9  Check my setup
+  5  Hunt progress so far                    0  Quit
+
+  g  Open the app (Slime Farm Studio): map, best spot, perimeter commands, build guide
+""")
+        c = ask("pick a number", None, str).strip()
+        if c in ("0", "q", "quit", "exit"):
+            return 0
+        argv = menu_args(c, p, farm)
+        if argv is None:
+            say("    pick one of the numbers above", "yellow")
+            continue
+        say("\nnext time you can type:  ./slime " + " ".join(shlex.quote(a) for a in argv), "darkgray")
+        say()
+        try:
+            main(argv)
+        except SystemExit:
+            pass
+        except KeyboardInterrupt:
+            say("\nstopped.", "yellow")
+        try:
+            if input("\nEnter for the menu, q to quit: ").strip().lower().startswith("q"):
+                return 0
+        except EOFError:
+            return 0
+
+
+def menu_args(c, p, farm):
+    seed_default = p.get("seed")
+    if c == "1":
+        seed = ask("your world seed", seed_default, seed_value, "number or text, /seed shows it")
+        x, z = ask_xz("search around", (0, 0))
+        return ["best-spot", "--seed", str(seed), "--x", str(x), "--z", str(z)]
+    if c in ("2", "3"):
+        seed = ask("world seed", farm.get("seed", seed_default), seed_value)
+        fx = (farm.get("best_x", farm.get("x")), farm.get("best_z", farm.get("z"))) if farm and farm.get("seed") == seed else None
+        x, z = ask_xz("farm AFK spot", fx if fx and None not in fx else None)
+        if c == "2":
+            return ["check", "--seed", str(seed), "--x", str(x), "--z", str(z)]
+        ver = ask("your Minecraft version", p.get("version", "1.21.11"), str, "like 1.21.11")
+        return ["perimeter", "--seed", str(seed), "--x", str(x), "--z", str(z), "--version", ver]
+    if c == "4":
+        kind = ask("1 normal hunt, or 2 exact phase search (needs main/best_spots.csv)", "1")
+        n = ask("how many cycles", 12, int)
+        return ["search", "--cycles", str(n)] if kind.strip() == "2" else ["hunt", "--cycles", str(n)]
+    if c == "5":
+        return ["status"]
+    if c == "6":
+        return ["farms"]
+    if c == "7":
+        seed = ask("world seed", farm.get("seed", seed_default), seed_value)
+        x, z = ask_xz("where you stood", None)
+        fy = ask("your feet y", -39, int)
+        n = ask("what /perimeterinfo said (spawning spaces)", None, int)
+        return ["measured", "--seed", str(seed), "--x", str(x), "--z", str(z), "--feet-y", str(fy), "--ingame", str(n)]
+    if c == "8":
+        return ["stop"]
+    if c == "9":
+        return ["doctor"]
+    if c.lower() == "g":
+        return ["gui"]
+    return None
+
+
+# ---- command line ------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(prog="slime", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--device", type=int, default=None, help="CUDA device index (default 0)")
+    sub = p.add_subparsers(dest="cmd")
+
+    def farm_args(s, required=True, xz_help="farm AFK spot, blocks"):
+        s.add_argument("--seed", type=seed_arg, required=True, help="world seed (number or text)")
+        s.add_argument("--x", type=int, required=required, help=xz_help)
+        s.add_argument("--z", type=int, required=required)
+
+    s = sub.add_parser("best-spot", help="best farm spot in your world")
+    s.add_argument("--seed", type=seed_arg, required=True, help="world seed (number or text)")
+    s.add_argument("--x", type=int, default=0, help="search centre, blocks (default spawn 0,0)")
+    s.add_argument("--z", type=int, default=0)
+    s.add_argument("--no-million", action="store_true", help="skip the 1M-block pass")
+
+    s = sub.add_parser("check", help="one farm: score, best standing height, what it means")
+    farm_args(s)
+    s.add_argument("--radius", type=int, default=6, help="chunks around x,z to look for the best spot (default 6)")
+    s.add_argument("--window", type=int, default=48, help="best AFK point searched within +-N blocks per height")
+    s.add_argument("--floor-y", type=int, default=-64, help="floor block Y (-64; 0 before 1.18)")
+
+    s = sub.add_parser("score", help="exact cq of one seed at one spot")
+    farm_args(s)
+    s.add_argument("--radius", type=int, default=6, help="chunks around x,z to search (default 6)")
+    s.add_argument("--family", default=None, help="output subfolder under main/scores/")
+    s.add_argument("--no-images", action="store_true")
+
+    s = sub.add_parser("y", help="every standing height at one farm")
+    farm_args(s)
+    s.add_argument("--window", type=int, default=48, help="best AFK point searched within +-N blocks")
+    s.add_argument("--floor-y", type=int, default=-64, help="floor block Y (-64; 0 before 1.18)")
+
+    s = sub.add_parser("perimeter", help="commands to build the farm floor in game")
+    farm_args(s)
+    s.add_argument("--version", default="1.21.11", help="your Minecraft version (default 1.21.11)")
+
+    s = sub.add_parser("verify", help="measurement-only rig (perimeter_setup); extra flags pass through")
+    farm_args(s)
+    s.add_argument("--version", default="1.21.11", help="your Minecraft version: gamerule/give syntax, floor height")
+
+    s = sub.add_parser("hunt", help="hunt for a record (record_cycle.ps1)")
+    s.add_argument("--cycles", type=int, default=12)
+    s.add_argument("--range", type=int, default=0, help="search window in blocks (default: the script's)")
+
+    s = sub.add_parser("search", help="exact phase search over a spot list")
+    s.add_argument("--spots", default="main/best_spots.csv")
+    s.add_argument("--cycles", type=int, default=10)
+    s.add_argument("--batch", type=int, default=10, help="spots per cycle")
+
+    sub.add_parser("status", help="hunt progress so far")
+    sub.add_parser("stop", help="stop every hunt process and check the GPU is idle")
+
+    s = sub.add_parser("farms", help="your best farms in one table")
+    s.add_argument("--top", type=int, default=15)
+    s.add_argument("--open", type=int, default=0, help="open farm #N's picture")
+
+    s = sub.add_parser("measured", help="save an in-game /perimeterinfo reading")
+    farm_args(s, xz_help="where you stood, blocks")
+    s.add_argument("--ingame", type=int, required=True, help="the spawning-spaces number /perimeterinfo showed")
+    s.add_argument("--feet-y", type=int, default=-39, help="your feet y when you measured (default -39)")
+    s.add_argument("--floor-y", type=int, default=-64)
+
+    sub.add_parser("gui", help="Slime Farm Studio: the app, full screen in this terminal (map, best spot, "
+                               "perimeter commands, build guide)")
+
+    s = sub.add_parser("doctor", help="check your setup, with the fix for anything wrong")
+    s.add_argument("--full", action="store_true", help="also run the GPU self-tests (~10 s)")
+
+    s = sub.add_parser("climb", help="GPU high-bit climb + exact refine of the top variants")
+    farm_args(s)
+    s.add_argument("--lo", type=int, default=24, help="lowest bit swept (default 24)")
+    s.add_argument("--bits", type=int, default=24, help="bits swept, 2^bits variants (default 24 -> 24..47)")
+    s.add_argument("--top", type=int, default=20, help="GPU candidates handed to refine (default 20)")
+    s.add_argument("--show", type=int, default=10)
+    s.add_argument("--radius", type=int, default=6)
+
+    s = sub.add_parser("dupes", help="seeds with the identical slime-chunk map")
+    farm_args(s, required=False, xz_help="with --z: also find near-duplicates at this spot")
+    s.add_argument("--count", type=int, default=0, help="write only the first N (default all)")
+    s.add_argument("--out", default=None, help="default main/dupes_<seed>.txt")
+    s.add_argument("--scan-top", type=int, default=256, help="GPU candidates checked for ties (default 256)")
+    s.add_argument("--radius", type=int, default=6)
+    return p
+
+
+COMMANDS = {"best-spot": cmd_best_spot, "check": cmd_check, "score": cmd_score, "y": cmd_y,
+            "perimeter": cmd_perimeter, "hunt": cmd_hunt, "search": cmd_search, "status": cmd_status,
+            "stop": cmd_stop, "farms": cmd_farms, "measured": cmd_measured, "doctor": cmd_doctor, "gui": cmd_gui,
+            "climb": cmd_climb, "dupes": cmd_dupes}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    p = build_parser()
+    o, extra = p.parse_known_args(argv)
+    if extra and o.cmd != "verify":
+        p.error("unrecognized arguments: " + " ".join(extra))
+    if o.device is not None:
+        os.environ["SLIME_DEVICE"] = str(o.device)
+    os.chdir(ROOT)
+    if not o.cmd:
+        return menu()
+    if o.cmd == "verify":
+        return cmd_verify(o, extra)
+    return COMMANDS[o.cmd](o)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        say("\nstopped.", "yellow")
+        sys.exit(130)

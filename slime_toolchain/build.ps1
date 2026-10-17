@@ -1,4 +1,4 @@
-# build.ps1 - all three, one folder, one slime_core.h
+# build.ps1 - every tool, one folder, one slime_core.h (build.sh is the Linux twin)
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
 
@@ -22,6 +22,8 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     Write-Host "cl.exe: $($cl.FullName)" -ForegroundColor DarkGray
 }
 Write-Host "building..." -ForegroundColor Cyan
+# the folders the scripts write into (data\DATA.txt, "FOLDER TREE") - some append to a log there without creating it
+New-Item -ItemType Directory -Force -Path main\logs, main\records, main\theory\heat, main\theory\prediction, main\work | Out-Null
 # --use_fast_math: safe here specifically because the hot paths (the LCG,
 # popcount) are integer/bitwise, not the transcendentals/div/sqrt approximations
 # this flag actually changes. Verified before adopting: self-tests pass exactly
@@ -36,6 +38,21 @@ nvcc -O3                slime_refine.cpp -o slime_refine.exe
 if ($LASTEXITCODE -ne 0) { Write-Host "slime_refine.cpp FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
 nvcc -O3                perimeter_setup.cpp -o perimeter_setup.exe
 if ($LASTEXITCODE -ne 0) { Write-Host "perimeter_setup.cpp FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
+nvcc -O3                afk_rescan.cpp -o afk_rescan.exe
+if ($LASTEXITCODE -ne 0) { Write-Host "afk_rescan.cpp FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
+nvcc -O3                geo_rank.cpp -o geo_rank.exe
+if ($LASTEXITCODE -ne 0) { Write-Host "geo_rank.cpp FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
+# phase_prepass: no --use_fast_math (its own header's build line)
+nvcc -O3 -arch=native   phase_prepass.cu -o phase_prepass.exe
+if ($LASTEXITCODE -ne 0) { Write-Host "phase_prepass.cu FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
+# perimeter_gen: the vendored Slime Chunk Perimeter Generator (C11), linked against slime_core.h
+# through a one-function shim so it shares the exact isSlimeChunk every other tool uses.
+New-Item -ItemType Directory -Force -Path main\work\build | Out-Null
+cl /nologo /O2 /std:c++17 /EHsc /c perimeter_gen\slime_core_shim.cpp /Fomain\work\build\slime_core_shim.obj
+if ($LASTEXITCODE -ne 0) { Write-Host "perimeter_gen FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
+cl /nologo /O2 /std:c11 /W3 /D_CRT_SECURE_NO_WARNINGS /DSLIME_CORE_SHIM /Fomain\work\build\ /Feperimeter_gen\perimeter_gen.exe `
+    perimeter_gen\src\main.c perimeter_gen\src\Perimeter.c perimeter_gen\src\util\Inputs.c main\work\build\slime_core_shim.obj
+if ($LASTEXITCODE -ne 0) { Write-Host "perimeter_gen FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
 Write-Host "`nself-tests (all three must pass)" -ForegroundColor Cyan
 .\hotspot_scan.exe --self-test; if ($LASTEXITCODE -ne 0) { Write-Host "hotspot_scan FAILED" -ForegroundColor Red; exit 1 }
 .\slime_gpu.exe    --self-test; if ($LASTEXITCODE -ne 0) { Write-Host "slime_gpu FAILED"    -ForegroundColor Red; exit 1 }
@@ -61,13 +78,11 @@ Write-Host " SEEDS (not just locations) for a spot where the most slime chunks f
 Write-Host " the 24-128 block spawning ring around one AFK point, and scores it as " -NoNewline
 Write-Host "cq" -ForegroundColor $w -NoNewline
 Write-Host " ="
-Write-Host " eligible spawn blocks / 256. Current record: " -NoNewline
-Write-Host "66.04 cq" -ForegroundColor $y -NoNewline
-Write-Host ", verified in game at " -NoNewline
-Write-Host "17,112 spawning spaces" -ForegroundColor $y -NoNewline
-Write-Host "."
-Write-Host " A 66.21 cq result exists too, but measured WORSE in game - records rank by"
-Write-Host " the in-game count, not the model number. Beating 66.04 is the goal."
+Write-Host " eligible spawn blocks / 256. Best measured in game so far: " -NoNewline
+Write-Host "20,506 spawning spaces" -ForegroundColor $y -NoNewline
+Write-Host ", " -NoNewline
+Write-Host "76.23 cq" -ForegroundColor $y
+Write-Host " (feet at y -39). Ranking is by the in-game number, not the model's."
 Write-Host ""
 Write-Host " THE FOUR TOOLS" -ForegroundColor $c
 Write-Host "   hotspot_scan     WHERE to hunt - picks promising spots, derives a seed mask"
@@ -86,6 +101,10 @@ Write-Host "   * Build an in-game rig to verify any result against Minecraft its
 Write-Host "   * Get PNG maps + text reports of every good find, filed automatically"
 Write-Host ""
 Write-Host " START HERE" -ForegroundColor $c
+Write-Host "   python slime gui" -ForegroundColor $w
+Write-Host "       the app, right in this terminal: map, best spot, perimeter commands, build guide"
+Write-Host "   python slime" -ForegroundColor $w
+Write-Host "       a numbered menu of the same jobs (HOW_TO_USE.txt); python slime doctor checks your setup"
 Write-Host "   powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Status" -ForegroundColor $w
 Write-Host "       progress so far - runs nothing, safe to start with"
 Write-Host "   powershell -ExecutionPolicy Bypass -File record_cycle.ps1 -Repeat 12" -ForegroundColor $w
@@ -97,31 +116,9 @@ Write-Host " DOCS" -ForegroundColor $c
 Write-Host "   FEATURES.txt            capability checklist, shortest read"
 Write-Host "   STEP_BY_STEP_GUIDE.txt  concepts, easiest to hardest"
 Write-Host "   README.txt              full command reference"
-Write-Host "   AI_CONTEXT.md           everything, dense - the one file to hand an AI"
+Write-Host "   AI_CONTEXT.md           start here: the hunt, its numbers, known answers"
+Write-Host "   docs\                   the detail (docs\REFERENCE.md: the older full reference)"
 Write-Host ""
-Write-Host "------------------------------------------------------------------------------" -ForegroundColor $y
-Write-Host " TWO WAYS TO USE THIS" -ForegroundColor $y
-Write-Host ""
-Write-Host " 1. STANDALONE - it is fully self-contained." -ForegroundColor $w
-Write-Host "    Every capability above is reachable from the commands in README.txt. No"    -ForegroundColor $g
-Write-Host "    AI, no account, no internet needed - just build it and run the commands."   -ForegroundColor $g
-Write-Host "    The docs are written to be sufficient on their own."                        -ForegroundColor $g
-Write-Host ""
-Write-Host " 2. WITH CLAUDE (or any AI assistant) - much easier, and recommended." -ForegroundColor $w
-Write-Host "    Point it at this folder and ask in plain English. It reads every source"    -ForegroundColor $g
-Write-Host "    file and doc here and answers immediately, including things written down"   -ForegroundColor $g
-Write-Host "    nowhere. It can also DO the work: run hunts, score a seed you paste in,"    -ForegroundColor $g
-Write-Host "    find the best spot near spawn, generate the in-game commands, explain any"  -ForegroundColor $g
-Write-Host "    number it produced, retune for your GPU, or add features outright."         -ForegroundColor $g
-Write-Host ""
-Write-Host "    The difference is real: standalone means finding the right flag across"     -ForegroundColor $g
-Write-Host "    four documents and four tools, then reading the output yourself. With an"   -ForegroundColor $g
-Write-Host "    assistant you say what you want and it handles the flags, chains the"       -ForegroundColor $g
-Write-Host "    tools, and tells you what the numbers mean. This whole project was built"   -ForegroundColor $g
-Write-Host "    that way."                                                                  -ForegroundColor $g
-Write-Host ""
-Write-Host "    Try: " -NoNewline -ForegroundColor $g
-Write-Host "`"read AI_CONTEXT.md, then hunt for a record`"" -ForegroundColor $w
 Write-Host "------------------------------------------------------------------------------" -ForegroundColor $y
 Write-Host ""
 Write-Host " NEXT: BENCHMARK THIS MACHINE" -ForegroundColor $c
@@ -134,6 +131,6 @@ Write-Host "   times) was measured on one specific GPU. The bench prints what YO
 Write-Host "   actually does. Once you have those numbers, re-tuning the defaults to match" -ForegroundColor $g
 Write-Host "   is " -NoNewline -ForegroundColor $g
 Write-Host "recommended" -NoNewline -ForegroundColor $y
-Write-Host " - ask an assistant to do it, or see the CURRENT TUNING section" -ForegroundColor $g
-Write-Host "   in AI_CONTEXT.md to do it by hand." -ForegroundColor $g
+Write-Host " - see the CURRENT TUNING section" -ForegroundColor $g
+Write-Host "   in docs\REFERENCE.md to do it by hand." -ForegroundColor $g
 Write-Host "------------------------------------------------------------------------------" -ForegroundColor $y
