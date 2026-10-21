@@ -12,6 +12,9 @@ import sys
 # the toolchain folder; for SlimeByte.exe (PyInstaller) that's where the .exe is, not where it unpacks itself
 ROOT = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
+# where the app keeps what it makes (prefs, saved searches, perimeter files, scores). Next to the tools by default;
+# SLIMEBYTE_DATA moves it, which is what a package manager needs: its install folder is replaced on every upgrade.
+DATA = os.environ.get("SLIMEBYTE_DATA") or os.path.join(ROOT, "main")
 
 
 def tool(name):
@@ -90,7 +93,7 @@ def run_capture(args, timeout=None):
 
 
 # ---- remembered answers for ./slime's menu (a convenience only) --------------------------
-PREFS = os.path.join(ROOT, "main", "slime_prefs.json")
+PREFS = os.path.join(DATA, "slime_prefs.json")
 
 
 def load_prefs():

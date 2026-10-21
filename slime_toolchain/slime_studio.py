@@ -36,12 +36,12 @@ import unicodedata
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from slime_common import (PERIMETER_BANDS, ROOT, ToolError, floor_block, load_prefs, perimeter_band,  # noqa: E402
+from slime_common import (DATA, PERIMETER_BANDS, ROOT, ToolError, floor_block, load_prefs, perimeter_band,  # noqa: E402
                           require_tools, run_perimeter_gen, save_prefs, slime_row, tool)
 
-PERIMETERS = os.path.join(ROOT, "main", "perimeters")
-RESULTS = os.path.join(ROOT, "main", "studio_results.json")   # every finished search, so it never runs twice
-TILES = os.path.join(ROOT, "main", "studio_tiles")            # each GPU tile's answer, per seed: a stopped scan resumes
+PERIMETERS = os.path.join(DATA, "perimeters")
+RESULTS = os.path.join(DATA, "studio_results.json")   # every finished search, so it never runs twice
+TILES = os.path.join(DATA, "studio_tiles")            # each GPU tile's answer, per seed: a stopped scan resumes
 TILE_M = 16000                 # slime_gpu --m-chunks caps here (+-256,000 blocks per call)
 EDGE = 1874000 - 8             # slime_gpu: |centre chunk| + m-chunks + 8 <= 1,874,000
 WORLD_RANGE = 29_983_000       # the whole world, to within ~16k blocks of the border (slime_gpu's edge)
@@ -1131,6 +1131,11 @@ class App:
         self.drag, self.hover, self.mapgeo = None, None, None
         self.minecraft = False
         self.missing = [n for n in ("slime_gpu", "slime_refine", "afk_rescan") if not os.path.exists(tool(n))]
+        # only the GPU tool missing, the rest built: a CPU-only install (macOS, no NVIDIA card) - not an unbuilt tree
+        self.no_gpu = self.missing == ["slime_gpu"]
+        if self.no_gpu:
+            self.missing = []
+            self.mode = "manual"
         if not os.path.exists(os.path.join(ROOT, "perimeter_gen", "perimeter_gen" + (".exe" if os.name == "nt" else ""))):
             self.missing.append("perimeter_gen")
         self.chunks, self.map_cache, self.floor_cache = {}, (None, None), (None, None)
@@ -1226,6 +1231,9 @@ class App:
         key = search_key(self.seed, self.mode, rng, x, z)
         if key in self.results:                            # searched before: the same answer, now
             return self.on_result(dict(self.results[key]["res"]), self.results[key]["secs"], saved=True)
+        if self.no_gpu:
+            return self.set_status("Best AFK and Cluster search run on an NVIDIA GPU (CUDA), which this install doesn't "
+                                   "have. Use Manual: type or click a spot, and Score it.", "err")
         miss = [t for t in ("slime_gpu", "slime_refine") if t in self.missing]
         if miss:
             return self.set_status("%s not built - run %s first" % (", ".join(miss), self.build_cmd()), "err")
@@ -1915,6 +1923,9 @@ class App:
 
     def warnings(self):
         out = []
+        if self.no_gpu:
+            out.append("No NVIDIA GPU here, so Best AFK and Cluster search are off. Manual scoring, the map and the "
+                       "perimeter commands all work.")
         if self.missing:
             out.append("Not built yet: %s. Run %s, then open this again." % (", ".join(self.missing), self.build_cmd()))
         if self.minecraft:

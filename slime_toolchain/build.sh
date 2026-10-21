@@ -6,6 +6,10 @@
 #
 #   ./build.sh            build + self-tests + orientation banner
 #   ./build.sh --no-test  build only
+#   ./build.sh --cpu-only just the tools that need no GPU (slime_refine, perimeter_setup, afk_rescan, geo_rank,
+#                         perimeter_gen). This is also what happens, with a note, when there's no nvcc: macOS
+#                         and any machine without an NVIDIA GPU. The app then does Manual scoring, the map and
+#                         the perimeter commands; Best AFK / Cluster search needs the GPU build.
 #
 # Environment overrides:
 #   NVCC=/path/to/nvcc     default: nvcc on PATH, else /opt/cuda/bin/nvcc,
@@ -16,7 +20,8 @@
 #                          whose GPU is not the one the binaries will run on)
 #   CXX=clang++            compiler for the two CPU-only tools (default g++)
 set -euo pipefail
-cd "$(dirname "$(readlink -f "$0")")"
+here="$0"; [[ -L "$here" ]] && here="$(readlink "$here")"       # no readlink -f: older macOS doesn't have it
+cd "$(dirname "$here")"
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 cyan() { printf '\033[36m%s\033[0m\n' "$*"; }
@@ -24,7 +29,13 @@ grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
 dim()  { printf '\033[90m%s\033[0m\n' "$*"; }
 
 RUN_TESTS=1
-[[ "${1:-}" == "--no-test" ]] && RUN_TESTS=0
+CPU_ONLY=0
+for a in "$@"; do
+    case "$a" in
+        --no-test) RUN_TESTS=0 ;;
+        --cpu-only) CPU_ONLY=1 ;;
+    esac
+done
 
 NVCC="${NVCC:-}"
 if [[ -z "$NVCC" ]]; then
@@ -32,12 +43,12 @@ if [[ -z "$NVCC" ]]; then
         [[ -n "$c" && -x "$c" ]] && { NVCC="$c"; break; }
     done
 fi
-if [[ -z "$NVCC" ]]; then
-    red "nvcc not found - install the CUDA toolkit (Arch: sudo pacman -S cuda)"
-    red "or point NVCC= at it."
-    exit 1
+if (( ! CPU_ONLY )) && [[ -z "$NVCC" ]]; then
+    printf '\033[33m%s\033[0m\n' "nvcc not found - building the CPU tools only (no GPU search)."
+    dim "For the GPU search install the CUDA toolkit (Arch: sudo pacman -S cuda), or point NVCC= at it, then run ./build.sh again."
+    CPU_ONLY=1
 fi
-dim "nvcc: $NVCC ($("$NVCC" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p'))"
+(( CPU_ONLY )) || dim "nvcc: $NVCC ($("$NVCC" --version | sed -n 's/.*release \([0-9.]*\).*/\1/p'))"
 
 CXX="${CXX:-g++}"
 command -v "$CXX" >/dev/null || { red "$CXX not found - install a C++ compiler"; exit 1; }
@@ -49,16 +60,18 @@ if [[ -n "${CUDA_ARCH:-}" ]]; then NVFLAGS+=(-arch="$CUDA_ARCH"); else NVFLAGS+=
 # Delete first. The Windows build learned this the hard way: if a compile
 # fails and the old binary survives, the self-tests below "pass" against it
 # and prove nothing about the source just edited.
-TOOLS=(hotspot_scan slime_gpu slime_refine perimeter_setup afk_rescan geo_rank phase_prepass)
-for t in "${TOOLS[@]}"; do rm -f "$t" "$t.exe"; done
+ALL_TOOLS=(hotspot_scan slime_gpu slime_refine perimeter_setup afk_rescan geo_rank phase_prepass)
+TOOLS=(slime_refine perimeter_setup afk_rescan geo_rank)
+(( CPU_ONLY )) || TOOLS=("${ALL_TOOLS[@]}")
+for t in "${ALL_TOOLS[@]}"; do rm -f "$t" "$t.exe"; done
 rm -f perimeter_gen/perimeter_gen
 
 cyan "building..."
 # --use_fast_math: safe here specifically because the hot paths (the LCG,
 # popcount) are integer/bitwise - see build.ps1 for the measurement.
 build() { local name="$1"; shift; if ! "$@"; then red "$name FAILED TO COMPILE"; exit 1; fi; }
-build hotspot_scan.cu    "$NVCC" "${NVFLAGS[@]}" hotspot_scan.cu -o hotspot_scan
-build slime_gpu.cu       "$NVCC" "${NVFLAGS[@]}" slime_gpu.cu    -o slime_gpu
+(( CPU_ONLY )) || build hotspot_scan.cu    "$NVCC" "${NVFLAGS[@]}" hotspot_scan.cu -o hotspot_scan
+(( CPU_ONLY )) || build slime_gpu.cu       "$NVCC" "${NVFLAGS[@]}" slime_gpu.cu    -o slime_gpu
 build slime_refine.cpp   "$CXX" -O3 -std=c++17 -pthread slime_refine.cpp    -o slime_refine
 build perimeter_setup.cpp "$CXX" -O3 -std=c++17         perimeter_setup.cpp -o perimeter_setup
 build afk_rescan.cpp     "$CXX" -O3 -std=c++17         afk_rescan.cpp   -o afk_rescan
@@ -67,7 +80,7 @@ build geo_rank.cpp       "$CXX" -O3 -std=c++17 -pthread geo_rank.cpp     -o geo_
 PPFLAGS=(-O3 -std=c++17)
 if [[ -n "${CUDA_ARCH:-}" ]]; then PPFLAGS+=(-arch="$CUDA_ARCH"); else PPFLAGS+=(-arch=native); fi
 [[ -n "${NVCC_CCBIN:-}" ]] && PPFLAGS+=(-ccbin "$NVCC_CCBIN")
-build phase_prepass.cu   "$NVCC" "${PPFLAGS[@]}" phase_prepass.cu -o phase_prepass
+(( CPU_ONLY )) || build phase_prepass.cu   "$NVCC" "${PPFLAGS[@]}" phase_prepass.cu -o phase_prepass
 # The .ps1 scripts call every tool as <name>.exe (one set of scripts for Windows and Linux):
 # give each Linux binary that name too.
 for t in "${TOOLS[@]}"; do ln -sf "$t" "$t.exe"; done
@@ -84,14 +97,29 @@ build perimeter_gen "$CC" -O2 -std=c11 -DSLIME_CORE_SHIM perimeter_gen/src/main.
 
 if (( RUN_TESTS )); then
     echo
-    cyan "self-tests (all three must pass)"
-    ./hotspot_scan --self-test || { red "hotspot_scan FAILED"; exit 1; }
-    ./slime_gpu    --self-test || { red "slime_gpu FAILED";    exit 1; }
-    ./slime_refine --self-test || { red "slime_refine FAILED"; exit 1; }
-    echo
-    grn "All three self-tests passed."
+    if (( CPU_ONLY )); then
+        cyan "self-test"
+        ./slime_refine --self-test || { red "slime_refine FAILED"; exit 1; }
+        echo
+        grn "slime_refine self-test passed (CPU-only build: no GPU tools)."
+    else
+        cyan "self-tests (all three must pass)"
+        ./hotspot_scan --self-test || { red "hotspot_scan FAILED"; exit 1; }
+        ./slime_gpu    --self-test || { red "slime_gpu FAILED";    exit 1; }
+        ./slime_refine --self-test || { red "slime_refine FAILED"; exit 1; }
+        echo
+        grn "All three self-tests passed."
+    fi
     dim "perimeter_setup built (no --self-test - it only formats commands from the"
     dim "already-validated isSlimeChunk; the only ground truth is Minecraft itself)."
+fi
+
+if (( CPU_ONLY )); then
+    echo
+    cyan "CPU-only build done: slime_refine, perimeter_setup, afk_rescan, geo_rank, perimeter_gen."
+    dim "Run ./slime gui (or slimebyte). Best AFK / Cluster search needs an NVIDIA GPU + CUDA (then ./build.sh again);"
+    dim "Manual scoring, the map and the perimeter commands work as they are."
+    exit 0
 fi
 
 cat <<'EOF'

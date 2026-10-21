@@ -32,12 +32,12 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from slime_common import (PERIMETER_BANDS, ROOT, die, load_prefs, num, perimeter_band,  # noqa: E402
+from slime_common import (DATA, PERIMETER_BANDS, ROOT, die, load_prefs, num, perimeter_band,  # noqa: E402
                           ps_command, read_csv, require_tools, run_capture, run_perimeter_gen,
                           save_prefs, say, tool, write_text)
 
-WORK = os.path.join(ROOT, "main", "work")
-RECORDS = os.path.join(ROOT, "main", "records")
+WORK = os.path.join(DATA, "work")
+RECORDS = os.path.join(DATA, "records")
 MASK48 = (1 << 48) - 1
 
 
@@ -335,7 +335,7 @@ def cmd_dupes(o):
         die("--x and --z go together")
 
     total = len(layouts) << 16
-    out = o.out or os.path.join(ROOT, "main", "dupes_%d.txt" % o.seed)
+    out = o.out or os.path.join(DATA, "dupes_%d.txt" % o.seed)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     limit = o.count if o.count else total
     n = 0
@@ -368,7 +368,7 @@ def cmd_perimeter(o):
     if band is None:
         die("--version %s: the perimeter generator supports 1.13 and later (e.g. 1.21.11, 26.1.2)" % o.version)
     try:
-        path, out = run_perimeter_gen(o.seed, o.x, o.z, band, os.path.join(ROOT, "main", "perimeters"))
+        path, out = run_perimeter_gen(o.seed, o.x, o.z, band, os.path.join(DATA, "perimeters"))
     except RuntimeError as e:
         die(str(e))
     save_prefs(seed=o.seed, version=o.version)
@@ -452,7 +452,7 @@ def cmd_farms(o):
     if not farms:
         say("No farms filed yet. Hunts file every good farm into main/records/ - start one with ./slime hunt.", "yellow")
         return 0
-    ys = {(r["Seed"], r["X"], r["Z"]): r for r in read_csv(os.path.join(ROOT, "main", "y_phase.csv"))}
+    ys = {(r["Seed"], r["X"], r["Z"]): r for r in read_csv(os.path.join(DATA, "y_phase.csv"))}
     meas = measured_rows()
     for f in farms:
         y = ys.get((f["seed"], str(f["x"]), str(f["z"])))
@@ -667,7 +667,7 @@ def cmd_doctor(o):
     farms = filed_farms()
     line(True, "farms filed", "%d in main/records/" % len(farms))
     line(True, "in-game readings", "%d in main/records/measured_in_game.csv" % len(measured_rows()))
-    bs = os.path.exists(os.path.join(ROOT, "main", "best_spots.csv"))
+    bs = os.path.exists(os.path.join(DATA, "best_spots.csv"))
     line(bs, "spot list", "main/best_spots.csv " + ("present" if bs else "missing - only ./slime search needs it"))
 
     say()
