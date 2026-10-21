@@ -88,7 +88,7 @@ export CXX="${CXX:-$(command -v g++ || command -v clang++)}"
 export CC="${CC:-$(command -v gcc || command -v clang || command -v cc)}"
 flags=(--no-test)
 [[ -n "${SLIMEBYTE_CPU_ONLY:-}" ]] && flags+=(--cpu-only)
-cyan "building (the GPU tools take a minute or two)"
+cyan "building (the GPU tools take a minute or two; the CPU ones are quick)"
 if ! ./build.sh "${flags[@]}"; then
     if [[ -z "${SLIMEBYTE_CPU_ONLY:-}" ]]; then
         red "the GPU build failed (often a CUDA / g++ version mismatch: see LINUX.md, NVCC_CCBIN)."
