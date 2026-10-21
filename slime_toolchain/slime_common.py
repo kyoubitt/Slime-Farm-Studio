@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 
-# the toolchain folder; for SlimeFarmStudio.exe (PyInstaller) that's where the .exe is, not where it unpacks itself
+# the toolchain folder; for SlimeByte.exe (PyInstaller) that's where the .exe is, not where it unpacks itself
 ROOT = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 EXE = ".exe" if os.name == "nt" else ""
 
@@ -139,21 +139,47 @@ def _i32(v):
     return ((v + 0x80000000) & 0xFFFFFFFF) - 0x80000000
 
 
+_XOR = 0x3ad8025f ^ 0x5DEECE66D      # the slime salt, then Random's own scramble
+_XTERMS = {}
+
+
+def _xterms(cx0, n):
+    """(int)(x*x*0x4c1906) + (int)(x*0x5ac0db) for x = cx0 .. cx0+n-1: the half of the seed mix that doesn't
+    depend on the row, so a map works it out once and reuses it for every row."""
+    k = (cx0, n)
+    t = _XTERMS.get(k)
+    if t is None:
+        if len(_XTERMS) > 64:
+            _XTERMS.clear()
+        t = _XTERMS[k] = [_i32(x * x * 0x4c1906) + _i32(x * 0x5ac0db) for x in range(cx0, cx0 + n)]
+    return t
+
+
+def _next_int10(s):
+    """Random.nextInt(10) from scrambled state s, rejection loop and all."""
+    while True:
+        s = (s * 0x5DEECE66D + 0xB) & _M48
+        bits = s >> 17
+        val = bits % 10
+        if bits - val + 9 < 0x80000000:           # Java's int-overflow rejection
+            return val
+
+
 def slime_row(seed, cx0, cz, n):
     """bytearray of n flags: is chunk (cx0 + i, cz) a slime chunk. Java's int-overflow terms exactly:
-    (int)(x*x*0x4c1906) + (int)(x*0x5ac0db) + (long)(int)(z*z)*0x4307a7 + (int)(z*0x5f24f)."""
+    (int)(x*x*0x4c1906) + (int)(x*0x5ac0db) + (long)(int)(z*z)*0x4307a7 + (int)(z*0x5f24f).
+    nextInt(10) only rejects a first draw of 2,147,483,640 or more (bits - bits % 10 + 9 overflows an int),
+    about 1 chunk in 270 million, so the common case is one step and the loop runs only for those."""
     base = seed + _i32(cz * cz) * 0x4307a7 + _i32(cz * 0x5f24f)
     out = bytearray(n)
-    for i in range(n):
-        x = cx0 + i
-        s = ((base + _i32(x * x * 0x4c1906) + _i32(x * 0x5ac0db)) ^ 0x3ad8025f ^ 0x5DEECE66D) & _M48
-        while True:                                   # Random.nextInt(10)
-            s = (s * 0x5DEECE66D + 0xB) & _M48
-            bits = s >> 17
-            val = bits % 10
-            if bits - val + 9 < 0x80000000:           # Java's int-overflow rejection
-                break
-        out[i] = val == 0
+    for i, xt in enumerate(_xterms(cx0, n)):
+        s = ((base + xt) ^ _XOR) & _M48
+        bits = ((s * 0x5DEECE66D + 0xB) & _M48) >> 17
+        if bits < 2147483640:
+            if not bits % 10:
+                out[i] = 1
+        elif _next_int10(s) == 0:
+            out[i] = 1
     return out
 
 

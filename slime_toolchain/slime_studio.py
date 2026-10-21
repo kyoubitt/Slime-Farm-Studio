@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""slime_studio.py - Slime Farm Studio: the toolchain as a full-screen app in your terminal.
+"""slime_studio.py - SlimeByte: the toolchain as a full-screen app in your terminal.
 
   ./slime gui                 (Windows: python slime gui)
 
@@ -22,6 +22,7 @@ the old Windows console) it's drawn with characters. Standard library only: noth
 import base64
 import codecs
 import io
+import json
 import math
 import os
 import queue
@@ -39,6 +40,8 @@ from slime_common import (PERIMETER_BANDS, ROOT, ToolError, floor_block, load_pr
                           require_tools, run_perimeter_gen, save_prefs, slime_row, tool)
 
 PERIMETERS = os.path.join(ROOT, "main", "perimeters")
+RESULTS = os.path.join(ROOT, "main", "studio_results.json")   # every finished search, so it never runs twice
+TILES = os.path.join(ROOT, "main", "studio_tiles")            # each GPU tile's answer, per seed: a stopped scan resumes
 TILE_M = 16000                 # slime_gpu --m-chunks caps here (+-256,000 blocks per call)
 EDGE = 1874000 - 8             # slime_gpu: |centre chunk| + m-chunks + 8 <= 1,874,000
 WORLD_RANGE = 29_983_000       # the whole world, to within ~16k blocks of the border (slime_gpu's edge)
@@ -50,20 +53,50 @@ WORLD = 30_000_000
 
 # ---- colours: the RedenMC slime farm generator's ----------------------------------------------------------------
 # A calm, light tool: a sage-white page, white cards with a title bar, deep-green text, one forest-green accent,
-# and a dark green map. Values from its own stylesheet and map code.
-PAGE, CARD_BG, PANEL2, LINE = 0xf1f3ee, 0xffffff, 0xe9eee6, 0xd5dcd2
-TEXT, MUTED = 0x26352b, 0x5f6d62
-GREEN, GREEN_DARK, WHITE = 0x32623c, 0x244e2d, 0xffffff         # the accent: main buttons, the tab you're on, focus
-VIOLET, AMBER, DANGER = 0x655080, 0x805716, 0xa93232
-EDGE, BTN_EDGE, BTN_HOVER = 0xb5c0b2, 0xb7c3b2, 0xedf3e8
-PICK_BG, PICK_EDGE = 0xeaf2e4, 0x91ac84                         # the chosen row of a choice
-NOTE_BG, NOTE_TEXT, NOTE_EDGE = 0xf1f4ed, 0x4d6051, 0xd7e0d0
-WARN_BG, WARN_TEXT, WARN_EDGE = 0xfaf4e5, 0x79531a, 0xe5d6af
-ERR_BG, ERR_TEXT, ERR_EDGE = 0xfff0eb, 0x9a302d, 0xe1b7af
-STAT_BG, STAT_EDGE, STAT_LABEL, STAT_ACCENT = 0xe5ecdf, 0xccd8c4, 0x56674f, 0x294f31
-COORD_BG, COORD_EDGE, COORD_TEXT = 0xf2f5ee, 0xd5dfce, 0x295b35
-TRACK, TOAST_BG = 0xe0e7da, 0x294d33
+# and a dark green map. Values from its own stylesheet and map code. Dark is the same page at night: deep
+# green-black cards around the map's own green, the accent lifted so it still reads, dark text on it.
+THEMES = {
+    "light": dict(
+        PAGE=0xf1f3ee, CARD_BG=0xffffff, PANEL2=0xe9eee6, LINE=0xd5dcd2,
+        TEXT=0x26352b, MUTED=0x5f6d62,
+        GREEN=0x32623c, GREEN_DARK=0x244e2d, ON_GREEN=0xffffff,   # the accent: main buttons, the tab you're on, focus
+        VIOLET=0x655080, AMBER=0x805716, DANGER=0xa93232,
+        FIELD_EDGE=0xb5c0b2, BTN_EDGE=0xb7c3b2, BTN_HOVER=0xedf3e8,
+        PICK_BG=0xeaf2e4, PICK_EDGE=0x91ac84,                    # the chosen row of a choice
+        NOTE_BG=0xf1f4ed, NOTE_TEXT=0x4d6051, NOTE_EDGE=0xd7e0d0,
+        WARN_BG=0xfaf4e5, WARN_TEXT=0x79531a, WARN_EDGE=0xe5d6af,
+        ERR_BG=0xfff0eb, ERR_TEXT=0x9a302d, ERR_EDGE=0xe1b7af,
+        STAT_BG=0xe5ecdf, STAT_EDGE=0xccd8c4, STAT_LABEL=0x56674f, STAT_ACCENT=0x294f31,
+        COORD_BG=0xf2f5ee, COORD_EDGE=0xd5dfce, COORD_TEXT=0x295b35,
+        TRACK=0xe0e7da, TOAST_BG=0x294d33, TOAST_TEXT=0xffffff),
+    "dark": dict(
+        PAGE=0x0f1712, CARD_BG=0x16201a, PANEL2=0x1c2821, LINE=0x2a3830,
+        TEXT=0xdbe5dd, MUTED=0x91a295,
+        GREEN=0x5c9f6e, GREEN_DARK=0x7cc08f, ON_GREEN=0x0c1710,   # lighter with focus here, not darker
+        VIOLET=0xb4a2dc, AMBER=0xe2b46a, DANGER=0xee7d70,
+        FIELD_EDGE=0x3b4c41, BTN_EDGE=0x3d4f43, BTN_HOVER=0x213027,
+        PICK_BG=0x1f3626, PICK_EDGE=0x4f8a5f,
+        NOTE_BG=0x1a261f, NOTE_TEXT=0xb2c3b5, NOTE_EDGE=0x2d3f34,
+        WARN_BG=0x2a2417, WARN_TEXT=0xe8c47c, WARN_EDGE=0x584a27,
+        ERR_BG=0x2e1b19, ERR_TEXT=0xf29d91, ERR_EDGE=0x69342e,
+        STAT_BG=0x1b2921, STAT_EDGE=0x2e4136, STAT_LABEL=0x91a295, STAT_ACCENT=0x9dd8ad,
+        COORD_BG=0x1a261f, COORD_EDGE=0x2e4136, COORD_TEXT=0x92d2a3,
+        TRACK=0x26342c, TOAST_BG=0x22392b, TOAST_TEXT=0xa9dcb5),
+}
+THEME = "light"
+
+
+def apply_theme(name):
+    """Swap the page's colours (the map keeps its own, dark in both). Every colour is read when it's drawn."""
+    global THEME, BG
+    THEME = name if name in THEMES else "light"
+    globals().update(THEMES[THEME])
+    BG = PAGE
+
+
+apply_theme("light")
 # the map: dark green, teal slime chunks, a violet 128 circle, a dashed amber 24 one, the AFK spot a pale-yellow cross
+WHITE = 0xffffff
 MAP_BG, SLIME, SLIME_LABEL, GRID = 0x17251f, 0x397e70, 0xa7dece, 0x24363a
 RING128, RING24, FLOOR_SQ, SEARCH_SQ, MARK = 0xa594ee, 0xffd68e, 0x88adc5, 0x5db8ac, 0xffe2a0
 INFO_BG, INFO_EDGE, INFO_TEXT, AXIS = 0x1c3028, 0x52665b, 0xd5e2d8, 0x9aaec8
@@ -72,7 +105,6 @@ SLIME_DIM = 0x19322f                                            # slime chunks u
 GLASS = 0x3b5c70                                                # their glass at 220/255 over the map, flat
 GRID_FINE, GRID_COARSE, GRID_BLOCK = (0x9fbad4, 0x25 / 255), (0x527092, 0x30 / 255), (0xa2b4da, 0x18 / 255)
 COMPASS = 0xb9cae0
-BG = PAGE
 CLEAR = -1                       # a cell left on the terminal's own background: where the map picture shows through
 
 SECTIONS = [(0, "Seed", None), (1, "Teleport", None), (2, "Clear the area", "WorldEdit"), (3, "Slime floor", None),
@@ -97,10 +129,24 @@ MODE_NOTE = {
 HELP = [("Keys", None), ("tab, shift+tab, up, down", "move between controls"), ("enter, space", "press or choose"),
         ("left, right", "change a choice: search type, range, version"), ("1  2  3", "switch tabs"),
         ("f", "find or score"), ("g", "generate the commands"), ("u", "build the perimeter at the AFK spot"),
-        ("c", "back to the farm on the map"), ("+  -", "zoom the map"), ("esc", "stop a search, close this"),
+        ("c", "back to the farm on the map"), ("+  -", "zoom the map"), ("t", "light or dark colours"),
+        ("esc", "stop a search, close this"),
         ("q, ctrl+c", "quit"), ("", None), ("Mouse", None), ("click", "press; on the map in Manual, place the AFK spot"),
         ("scroll", "zoom the map, scroll a column"), ("drag", "move the map")]
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# the game-version menu, newest first: (band, what the box says, the releases it covers). Bands 0-3 are what
+# perimeter_gen writes commands for; OLD is the one it can't (before 1.13 the commands differ), where the map,
+# search and AFK scoring still work - the version never changes the slime chunks.
+OLD = len(PERIMETER_BANDS)
+VERSIONS = [(3, "1.21.11 and newer", "1.21.11, 26.1 and later"),
+            (2, "1.20.5 - 1.21.10", "1.20.5, 1.20.6, 1.21 - 1.21.10"),
+            (1, "1.18 - 1.20.4", "1.18, 1.19, 1.20 - 1.20.4"),
+            (0, "1.13 - 1.17", "1.13, 1.14 ... 1.17"),
+            (OLD, "1.12 and older", "map and search only")]
+
+
+def band_name(b):
+    return next(n for k, n, _ in VERSIONS if k == b)
 
 
 def fmt(n):
@@ -435,7 +481,8 @@ class Screen:
         if bg is not None:
             self.bg[i] = bg
 
-    def put(self, x, y, text, fg=TEXT, bg=None, bold=False):
+    def put(self, x, y, text, fg=None, bg=None, bold=False):
+        fg = TEXT if fg is None else fg
         x0, y0, x1, y1 = self.clips[-1]
         if not y0 <= y < y1:
             return x + twidth(text)
@@ -455,7 +502,8 @@ class Screen:
             x += w
         return x
 
-    def fill(self, x, y, w, h, bg, c=" ", fg=TEXT):
+    def fill(self, x, y, w, h, bg, c=" ", fg=None):
+        fg = TEXT if fg is None else fg
         x0, y0, x1, y1 = self.clips[-1]
         for yy in range(max(y, y0), min(y + h, y1)):
             row = yy * self.w
@@ -736,6 +784,34 @@ class Job:
         self.cancel = threading.Event()
 
 
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    """Through a temporary file, so a crash mid-write never leaves half a file behind."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def search_key(seed, mode, rng, x, z, floor_y=None):
+    """What makes a search's answer: the same key, the same answer - every tool is deterministic."""
+    return "%d %s %d %d %d" % (seed, mode, floor_y if mode == "manual" else rng, x, z)
+
+
+def tiles_path(seed):
+    return os.path.join(TILES, "%d.json" % seed)
+
+
 def tiles_for(rng):
     """slime_gpu calls covering +-rng blocks: (offsets, m_chunks). One call up to +-256,000, else an n x n grid
     of equal tiles (n = 4 at the full 1M - the same 16 calls as ./slime best-spot; 118 x 118 for the world)."""
@@ -754,18 +830,24 @@ def eta(secs):
     return "%d h %02d min" % (secs // 3600, secs % 3600 // 60)
 
 
-def gpu_tiles(job, seed, centers, m):
+def gpu_tiles(job, seed, centers, m, known=None):
     """Many fixed-seed position searches through ONE slime_gpu --worker: the CUDA start-up (~0.3 s, nearly all
     of a lone tile's time) is paid once, so the whole world's 13,924 tiles take minutes, not an hour.
-    Each line is the exact CLI search ./slime best-spot runs. Stops early on cancel; returns what it has."""
+    Each line is the exact CLI search ./slime best-spot runs. Stops early on cancel; returns what it has.
+    known: {"m cx cz": [chunks, x, z]} from earlier scans of this seed - those tiles aren't run again, and
+    every new one is added to it."""
+    known = {} if known is None else known
+    todo = [c for c in centers if "%d %d %d" % (m, c[0], c[1]) not in known]
+    out = [tuple(known["%d %d %d" % (m, c[0], c[1])]) for c in centers if "%d %d %d" % (m, c[0], c[1]) in known]
+    if not todo:
+        return out
     p = subprocess.Popen([tool("slime_gpu"), "--worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, bufsize=1)
-    out = []
     try:
         if p.stdout.readline().strip() != "WORKER READY":
             raise ToolError("slime_gpu --worker didn't start - ./slime doctor checks your setup")
         t0 = time.time()
-        for k, (cx, cz) in enumerate(centers):
+        for k, (cx, cz) in enumerate(todo):
             if job.cancel.is_set():
                 break
             p.stdin.write("--seed %d --m-chunks %d --center-x %d --center-z %d\n" % (seed, m, cx, cz))
@@ -782,11 +864,13 @@ def gpu_tiles(job, seed, centers, m):
             if best is None:
                 raise ToolError("slime_gpu: %s" % (err or "stopped mid-scan"))
             out.append(best)
+            known["%d %d %d" % (m, cx, cz)] = list(best)
             el = time.time() - t0
             job.tile_s = el / (k + 1)
-            job.progress = "GPU tiles %s of %s, %s left" % (fmt(k + 1), fmt(len(centers)),
-                                                           eta(job.tile_s * (len(centers) - k - 1)))
-            job.frac = (k + 1) / len(centers)
+            done = len(centers) - len(todo) + k + 1
+            job.progress = "GPU tiles %s of %s, %s left" % (fmt(done), fmt(len(centers)),
+                                                           eta(job.tile_s * (len(todo) - k - 1)))
+            job.frac = done / len(centers)
     finally:
         try:
             p.stdin.write("--quit\n")
@@ -806,8 +890,12 @@ def search_worker(cli, job, seed, mode, rng, x, z):
         job.progress = "GPU search"
         cands = [cli.gpu_best(seed, x, z, m)]
     else:
-        cands = gpu_tiles(job, seed, [(x + dx, z + dz) for dx, dz in tiles], m)
-        if len(tiles) >= 16 and len(cands) >= 16:
+        known = load_json(tiles_path(seed), {})
+        before = len(known)
+        cands = gpu_tiles(job, seed, [(x + dx, z + dz) for dx, dz in tiles], m, known)
+        if len(known) > before:
+            save_json(tiles_path(seed), known)
+        if len(tiles) >= 16 and len(known) - before >= 16:
             save_prefs(studio_tile_s=round(job.tile_s * (m / TILE_M) ** -2, 4))   # this GPU's speed, per full tile
     if not cands:
         return None
@@ -1006,13 +1094,15 @@ class App:
         self.prev = None
         self.W, self.H = term.size()
         p = load_prefs()
+        apply_theme(p.get("studio_theme", "light"))
         self.f = {"seed": Field(str(p["seed"]) if p.get("seed") is not None else "1"),
                   "range": Field("4000", True), "cx": Field("0", True), "cz": Field("0", True),
                   "m_x": Field("", True), "m_z": Field("", True), "m_y": Field("", True), "m_n": Field("", True)}
         band = p.get("studio_band")
         if band is None and p.get("version"):
             band = perimeter_band(str(p["version"]))
-        self.band = band if isinstance(band, int) and 0 <= band < len(PERIMETER_BANDS) else 3
+        self.band = band if isinstance(band, int) and 0 <= band <= OLD else 3
+        self.menu = None                      # the open dropdown: {"x", "y", "w", "sel"}
         self.mode = "best"
         self.layers = {"slime": True, "ring": True, "peri": True, "coords": False}
         self.parse_seed()
@@ -1023,6 +1113,11 @@ class App:
             self.f["cx"].set(str(self.afk[0]))
             self.f["cz"].set(str(self.afk[1]))
         self.result = None
+        self.results = load_json(RESULTS, {})
+        if not isinstance(self.results, dict):
+            self.results = {}
+        self.restore_result(keep_afk=bool(farm and self.seed is not None and str(farm.get("seed")) == str(self.seed)),
+                            recenter=False)           # the view starts on self.afk just below
         self.peri, self.peri_key, self.peri_center = None, None, self.afk
         self.height, self.measure_msg = None, None
         self.view = [self.afk[0] + 0.5, self.afk[1] + 0.5, None]      # centre x, z; blocks per pixel (None = fit)
@@ -1059,7 +1154,7 @@ class App:
             return None
 
     def floor_y(self):
-        return 0 if self.band == 0 else -64
+        return 0 if self.band in (0, OLD) else -64
 
     def stale(self):
         return self.peri is None or self.peri_key != (self.seed, self.band, self.peri_center)
@@ -1115,7 +1210,11 @@ class App:
         if self.mode == "manual":
             self.set_afk(x, z, recenter=True)
             self.result = None
-            return self.start("score", score_worker, self.on_result, self.seed, x, z, self.floor_y())
+            key = search_key(self.seed, "manual", None, x, z, self.floor_y())
+            if key in self.results:
+                return self.on_result(dict(self.results[key]["res"]), self.results[key]["secs"], saved=True)
+            return self.start("score", score_worker, lambda res, secs: self.on_result(res, secs, key=key),
+                              self.seed, x, z, self.floor_y())
         rng = self.num("range")
         if rng is None or not 16 <= rng <= WORLD:
             return self.set_status("search range is 16 to 30,000,000 blocks - World covers all of it", "err")
@@ -1124,6 +1223,9 @@ class App:
         elif max(abs(x), abs(z)) + rng > WORLD_RANGE:
             return self.set_status("±%s around %d, %d runs past the world border - lower it, or pick World" % (
                 fmt(rng), x, z), "err")
+        key = search_key(self.seed, self.mode, rng, x, z)
+        if key in self.results:                            # searched before: the same answer, now
+            return self.on_result(dict(self.results[key]["res"]), self.results[key]["secs"], saved=True)
         miss = [t for t in ("slime_gpu", "slime_refine") if t in self.missing]
         if miss:
             return self.set_status("%s not built - run %s first" % (", ".join(miss), self.build_cmd()), "err")
@@ -1132,13 +1234,22 @@ class App:
             return self.set_status("Minecraft is open. A long GPU scan next to it can crash some laptops: close it, "
                                    "or press Find again to start anyway.", "err")
         self.confirm_long = False
-        self.start("search", search_worker, self.on_result, self.seed, self.mode, rng, x, z)
+        self.start("search", search_worker, lambda res, secs: self.on_result(res, secs, key=key),
+                   self.seed, self.mode, rng, x, z)
 
-    def on_result(self, res, secs):
+    def on_result(self, res, secs, key=None, saved=False):
         self.result = res
         self.set_afk(res["x"], res["z"], recenter=True)
         took = eta(secs) if secs >= 60 else "%.1f s" % secs
-        if res["mode"] == "manual":
+        if key and not res.get("partial"):                 # remember it: this search never has to run again
+            self.results[key] = {"seed": self.seed, "res": dict(res), "secs": secs, "t": time.time()}
+            if len(self.results) > 300:
+                for k in sorted(self.results, key=lambda k: self.results[k]["t"])[:len(self.results) - 300]:
+                    del self.results[k]
+            save_json(RESULTS, self.results)
+        if saved:
+            self.set_status("searched before - the saved answer (it took %s then)" % took, "ok")
+        elif res["mode"] == "manual":
             self.set_status("scored in %s" % took, "ok")
         elif res.get("partial"):
             self.set_status("stopped after %s of %s GPU tiles - the best of those" % (fmt(res["scanned"]), fmt(res["tiles"])))
@@ -1146,6 +1257,27 @@ class App:
             self.set_status("found in %s%s" % (took, " (%s GPU tiles)" % fmt(res["tiles"]) if res["tiles"] > 1 else ""), "ok")
         if res.get("tiles", 0) >= 16:
             self.tile_s = load_prefs().get("studio_tile_s", self.tile_s)
+
+    def restore_result(self, keep_afk=False, recenter=True):
+        """This seed's last finished search, with the inputs that made it, so Find gives it straight back."""
+        if self.seed is None:
+            return
+        mine = [(e["t"], k) for k, e in self.results.items() if e.get("seed") == self.seed]
+        if not mine:
+            return
+        k = max(mine)[1]
+        res = dict(self.results[k]["res"])
+        _, mode, rng, x, z = k.split(" ")
+        self.mode = mode
+        if mode != "manual":
+            self.f["range"].set(rng)
+        self.f["cx"].set(x)
+        self.f["cz"].set(z)
+        self.result = res
+        if not keep_afk:
+            self.set_afk(res["x"], res["z"], recenter=recenter)
+            if recenter:
+                self.view[2], self.view_auto = None, True
 
     def pick_top(self, i):
         """Show another of the search's top spots."""
@@ -1192,6 +1324,8 @@ class App:
     def generate(self, remember=True):
         if self.seed is None:
             return self.set_status("type a world seed first", "err")
+        if self.band == OLD:
+            return self.flash("No commands for 1.12 and older - pick 1.13 or newer. The map and search work as is.")
         if "perimeter_gen" in self.missing:
             return self.flash("perimeter_gen isn't built - run %s first" % self.build_cmd())
         x, z = self.peri_center
@@ -1215,6 +1349,8 @@ class App:
             return
         i = self.copy_i.get(n, 0) % len(lines)
         what = "%d characters" % len(lines[i]) if len(lines[i]) > 60 else None
+        if len(lines) > 1:
+            what = "%d of %d, %s" % (i + 1, len(lines), what or lines[i])
         self.copy(lines[i], what)
         self.copy_i[n] = (i + 1) % len(lines)
 
@@ -1268,6 +1404,7 @@ class App:
         if fid == "seed":
             self.parse_seed()
             self.result, self.height = None, None
+            self.restore_result()
         elif fid in ("cx", "cz"):
             if self.mode == "manual":
                 x, z = self.num("cx"), self.num("cz")
@@ -1327,7 +1464,7 @@ class App:
         S = self.scr = Screen(W, H)
         self.order, self.fpos, self.hits, self.actions, self.panels, self.fieldx = [], {}, [], {}, {}, {}
         self.cur_panel = None
-        self.mapgeo, self.pic_req = None, None
+        self.mapgeo, self.pic_req, self.vbox = None, None, None
         if W < 64 or H < 18:
             msg = "Make the window bigger: at least 64 x 18 (it's %d x %d)" % (W, H)
             S.put(max(0, (W - len(msg)) // 2), H // 2, msg[:W], MUTED)
@@ -1345,6 +1482,7 @@ class App:
         self.footer()
         if self.help:
             self.help_box()
+        self.menu_box()
 
     def help_box(self):
         S = self.scr
@@ -1418,15 +1556,16 @@ class App:
             th = max(1, h * h // used)
             ty = y + (h - th) * self.scroll.get(name, 0) // max(1, used - h)
             for yy in range(y, y + h):
-                S.put(x + w - 1, yy, "┃" if ty <= yy < ty + th else "│", EDGE if ty <= yy < ty + th else LINE)
+                S.put(x + w - 1, yy, "┃" if ty <= yy < ty + th else "│", FIELD_EDGE if ty <= yy < ty + th else LINE)
 
     # -- widgets ---------------------------------------------------------------------------------------------------
-    def label(self, x, y, text, color=TEXT, bold=True):
+    def label(self, x, y, text, color=None, bold=True):
         """A field's title: short, bold, sentence case."""
-        self.scr.put(x, y, text, color, bold=bold)
+        self.scr.put(x, y, text, color or TEXT, bold=bold)
 
-    def helptext(self, x, y, w, text, color=MUTED):
+    def helptext(self, x, y, w, text, color=None):
         """The line of help under a field. Returns the rows it took."""
+        color = MUTED if color is None else color
         n = 0
         for l in wrap(text, w):
             self.scr.put(x, y + n, l, color)
@@ -1470,7 +1609,7 @@ class App:
         f = self.f[fid]
         bad = (fid == "seed" and self.seed_err is not None) or \
               (fid in ("range", "cx", "cz") and self.num(fid) is None and not disabled)
-        edge = DANGER if bad else GREEN if foc else LINE if disabled else EDGE
+        edge = DANGER if bad else GREEN if foc else LINE if disabled else FIELD_EDGE
         if self.compact:
             S.fill(x + 1, y, w - 2, 1, CARD_BG)
             S.put(x, y, "▕", edge)
@@ -1492,7 +1631,7 @@ class App:
         if foc:                                            # a green caret, as their caret-color
             cx = tx + twidth(f.value[f.off:f.cur])
             c = f.value[f.cur] if f.cur < len(f.value) else " "
-            S.put(cx, ty, c if cwidth(c) == 1 else " ", WHITE, GREEN)
+            S.put(cx, ty, c if cwidth(c) == 1 else " ", ON_GREEN, GREEN)
         S.pop()
         self.fieldx[fid] = tx
         self.hit(fid, x, y, w, h)
@@ -1507,7 +1646,7 @@ class App:
         t = text if twidth(text) <= w - 4 else text[:w - 5] + "…"
         if primary:
             bgc = TRACK if disabled else GREEN_DARK if foc else GREEN
-            fg = MUTED if disabled else WHITE
+            fg = MUTED if disabled else ON_GREEN
             if h == 3:
                 S.put(x, y, "▄" * w, bgc)
                 S.put(x, y + 2, "▀" * w, bgc)
@@ -1539,7 +1678,7 @@ class App:
         if disabled:
             bgc, fg = PANEL2, MUTED
         elif foc:
-            bgc, fg = GREEN, WHITE
+            bgc, fg = GREEN, ON_GREEN
         elif selected:
             bgc, fg = PICK_BG, GREEN
         else:
@@ -1573,7 +1712,7 @@ class App:
         for i, (name, v) in enumerate(PRESETS):
             on = cur is not None and (cur == v or (i == n - 1 and cur >= WORLD_RANGE))
             ww = sw if i < n - 1 else x + w - sx
-            bgc, fg = (GREEN, WHITE) if foc and on else (PICK_BG, GREEN) if on else (BTN_HOVER, TEXT)
+            bgc, fg = (GREEN, ON_GREEN) if foc and on else (PICK_BG, GREEN) if on else (BTN_HOVER, TEXT)
             self.scr.fill(sx, y, ww, 1, bgc)
             self.scr.put(sx + (ww - len(name)) // 2, y, name, fg, bgc, bold=on)
             self.hit("preset:%d" % i, sx, y, ww, 1, (lambda v=v: self.set_range(v)))
@@ -1584,30 +1723,78 @@ class App:
     def version_row(self, x, y, w):
         """The game version: it only changes the commands' syntax and floor height, never the slime chunks."""
         S, foc = self.scr, self.focus == "band"
-        name = PERIMETER_BANDS[self.band][1]
+        name = band_name(self.band)
         if self.compact:
             S.put(x, y, "Version", MUTED)
-            t = "‹ %s ›" % name
+            t = "%s ▾" % name
             S.put(x + w - len(t), y, t, GREEN_DARK if foc else TEXT, bold=True)
             self.hit("band", x, y, w, 1)
             self.focusable("band", y, y + 1)
+            self.vbox = self.on_screen(x, y, w, 1)
             return 1
         S.fill(x, y, w, 3, BTN_HOVER if foc else CARD_BG)
-        S.box(x, y, w, 3, GREEN if foc else EDGE)
+        S.box(x, y, w, 3, GREEN if foc else FIELD_EDGE)
         S.put(x + 2, y + 1, name, TEXT, BTN_HOVER if foc else CARD_BG)
-        S.put(x + w - 4, y + 1, "‹›", MUTED, BTN_HOVER if foc else CARD_BG)
+        S.put(x + w - 4, y + 1, "▾", MUTED, BTN_HOVER if foc else CARD_BG)
         self.hit("band", x, y, w, 3)
         self.focusable("band", y, y + 3)
+        self.vbox = self.on_screen(x, y, w, 3)
         return 3
 
-    def kv(self, x, y, w, left, right, rcolor=TEXT):
+    def on_screen(self, x, y, w, h):
+        """The box if it's fully inside the panel it's drawn in (not scrolled out of view), else None."""
+        x0, y0, x1, y1 = self.scr.clips[-1]
+        return (x, y, w, h) if x0 <= x and x + w <= x1 and y0 <= y and y + h <= y1 else None
+
+    def open_menu(self):
+        self.menu = {"sel": next(i for i, (k, _, _) in enumerate(VERSIONS) if k == self.band), "hover": None}
+
+    def pick_version(self, i):
+        self.band = VERSIONS[i][0]
+        self.menu = None
+        save_prefs(studio_band=self.band)
+        self.focus = "band"
+
+    def menu_geo(self):
+        """Where the open dropdown goes: under the box over whatever is there, above it when the screen ends
+        first; two lines a row when there's room (the releases each covers), one when there isn't."""
+        tall = 2 if self.H >= 30 else 1
+        mh = len(VERSIONS) * tall + 2
+        if self.vbox:
+            x, y, w, h = self.vbox
+            top = y + h if y + h + mh <= self.H - 1 else y - mh if y - mh >= 0 else (self.H - 1 - mh) // 2
+        else:                                           # the box has scrolled off: the menu opens mid-screen
+            w = min(38, self.W - 4)
+            x, top = (self.W - w) // 2, (self.H - 1 - mh) // 2
+        return x, max(0, top), w, mh, tall
+
+    def menu_box(self):
+        S = self.scr
+        if not self.menu:
+            return
+        x, y, w, mh, tall = self.menu_geo()
+        S.fill(x, y, w, mh, CARD_BG)
+        S.box(x, y, w, mh, GREEN)
+        for i, (k, name, covers) in enumerate(VERSIONS):
+            ry = y + 1 + i * tall
+            on, hov = k == self.band, i == self.menu["sel"]
+            bgc = PICK_BG if hov else CARD_BG
+            S.fill(x + 1, ry, w - 2, tall, bgc)
+            S.put(x + 2, ry, "✓" if on else " ", GREEN, bgc, bold=True)
+            S.put(x + 4, ry, name, GREEN_DARK if hov else TEXT, bgc, bold=on or hov)
+            if tall == 2:
+                S.put(x + 4, ry + 1, covers[:w - 6], MUTED, bgc)
+            self.hit("vopt:%d" % i, x + 1, ry, w - 2, tall)
+
+    def kv(self, x, y, w, left, right, rcolor=None):
         """Their key-value row: the name muted on the left, the value bold on the right."""
         self.scr.put(x, y, left, MUTED)
-        self.scr.put(x + w - twidth(right), y, right, rcolor, bold=True)
+        self.scr.put(x + w - twidth(right), y, right, rcolor or TEXT, bold=True)
 
     row = kv
 
-    def bar(self, x, y, w, frac, color=GREEN):
+    def bar(self, x, y, w, frac, color=None):
+        color = GREEN if color is None else color
         n = max(0, min(w, round(w * frac)))
         self.scr.put(x, y, "━" * n, DANGER if frac > 1 else color)
         self.scr.put(x + n, y, "━" * (w - n), TRACK)
@@ -1645,7 +1832,7 @@ class App:
         S, W = self.scr, self.W
         y = 0 if self.compact else 1
         S.put(2, y, "▐█▌", SLIME)                           # a small slime block
-        x = S.put(6, y, "Slime Farm Studio" if W >= 90 else "Slime Farm", TEXT, bold=True)
+        x = S.put(6, y, "SlimeByte", TEXT, bold=True)
         formula = "24² < ΔX² + ΔZ² ≤ 128²"
         ty = y if self.compact else y + 1
         tx = x + 4 if self.compact else 2
@@ -1662,9 +1849,23 @@ class App:
             self.hit(tid, tx, ty, len(name), 1, (lambda k=k: self.set_tab(k)))
             self.focusable(tid, 0, ty + 1)
             tx += len(name) + 4
-        if W - len(formula) - 3 > (x if not self.compact else tx):
-            S.put(W - len(formula) - 2, y, formula, MUTED)
+        xx = W - 2
+        for k, name in reversed((("light", "Light"), ("dark", "Dark"))):     # like the map's Chunks / Floor
+            xx -= len(name)
+            on, tid = THEME == k, "theme:" + k
+            foc = self.focus == tid
+            S.put(xx, y, name, GREEN if on else GREEN_DARK if foc else MUTED, bold=on or foc)
+            self.hit(tid, xx, y, len(name), 1, (lambda k=k: self.set_theme(k)))
+            self.focusable(tid, 0, y + 1)
+            xx -= 3
+        if xx - len(formula) - 2 > (x if not self.compact else tx):
+            S.put(xx - len(formula) - 2, y, formula, MUTED)
         return ty + 2
+
+    def set_theme(self, k):
+        apply_theme(k)
+        save_prefs(studio_theme=THEME)
+        self.prev, self.map_cache, self.pic_cache = None, (None, None), (None, None)     # repaint it all
 
     def set_tab(self, k):
         self.tab = k
@@ -1698,7 +1899,7 @@ class App:
             x = S.put(x, y, k, TEXT, bold=True)
             x = S.put(x + 1, y, what, MUTED) + 3
         if right:
-            S.put(W - 2 - len(right), y, right, WHITE if rbg else MUTED, rbg)
+            S.put(W - 2 - len(right), y, right, TOAST_TEXT if rbg else MUTED, rbg)
 
     # -- 1 · find spot -------------------------------------------------------------------------------------------
     def find_tab(self, top, bot):
@@ -1859,12 +2060,6 @@ class App:
                     MUTED if stale else (DANGER if chars and chars > LIMIT else TEXT))
             self.bar(ix, cy + 1, iw, (chars or 0) / LIMIT if not stale else 0)
             cy += 2
-        if p and not stale and 1 in p["sections"] and p["sections"][1]["lines"]:
-            tp = p["sections"][1]["lines"][0]
-            cy += gap
-            self.label(ix, cy, "Teleport")
-            cy += 1
-            cy += self.coord_box("copy_tp", ix, cy, iw, tp, tp)
         if p and stale:
             cy += gap + self.note(ix, cy + gap, iw, "Your inputs changed since these were made: generate again.", "warn")
         elif p and any((p["sections"].get(n, {}).get("chars") or 0) > LIMIT for n in (3, 4)):
@@ -1885,13 +2080,16 @@ class App:
         stale = self.stale()
         for n, name, tag in SECTIONS:
             lines = self.peri["sections"].get(n, {}).get("lines", []) if self.peri else []
-            t = "Copy" if len(lines) <= 1 else "Copy %d of %d" % (self.copy_i.get(n, 0) % len(lines) + 1, len(lines))
-            cx = ix + iw - len(t) - 2
+            # a section of several chat lines copies them one at a time: the button names the one it copies
+            heads = ["Copy " + l.split(" ")[0] for l in lines] if len(lines) > 1 else ["Copy"]
+            t = heads[self.copy_i.get(n, 0) % len(heads)]
+            cw = max(len(h) for h in heads) + 2                  # as wide as its longest, so it never jumps
+            cx = ix + iw - cw
             x = S.put(ix, cy, str(n), MUTED)
             x = S.put(x + 2, cy, name, TEXT)
             if tag and x + 2 + len(tag) < cx - 1:                 # the mod it needs, when there's room
                 S.put(x + 2, cy, tag, VIOLET)
-            self.chip("copy:%d" % n, cx, cy, t, (lambda n=n: self.copy_section(n)), disabled=stale)
+            self.chip("copy:%d" % n, cx, cy, t, (lambda n=n: self.copy_section(n)), disabled=stale, w=cw)
             cy += 1 if self.dense else 2
         if not self.peri:
             cy += self.helptext(ix, cy, iw, "Generate first.")
@@ -1916,31 +2114,30 @@ class App:
                 xx -= 3
 
         def body(ix, iy, iw):
-            hint = "Click to place the AFK spot. Scroll to zoom, drag to move." if self.mode == "manual" else \
-                "Scroll to zoom, drag to move, hover for coordinates."
-            bx = ix + iw
+            my = iy
+            mh = h - (my - y) - 1 - (2 if self.compact else 4)
+            if mh >= 4:
+                self.draw_map(ix - 1, my, iw + 2, mh)
+            ly = my + max(mh, 0) + (0 if self.compact else 1)
+            bx = ix + iw                                          # under the map, right: the two views of it
             r = self.result
             for bid, text, act, ok in (("range_fit", "Whole search range", self.fit_search, bool(r and r.get("range"))),
                                        ("farm_fit", "Back to the farm", self.back_to_farm, True)):
                 bx -= len(text) + 4
-                self.button(bid, bx, iy, len(text) + 4, text, act, primary=False, disabled=not ok, tall=False)
+                self.button(bid, bx, ly, len(text) + 4, text, act, primary=False, disabled=not ok, tall=False)
                 bx -= 1
-            if ix + len(hint) < bx - 1:
-                S.put(ix, iy, hint, MUTED)
-            my = iy + (1 if self.compact else 2)
-            legend_rows = 1
-            mh = h - (my - y) - legend_rows - (3 if self.compact else 5)
-            if mh >= 4:
-                self.draw_map(ix - 1, my, iw + 2, mh)
-            ly = my + max(mh, 0) + (0 if self.compact else 1)
-            items = [("■", SLIME, "Slime chunk"), ("■", OBSIDIAN, "Obsidian"), ("■", MAGMA, "Magma block"),
-                     ("■", GLASS, "Glass"), ("●", MARK, "AFK spot")]          # their legend, in their order
+            items = ([("■", SLIME, "Slime chunk"), ("■", OBSIDIAN, "Obsidian")] if view == "chunks" else
+                     [("■", OBSIDIAN, "Obsidian"), ("■", MAGMA, "Magma block"), ("■", GLASS, "Glass")]) + \
+                [("●", MARK, "AFK spot")]                       # left: their legend, only what this view draws
             lx = ix
             for sw, col, name in items:
-                if lx + len(sw) + len(name) + 1 > ix + iw:
+                if lx + len(sw) + len(name) + 1 > bx - 2:
                     break
                 S.put(lx, ly, sw, col)
                 lx = S.put(lx + len(sw) + 1, ly, name, MUTED) + 3
+            hint = "Click the map to place the AFK spot."             # the one thing the footer can't say first
+            if self.mode == "manual" and lx + len(hint) < bx - 2:
+                S.put(lx, ly, hint, GREEN)
             return ly - iy + 1
 
         self.card(x, y, w, "Map", body, right=tabs)
@@ -1959,6 +2156,8 @@ class App:
     def info_lines(self):
         """Their map info box: which way is north, and the block under the mouse."""
         lines = ["North ↑ −Z    East → +X"]
+        if self.seed is None:
+            lines.append("No seed yet: type one on the left to see the slime chunks")
         pt = self.hover or ((self.view[0], self.view[1]) if self.focus == "map" else None)
         if pt:
             bx, bz = math.floor(pt[0]), math.floor(pt[1])
@@ -1981,7 +2180,7 @@ class App:
         pw, ph = cw, ch * 2                # the character map's pixels: half a cell each
         size = None
         g = self.term.graphics             # the help box over a Sixel map: characters while it's open
-        cell = self.term.cell_px() if g and self.seed is not None and not (g == "sixel" and self.help) else None
+        cell = self.term.cell_px() if g and not (g == "sixel" and (self.help or self.menu)) else None
         if cell:                           # a real picture: as many pixels as the cells have (kitty: up to
             k = min(1.0, 2400 / (cw * cell[0])) if g == "kitty" else 1.0     # 2400 wide, the terminal scales it)
             size = (max(1, round(cw * cell[0] * k)), max(1, round(ch * cell[1] * k)))
@@ -2013,11 +2212,6 @@ class App:
                 t, fg, bg = cells[k]
                 S._set(row + ix + c, row, t, fg, bg, False)
                 k += 1
-        if self.seed is None:                                          # their empty state
-            msg = ["Start from a world seed", "Type a seed on the left, then search - or pick Manual and click the map."]
-            for i, l in enumerate(msg):
-                S.put(ix + (cw - len(l)) // 2, iy + ch // 2 - 1 + i * 2, l[:cw], INFO_TEXT, MAP_BG, bold=(i == 0))
-            return
         lines = self.info_lines()                                      # the info box, top left
         bw = min(cw - 4, max(len(l) for l in lines) + 4)
         if len(lines) + 2 <= ch // 4 and bw <= cw // 2:
@@ -2045,11 +2239,12 @@ class App:
         S.push(ix, iy, ix + cw, iy + ch)
 
         def text(px, py, t, fg, bold=False):
-            """t with its left edge at picture x px, in the cell row holding picture y py."""
-            cx, cy = math.floor(px / cpx), math.floor(py / cpy)
-            if 0 <= cy < ch and 0 <= cx and cx + len(t) <= cw:
-                S.put(ix + cx, iy + cy, t, fg, bold=bold)
-                return cx + len(t)
+            """t with its left edge at picture x px, in the cell row holding picture y py - on a small plate of
+            the map's own green with a space each side, so a slime chunk under it never cuts through it."""
+            cx, cy = max(0, math.floor(px / cpx) - 1), math.floor(py / cpy)
+            if 0 <= cy < ch and 0 <= cx and cx + len(t) + 2 <= cw:
+                S.put(ix + cx, iy + cy, " %s " % t, fg, MAP_BG, bold=bold)
+                return cx + len(t) + 1
             return None
         # rulers along the bottom and the left (their labelStep, wide enough for the longest number here)
         far = max(abs(int(left)), abs(int(left + W / s)), abs(int(top)), abs(int(top + H / s)))
@@ -2090,6 +2285,8 @@ class App:
     def info_line(self):
         """One line, like theirs: the view and the spot, or the block under the mouse."""
         pt = self.hover or ((self.view[0], self.view[1]) if self.focus == "map" else None)
+        if not pt and self.seed is None:
+            return "No seed yet · type one on the left to see the slime chunks"
         if not pt:
             return "%s · AFK spot %d, %d" % ("Slime chunks" if self.map_view == "chunks" else
                                               "Floor at y %d" % self.floor_y(), self.afk[0], self.afk[1])
@@ -2098,9 +2295,9 @@ class App:
         slime = self.slime_at([cx], cz)[0]
         d2 = (bx - self.afk[0]) ** 2 + (bz - self.afk[1]) ** 2           # the spawn rule's integer offsets
         where = "nothing spawns" if d2 <= 576 else "spawns" if d2 <= 16384 else "despawns"
-        out = "Block %d, %d · chunk %d, %d · %s · %s from AFK, %s" % (bx, bz, cx, cz, "slime" if slime else "normal",
-                                                                     fmt(math.sqrt(d2)), where)
-        if self.map_view == "floor":
+        out = "Block %d, %d · chunk %d, %d · %s%s from AFK, %s" % (
+            bx, bz, cx, cz, "" if self.seed is None else "slime · " if slime else "normal · ", fmt(math.sqrt(d2)), where)
+        if self.map_view == "floor" and self.seed is not None:
             out += " · %s" % (floor_block(lambda a, b: self.slime_at([a], b)[0], self.afk[0], self.afk[1], bx, bz)
                               or "not cleared")
         return out
@@ -2133,12 +2330,14 @@ class App:
         col = P.code(SLIME_DIM if floor_view else SLIME)
         ax, az = afk
         kx0, kx1, kz0, kz1 = (ax - RADIUS) // 16, (ax + RADIUS) // 16, (az - RADIUS) // 16, (az + RADIUS) // 16
-        fl = [(a, b) for b in range(kz0, kz1 + 1)
-              for a, v in zip(range(kx0, kx1 + 1), slime_row(seed, kx0, b, kx1 - kx0 + 1)) if v]
+        fl = [] if seed is None else [(a, b) for b in range(kz0, kz1 + 1)
+                                      for a, v in zip(range(kx0, kx1 + 1), slime_row(seed, kx0, b, kx1 - kx0 + 1)) if v]
         cx0, cx1 = math.floor(left / 16), math.floor((left + W / s) / 16)
         cz0, cz1 = math.floor(top / 16), math.floor((top + H / s) / 16)
         bgrow = P.code(MAP_BG) * W
-        if 16 * s >= 1.5:                                        # every chunk, a square
+        if seed is None:                                         # no seed yet: an empty field, the rest as usual
+            pass
+        elif 16 * s >= 1.5:                                      # every chunk, a square
             xs = [min(W, max(0, X(c * 16))) for c in range(cx0, cx1 + 2)]
             for cz in range(cz0, cz1 + 1):
                 flags = slime_row(seed, cx0, cz, cx1 - cx0 + 1)
@@ -2243,6 +2442,8 @@ class App:
 
     def slime_at(self, cxs, cz):
         """Flags for the given chunk columns in row cz, cached per seed."""
+        if self.seed is None:
+            return [0] * len(cxs)
         need = [c for c in cxs if (c, cz) not in self.chunks]
         if need:
             if len(self.chunks) > 1_500_000:
@@ -2425,7 +2626,7 @@ class App:
         def summary(bx, by, bw):
             yy = by
             yy += self.helptext(bx, yy, bw, "Seed %s, centered on %d, %d, %s, floor at y %d." % (
-                self.seed, cx, cz, PERIMETER_BANDS[self.band][1], self.floor_y()))
+                self.seed, cx, cz, band_name(self.band), self.floor_y()))
             if p:
                 yy += self.helptext(bx, yy, bw, "Saved as %s." % os.path.relpath(p["path"], ROOT))
             yy += gap
@@ -2520,7 +2721,7 @@ class App:
         cy += 0 if self.compact else 1
         ready = p is not None and not self.stale()
         for n, (title, tag, desc) in enumerate(self.STEPS):
-            S.put(ix, cy, " %d " % n, WHITE, GREEN, bold=True)
+            S.put(ix, cy, " %d " % n, ON_GREEN, GREEN, bold=True)
             xx = S.put(ix + 5, cy, title, TEXT, bold=True)
             if tag:
                 S.put(xx + 2, cy, "needs %s" % tag, VIOLET)
@@ -2613,6 +2814,8 @@ class App:
             if ev[0] in ("key", "char", "paste") or (ev[0] == "mouse" and ev[1] == "press"):
                 self.help = False
             return
+        if self.menu:                                   # an open dropdown takes the keys and clicks first
+            return self.menu_event(ev)
         if ev[0] == "key":
             self.on_key(ev[1])
         elif ev[0] == "char":
@@ -2633,7 +2836,7 @@ class App:
 
     def activate(self, fid):
         if fid == "band":
-            self.band = (self.band + 1) % len(PERIMETER_BANDS)
+            self.open_menu()
         elif fid == "mode":
             m = ["best", "cluster", "manual"]
             self.set_mode(m[(m.index(self.mode) + 1) % 3])
@@ -2641,6 +2844,32 @@ class App:
             self.step_preset(1, wrap_around=True)
         elif fid in self.actions:
             self.actions[fid]()
+
+    def menu_event(self, ev):
+        m, n = self.menu, len(VERSIONS)
+        if ev[0] == "key":
+            k = ev[1]
+            if k in ("up", "left", "btab"):
+                m["sel"] = (m["sel"] - 1) % n
+            elif k in ("down", "right", "tab"):
+                m["sel"] = (m["sel"] + 1) % n
+            elif k == "enter":
+                self.pick_version(m["sel"])
+            elif k in ("esc", "ctrl+c"):
+                self.menu = None
+        elif ev[0] == "char" and ev[1] == " ":
+            self.pick_version(m["sel"])
+        elif ev[0] == "mouse":
+            _, kind, x, y, btn = ev
+            hid = self.at(x, y)
+            row = int(hid[5:]) if hid and hid.startswith("vopt:") else None
+            if kind == "move" and row is not None:
+                m["sel"] = row
+            elif kind == "press" and btn == 0:
+                if row is not None:
+                    self.pick_version(row)
+                else:
+                    self.menu = None                    # a click anywhere else just closes it
 
     def on_key(self, k):
         kind = self.kind(self.focus)
@@ -2680,7 +2909,8 @@ class App:
             return
         if kind in ("select", "seg") and k in ("left", "right"):
             if kind == "select":
-                self.band = (self.band + (1 if k == "right" else -1)) % len(PERIMETER_BANDS)
+                i = next(n for n, (b, _, _) in enumerate(VERSIONS) if b == self.band)
+                self.band = VERSIONS[(i + (1 if k == "right" else -1)) % len(VERSIONS)][0]
             elif self.focus == "preset":
                 self.step_preset(1 if k == "right" else -1)
             else:
@@ -2703,6 +2933,8 @@ class App:
             self.running = False
         elif c == "?":
             self.help = True
+        elif c == "t":
+            self.set_theme("dark" if THEME == "light" else "light")
         elif c in "123":
             self.set_tab({"1": "find", "2": "commands", "3": "guide"}[c])
         elif c == "f":

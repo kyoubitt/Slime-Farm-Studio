@@ -3,14 +3,15 @@
 Finds the best spot for a Minecraft slime farm on a world seed — the AFK block with the most
 spawning spaces around it — then writes the commands that build the perimeter.
 
-![Slime Farm Studio](slime_toolchain/docs/studio.png)
+![SlimeByte](slime_toolchain/docs/studio.png)
 
-## Slime Farm Studio
+## SlimeByte
 
 The app, full screen in your terminal: seed in, best spot out, a live slime-chunk map, the
-perimeter commands with Copy buttons, and the build guide.
+perimeter commands with Copy buttons, and the build guide. Light and dark colours (press `t`), and a search you've run is
+saved, so asking again is instant.
 
-- **Windows:** download `SlimeFarmStudio.exe` from [Releases](../../releases), put it in
+- **Windows:** download `SlimeByte.exe` from [Releases](../../releases), put it in
   `slime_toolchain` next to the tools from `build.ps1`, and double-click it.
 - **Linux / macOS:** `./build.sh`, then `./slime gui`.
 

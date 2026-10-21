@@ -6,7 +6,10 @@ against SlimeFinder.jar - other programs. This checks them against the game
 itself: vanilla_parity/GameOracle.java loads an actual Minecraft client jar
 and calls the game's own WorldgenRandom.seedSlimeChunk(...).nextInt(10) - the
 exact call Slime's spawn rule makes - and every answer is compared with this
-toolchain's, bit for bit.
+toolchain's, bit for bit. Versions before 1.18 (1.12, the betas) have no such
+static method: vanilla_parity/OldGameOracle.java calls their Chunk's own
+getRandomWithSeed(987234911).nextInt(10) instead, on an empty chunk and world
+with just the fields that method reads set (found in the jar's bytecode).
 
   1. core       slime_core.h isSlimeChunk, CPU and GPU builds, on 20M random
                 (seed, chunk) pairs: near spawn, anywhere in the world border,
@@ -17,13 +20,15 @@ toolchain's, bit for bit.
                 801x801 centres vs the same score computed from the game's map
   4. perimeter  perimeter_setup's rig floor: every chunk it fills vs the game
   6. spawn rule the game's own NaturalSpawner bytecode: a spawn needs d^2 > 576
-                (strict) - the rule slime_refine and afk_rescan's vanilla_* use
+                (strict) - the rule slime_refine and afk_rescan's vanilla_* use.
+                1.12 and the betas allow d^2 >= 576 (inclusive): there the
+                Carpet count is the in-game one, and that's reported, not failed
   7. afk_rescan its Carpet (/perimeterinfo) and vanilla counts at feet heights
                 dy 0/12/23/24, recounted independently from the game's map
   5. perimeter_gen  the Slime Chunk Perimeter Generator's obsidian floor AND
                 magma border, block by block, vs the game's map (border
                 recomputed independently from the game map, not from its code)
-  8. studio map slime_common.slime_row - the formula Slime Farm Studio
+  8. studio map slime_common.slime_row - the formula SlimeByte
                 (./slime gui) draws its map with: the same game maps and the
                 first 2M random cases, bit for bit, its floor count vs the
                 game map and perimeter_gen's own, and its Floor tab
@@ -32,7 +37,7 @@ toolchain's, bit for bit.
 For the commands themselves running in a real vanilla server, see
 vanilla_world_test.py.
 
-    ./vanilla_parity.py                   every 1.18+ jar found (Prism / .minecraft)
+    ./vanilla_parity.py                   every jar found (Prism / .minecraft), betas included
     ./vanilla_parity.py --jar path/to/client.jar [--jar ...] [--cases 20000000]
 
 Needs a JDK (javac) and ./build.sh to have been run.
@@ -86,7 +91,7 @@ def run(args, **kw):
 
 def build():
     os.makedirs(BUILD, exist_ok=True)
-    r = run(["javac", "-d", BUILD, os.path.join(PD, "GameOracle.java")])
+    r = run(["javac", "-nowarn", "-d", BUILD, os.path.join(PD, "GameOracle.java"), os.path.join(PD, "OldGameOracle.java")])
     if r.returncode:
         say(r.stdout + r.stderr, "red")
         sys.exit("javac failed (need a JDK: sudo pacman -S jdk21-openjdk)")
@@ -119,6 +124,75 @@ def oracle(jar, *args):
         msg = lines[-1] if lines else "?"
         return None, re.sub(r"^.*?(Exception|Error): ", "", msg)
     return r.stdout.splitlines(), None
+
+
+def old_spec(jar):
+    """For a jar before 1.18: what OldGameOracle needs, read from the bytecode with javap - the slime class's
+    own call (ldc2_w 987234911 / invokevirtual <chunk>.<m>(J)Random / bipush 10 / nextInt / ifne), the two int
+    fields that method squares (x first: x*x*4987142), and the fields it reads the world seed through."""
+    import zipfile
+    cache = {}
+
+    def javap(c):
+        if c not in cache:
+            cache[c] = run(["javap", "-c", "-p", "-cp", jar, c]).stdout
+        return cache[c]
+
+    def method(c, sig):
+        while c:                                       # declared here or in a superclass
+            t = javap(c)
+            m = re.search(r"\n  [^\n]*?" + sig + r";\n    Code:\n(.*?)\n\n", t, re.S)
+            if m:
+                return [l.split("//")[-1].strip() if "//" in l else l.split(":", 1)[1].strip()
+                        for l in m.group(1).splitlines()]
+            sup = re.search(r"class \S+ extends (\S+)", t)
+            c = sup.group(1) if sup and not sup.group(1).startswith("java.") else None
+        return None
+
+    def hops(c, code):
+        """The fields a getter chain reads from `this` until a long: [(class, field, type)]."""
+        out, cur = [], c
+        for l in code:
+            m = re.match(r"Field (?:(\S+)\.)?(\S+):(\S+)", l)
+            if m:
+                out.append((m.group(1) or cur, m.group(2), m.group(3)))
+                if m.group(3) == "J":
+                    return out
+                cur = m.group(3)[1:-1].replace("/", ".") if m.group(3).startswith("L") else None
+                continue
+            m = re.match(r"Method (?:(\S+)\.)?(\S+):\(\)(\S+)", l)
+            if m:
+                sub = hops(m.group(1) or cur, method(m.group(1) or cur, r" %s\(\)" % re.escape(m.group(2))) or [])
+                out += sub
+                if sub and sub[-1][2] == "J":
+                    return out
+                cur = sub[-1][2][1:-1].replace("/", ".") if sub else None
+        return out
+    salt = bytes([5]) + struct.pack(">q", 987234911)
+    with zipfile.ZipFile(jar) as z:
+        users = [n[:-6].replace("/", ".") for n in z.namelist() if n.endswith(".class") and salt in z.read(n)]
+    for u in users:
+        m = re.search(r"long 987234911l\n\s+\d+: invokevirtual\s+#\d+\s+// Method (\S+)\.(\S+):\(J\)Ljava/util/Random;"
+                      r"\n\s+\d+: bipush\s+10\n\s+\d+: invokevirtual\s+#\d+\s+// Method java/util/Random\.nextInt:\(I\)I"
+                      r"\n\s+\d+: ifne", javap(u))
+        if m:
+            owner, name = m.group(1).replace("/", "."), m.group(2)
+            code = method(owner, r"java\.util\.Random %s\(long\)" % re.escape(name))
+            seed = hops(owner, code[:next(i for i, l in enumerate(code) if l.endswith("()J")) + 1])
+            ints = [re.match(r"Field (\S+):I", l).group(1) for l in code if re.match(r"Field \S+:I", l)]
+            return [owner, name, ints[0], next(f for f in ints if f != ints[0]),
+                    ";".join("%s,%s" % (c, f) for c, f, _ in seed)], u
+    return None, None
+
+
+def old_oracle(jar, spec, *args):
+    libs = os.path.join(os.path.dirname(jar), *[".."] * 4)          # .../libraries, for 1.12's guava
+    r = run([JAVA, "--sun-misc-unsafe-memory-access=allow", "-cp", BUILD, "OldGameOracle", jar, os.path.normpath(libs)]
+            + spec + [str(a) for a in args])
+    if r.returncode:
+        lines = [l for l in r.stderr.splitlines() if l.strip() and not l.startswith(("\tat ", "\t...", "WARNING"))]
+        return None, re.sub(r"^.*?(Exception|Error): ", "", lines[-1] if lines else "?")
+    return [l for l in r.stdout.splitlines() if l.startswith(("game ", "asked "))], None
 
 
 def parity(*args):
@@ -206,7 +280,7 @@ def check_perimeter_gen(bits, cx0, cz0, w, seed, bx, bz, band):
         cmd = next((l for l in secs.get(name, "").splitlines() if l.startswith("summon")), "")
         if len(cmd) > 32500:
             problems.append("%s command is %d chars, over the 32500 command-block limit" % (sec, len(cmd)))
-    # Slime Farm Studio's "slime chunks in floor": the same box and count as the game map and the generator
+    # SlimeByte's "slime chunks in floor": the same box and count as the game map and the generator
     R = PERIMETER_RADIUS
     cx0b, cz0b = floor16(bx - R), floor16(bz - R)
     nx, nz = floor16(bx + R) - cx0b + 1, floor16(bz + R) - cz0b + 1
@@ -217,7 +291,7 @@ def check_perimeter_gen(bits, cx0, cz0, w, seed, bx, bz, band):
     if (mine, nx * nz) != want or not hm or (int(hm[1]), int(hm[2])) != want:
         problems.append("studio floor count %d/%d, game %d/%d, perimeter_gen %s" % (
             (mine, nx * nz) + want + (hm and hm[1] + "/" + hm[2],)))
-    # Slime Farm Studio's Floor tab (slime_common.floor_block), block by block over the //pos box of the glass
+    # SlimeByte's Floor tab (slime_common.floor_block), block by block over the //pos box of the glass
     # skirt and a chunk past it: obsidian where the floor fills put it, magma where the border fills do, glass on
     # the rest of the box (//replace air glass), nothing outside
     off = None
@@ -247,19 +321,19 @@ def spawn_rule(jar):
     it as  ldc2_w 576.0 / dcmpg / ifgt  - i.e. "if d^2 > 576 carry on, else no spawn" (strict).
     Returns (class, 'strict' | 'inclusive' | None)."""
     import zipfile
-    pat = bytes([6]) + struct.pack(">d", 576.0)
+    pats = (bytes([6]) + struct.pack(">d", 576.0), bytes([4]) + struct.pack(">f", 576.0))   # betas: a float
     with zipfile.ZipFile(jar) as z:
         cands = [n[:-6].replace("/", ".") for n in z.namelist()
-                 if n.endswith(".class") and pat in z.read(n)]
+                 if n.endswith(".class") and any(p in z.read(n) for p in pats)]
     for c in cands:
         r = run(["javap", "-c", "-p", "-cp", jar, c])
         lines = [l.strip() for l in r.stdout.splitlines()]
         for i, l in enumerate(lines[:-2]):
-            if "double 576.0d" in l and lines[i + 1].endswith("dcmpg"):
+            if ("double 576.0d" in l or "float 576.0f" in l) and lines[i + 1].endswith(("dcmpg", "fcmpg")):
                 op = lines[i + 2].split()[1] if len(lines[i + 2].split()) > 1 else ""
                 if op == "ifgt":
                     return c, "strict"      # spawn only when d^2 > 576
-                if op == "iflt":
+                if op in ("iflt", "ifge"):  # 1.12 / betas: "if d^2 >= 576 go on to spawn, else skip"
                     return c, "inclusive"   # spawn when d^2 >= 576
     return None, None
 
@@ -300,7 +374,7 @@ def check_afk_rescan(bits, cx0, cz0, w, seed, ax, az):
 
 
 def studio_map(seed, cx0, cz0, w, h, path):
-    """slime_common.slime_row (Slime Farm Studio's map) vs a GameOracle map, bit for bit; 1 on a mismatch."""
+    """slime_common.slime_row (SlimeByte's map) vs a GameOracle map, bit for bit; 1 on a mismatch."""
     with open(path, "rb") as f:
         game = f.read()
     bad = slime = 0
@@ -359,11 +433,24 @@ def test_jar(jar, ncases):
     cls, rule = spawn_rule(jar)
     if rule == "strict":
         say("  spawn rule (%s bytecode): no spawn at d^2 <= 576 - strict, as slime_refine / afk_rescan vanilla_* assume  -> OK" % cls)
+    elif rule == "inclusive":
+        say("  spawn rule (%s bytecode): spawns at d^2 >= 576 - inclusive, like Carpet's /perimeterinfo: in this "
+            "version the carpet count is the in-game one, the vanilla_* columns one shell short  -> NOTE" % cls, "yellow")
     else:
-        say("  spawn rule: %s (%s) - the vanilla_* columns assume strict  -> FAIL" % (rule or "not found", cls), "red")
+        say("  spawn rule: not found (%s) - the vanilla_* columns assume strict  -> FAIL" % cls, "red")
         fails += 1
     binf = os.path.join(BUILD, "cases_%s.bin" % v)
+    ask = oracle
     out, err = oracle(jar, "cases", ncases, binf)
+    if out is None:                                  # before 1.18: the chunk's own instance method
+        spec, slime_cls = old_spec(jar)
+        if spec is None:
+            say("  skipped: no slime check found (%s)" % err, "yellow")
+            return None
+        say("  slime check: %s calls %s.%s(987234911).nextInt(10) == 0, x/z fields %s/%s" % (
+            slime_cls, spec[0], spec[1], spec[2], spec[3]), "darkgray")
+        ask = lambda j, *a: old_oracle(j, spec, *a)
+        out, err = ask(jar, "cases", ncases, binf)
     if out is None:
         say("  skipped: %s" % err, "yellow")
         return None
@@ -377,7 +464,7 @@ def test_jar(jar, ncases):
     for label, seed, ccx, ccz, do_gpu in WINDOWS:
         cx0, cz0, w = ccx - HALF, ccz - HALF, 2 * HALF + 1
         mf = os.path.join(BUILD, "map_%s_%d_%d.bin" % (v, ccx, ccz))
-        out, err = oracle(jar, "map", seed, cx0, cz0, w, w, mf)
+        out, err = ask(jar, "map", seed, cx0, cz0, w, w, mf)
         if out is None:
             say("  %s: oracle failed: %s" % (label, err), "red")
             fails += 1
@@ -470,7 +557,7 @@ def main():
     say("\n=== SUMMARY ===", "cyan")
     tested = {k: v for k, v in results.items() if v is not None}
     for k, v in results.items():
-        say("  %-12s %s" % (k, "skipped (no 1.18+ slime-chunk method)" if v is None else
+        say("  %-12s %s" % (k, "skipped (no slime check found)" if v is None else
                             ("PASS - 1:1 with the game" if v == 0 else "FAIL (%d checks)" % v)),
             "darkgray" if v is None else ("green" if v == 0 else "red"))
     if not tested:

@@ -1,7 +1,7 @@
-"""slime_studio_exe.py - the entry point of SlimeFarmStudio.exe, the Windows app built from these same files.
+"""slime_studio_exe.py - the entry point of SlimeByte.exe, the Windows app built from these same files.
 
-  SlimeFarmStudio.exe              opens the app (Slime Farm Studio, in Windows Terminal)
-  SlimeFarmStudio.exe <command>    the ./slime command line: doctor, hunt, perimeter, ...
+  SlimeByte.exe              opens the app (SlimeByte, in Windows Terminal)
+  SlimeByte.exe <command>    the ./slime command line: doctor, hunt, perimeter, ...
 
 Built in build.ps1 with PyInstaller when it's installed (pip install pyinstaller); people who run the .exe need
 nothing, not even Python. It goes next to slime_gpu.exe and the other tools and finds them there.

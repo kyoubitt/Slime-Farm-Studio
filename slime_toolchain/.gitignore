@@ -25,3 +25,8 @@ main/y_phase.csv
 main/logs/
 main/theory/
 main/slime_prefs.json
+
+# SlimeByte: saved searches and logs, per machine
+main/studio_results.json
+main/studio_tiles/
+logs/

@@ -2,7 +2,7 @@
 """slime - the easy way to drive the slime-farm toolchain.
 
   ./slime                                   menu: pick a number, answer a few questions
-  ./slime gui                               Slime Farm Studio: the app, right in this terminal, with a map
+  ./slime gui                               SlimeByte: the app, right in this terminal, with a map
 
 Or straight from the command line (the menu prints these for you as it goes):
 
@@ -723,7 +723,7 @@ def menu():
   4  Hunt for a record                       9  Check my setup
   5  Hunt progress so far                    0  Quit
 
-  g  Open the app (Slime Farm Studio): map, best spot, perimeter commands, build guide
+  g  Open the app (SlimeByte): map, best spot, perimeter commands, build guide
 """)
         c = ask("pick a number", None, str).strip()
         if c in ("0", "q", "quit", "exit"):
@@ -848,7 +848,7 @@ def build_parser():
     s.add_argument("--feet-y", type=int, default=-39, help="your feet y when you measured (default -39)")
     s.add_argument("--floor-y", type=int, default=-64)
 
-    sub.add_parser("gui", help="Slime Farm Studio: the app, full screen in this terminal (map, best spot, "
+    sub.add_parser("gui", help="SlimeByte: the app, full screen in this terminal (map, best spot, "
                                "perimeter commands, build guide)")
 
     s = sub.add_parser("doctor", help="check your setup, with the fix for anything wrong")
