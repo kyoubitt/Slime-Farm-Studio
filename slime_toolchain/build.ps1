@@ -42,6 +42,12 @@ nvcc -O3                afk_rescan.cpp -o afk_rescan.exe
 if ($LASTEXITCODE -ne 0) { Write-Host "afk_rescan.cpp FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
 nvcc -O3                geo_rank.cpp -o geo_rank.exe
 if ($LASTEXITCODE -ne 0) { Write-Host "geo_rank.cpp FAILED TO COMPILE" -ForegroundColor Red; exit 1 }
+# slime_cpu / slime_cl: the same position search without CUDA (AMD, Intel, or any CPU). The repo ships built copies;
+# a failure here is only a warning, since slime_gpu already does the job on this machine.
+nvcc -O3 -Xcompiler "/arch:AVX2" slime_cpu.cpp -o slime_cpu.exe
+if ($LASTEXITCODE -ne 0) { Write-Host "slime_cpu.cpp did not compile (the shipped slime_cpu.exe still works)" -ForegroundColor Yellow }
+nvcc -O3                slime_cl.cpp -o slime_cl.exe
+if ($LASTEXITCODE -ne 0) { Write-Host "slime_cl.cpp did not compile (the shipped slime_cl.exe still works)" -ForegroundColor Yellow }
 # phase_prepass: no --use_fast_math (its own header's build line)
 nvcc -O3 -arch=native   phase_prepass.cu -o phase_prepass.exe
 if ($LASTEXITCODE -ne 0) { Write-Host "phase_prepass.cu FAILED TO COMPILE" -ForegroundColor Red; exit 1 }

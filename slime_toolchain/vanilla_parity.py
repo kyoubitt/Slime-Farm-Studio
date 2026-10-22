@@ -16,8 +16,11 @@ with just the fields that method reads set (found in the jar's bytecode).
                 any int32 (every overflow path), and special seeds
   2. maps       complete 1001x1001-chunk maps at both record spots, the
                 origin, and both world-border corners
-  3. slime_gpu  its optimized bit/score kernels END TO END: best score over
-                801x801 centres vs the same score computed from the game's map
+  3. searches   slime_gpu (CUDA), slime_cl (OpenCL: AMD, Intel, Apple) and slime_cpu,
+                whichever work on this machine, END TO END: best score over
+                801x801 centres vs the same score computed from the game's map.
+                Plus once per run: all of them against each other on random
+                (seed, window) cases, edge and negative coordinates included
   4. perimeter  perimeter_setup's rig floor: every chunk it fills vs the game
   6. spawn rule the game's own NaturalSpawner bytecode: a spawn needs d^2 > 576
                 (strict) - the rule slime_refine and afk_rescan's vanilla_* use.
@@ -50,7 +53,8 @@ import re
 import subprocess
 import sys
 
-from slime_common import ROOT, floor_block, perimeter_band, require_tools, run_perimeter_gen, say, slime_row, tool
+from slime_common import (ROOT, SEARCH_TOOLS, floor_block, perimeter_band, require_tools, run_perimeter_gen, say,
+                          search_runs, slime_row, tool)
 
 PD = os.path.join(ROOT, "vanilla_parity")
 BUILD = os.path.join(ROOT, "main", "work", "parity")
@@ -475,24 +479,25 @@ def test_jar(jar, ncases):
         fails += studio_map(seed, cx0, cz0, w, w, mf)
 
         if do_gpu:
-            # slime_gpu's own optimized kernels, end to end, vs the game's map
-            r = run([tool("slime_gpu"), "--seed", str(seed), "--center-x", str(ccx * 16),
-                     "--center-z", str(ccz * 16), "--m-chunks", str(GPU_M)])
-            m = re.search(r"Best: score=(\d+) at x=-?\d+ z=-?\d+ \(chunk (-?\d+),(-?\d+)\)", r.stdout)
-            if not m:
-                say("    slime_gpu gave no result: %s" % (r.stdout + r.stderr).strip()[-200:], "red")
-                fails += 1
-            else:
-                g, gx, gz = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                rc, txt = parity("score", cx0, cz0, w, w, mf, ccx, ccz, GPU_M, gx, gz)
-                best, at = (int(t) for t in txt.split()[:2]) if rc == 0 else (-1, -1)
-                where = " ".join(txt.split()[2:]) if rc == 0 else ""
-                ok = g == best == at
-                say("    slime_gpu best over %dx%d centres: %d chunks at chunk (%d,%d) | from game map: best %d, "
-                    "that spot %d  -> %s" % (2 * GPU_M + 1, 2 * GPU_M + 1, g, gx, gz, best, at,
-                                             "OK" if ok else "FAIL  (game-map best at %s)" % where),
-                    None if ok else "red")
-                fails += not ok
+            # every search tool's own kernels, end to end, vs the game's map
+            for sname in (n for n in SEARCH_TOOLS if search_runs(n)):
+                r = run([tool(sname), "--seed", str(seed), "--center-x", str(ccx * 16),
+                         "--center-z", str(ccz * 16), "--m-chunks", str(GPU_M)])
+                m = re.search(r"Best: score=(\d+) at x=-?\d+ z=-?\d+ \(chunk (-?\d+),(-?\d+)\)", r.stdout)
+                if not m:
+                    say("    %s gave no result: %s" % (sname, (r.stdout + r.stderr).strip()[-200:]), "red")
+                    fails += 1
+                else:
+                    g, gx, gz = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    rc, txt = parity("score", cx0, cz0, w, w, mf, ccx, ccz, GPU_M, gx, gz)
+                    best, at = (int(t) for t in txt.split()[:2]) if rc == 0 else (-1, -1)
+                    where = " ".join(txt.split()[2:]) if rc == 0 else ""
+                    ok = g == best == at
+                    say("    %s best over %dx%d centres: %d chunks at chunk (%d,%d) | from game map: best %d, "
+                        "that spot %d  -> %s" % (sname, 2 * GPU_M + 1, 2 * GPU_M + 1, g, gx, gz, best, at,
+                                                 "OK" if ok else "FAIL  (game-map best at %s)" % where),
+                        None if ok else "red")
+                    fails += not ok
 
             # perimeter_setup: the exact chunks the in-game rig floors (its section 3 monolith)
             bx, bz = ccx * 16 + 8, ccz * 16 + 8
@@ -538,12 +543,45 @@ def test_jar(jar, ncases):
     return fails
 
 
+def check_searchers(n=60):
+    """Every search tool that works here, against each other, on random windows - the world border, negative and
+    huge coordinates, one-chunk windows and full 16000-chunk tiles. slime_cpu's own --self-test already checks it
+    against the naive scorer; this makes sure the GPU ones agree too."""
+    names = [t for t in SEARCH_TOOLS if search_runs(t)]
+    if len(names) < 2:
+        say("  searches: only %s here, nothing to compare" % (names[0] if names else "no search tool"), "darkgray")
+        return 0 if names else 1
+    import random
+    rnd = random.Random(48)
+    cases = [(71629181566, 0, 0, 16000), (-1, 1873800 * 16 - 3000, -1873800 * 16 + 3000, 1), (0, 0, 0, 1),
+             (42, 29900000, -29900000, 900), (-9223372036854775808, -17, 33, 250)]
+    for _ in range(n):
+        m = rnd.choice([1, 2, 7, 24, 64, 400, 2500, 5000])
+        lim = (1874000 - m - 9) * 16
+        cases.append((rnd.randrange(-2**63, 2**63), rnd.randint(-lim, lim), rnd.randint(-lim, lim), m))
+    fails = 0
+    for seed, x, z, m in cases:
+        got = {}
+        for t in names:
+            r = run([tool(t), "--seed", str(seed), "--center-x", str(x), "--center-z", str(z), "--m-chunks", str(m)])
+            hit = re.search(r"Best: score=(\d+) at x=(-?\d+) z=(-?\d+)", r.stdout)
+            got[t] = hit.groups() if hit else ("no result: " + (r.stdout + r.stderr).strip()[-120:],)
+        if len(set(got.values())) != 1:
+            fails += 1
+            say("  searches DIFFER  seed %d centre (%d,%d) m %d: %s" % (seed, x, z, m, got), "red")
+    say("  searches (%s) agree on %d random windows%s" % (", ".join(names), len(cases),
+                                                         "" if not fails else " - EXCEPT %d" % fails), "red" if fails else None)
+    return fails
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--jar", action="append", help="Minecraft client jar (repeatable); default: auto-find")
     ap.add_argument("--cases", type=int, default=20_000_000)
     o = ap.parse_args()
-    require_tools("slime_gpu", "perimeter_setup", "afk_rescan")
+    require_tools("perimeter_setup", "afk_rescan")
+    if not any(search_runs(t) for t in SEARCH_TOOLS):
+        sys.exit("no search tool works here (slime_gpu, slime_cl, slime_cpu) - run ./build.sh")
     jars = o.jar or find_jars()
     if not jars:
         sys.exit("no Minecraft client jar found - pass --jar path/to/client.jar")
@@ -552,6 +590,8 @@ def main():
     say("java: " + JAVA, "darkgray")
     build()
     results = {}
+    say("\nposition searches", "cyan")
+    search_fails = check_searchers()
     for j in jars:
         results[version_of(j)] = test_jar(j, o.cases)
     say("\n=== SUMMARY ===", "cyan")
@@ -560,9 +600,11 @@ def main():
         say("  %-12s %s" % (k, "skipped (no slime check found)" if v is None else
                             ("PASS - 1:1 with the game" if v == 0 else "FAIL (%d checks)" % v)),
             "darkgray" if v is None else ("green" if v == 0 else "red"))
+    say("  %-12s %s" % ("searches", "PASS - the tools agree" if not search_fails else "FAIL (%d windows)" % search_fails),
+        "green" if not search_fails else "red")
     if not tested:
         sys.exit("nothing tested")
-    return 1 if any(tested.values()) else 0
+    return 1 if any(tested.values()) or search_fails else 0
 
 
 if __name__ == "__main__":

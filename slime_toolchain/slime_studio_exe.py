@@ -4,7 +4,7 @@
   SlimeByte.exe <command>    the ./slime command line: doctor, hunt, perimeter, ...
 
 Built in build.ps1 with PyInstaller when it's installed (pip install pyinstaller); people who run the .exe need
-nothing, not even Python. It goes next to slime_gpu.exe and the other tools and finds them there.
+nothing, not even Python. It goes next to slime_gpu.exe, slime_cl.exe, slime_cpu.exe and the other tools and finds them there.
 """
 import importlib.machinery
 import importlib.util

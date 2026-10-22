@@ -1,6 +1,8 @@
 # Linux builds (build.sh) - -arch=native, so never portable between machines
 /hotspot_scan
 /slime_gpu
+/slime_cl
+/slime_cpu
 /slime_refine
 /perimeter_setup
 __pycache__/

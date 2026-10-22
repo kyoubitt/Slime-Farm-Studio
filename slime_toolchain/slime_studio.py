@@ -36,17 +36,20 @@ import unicodedata
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from slime_common import (DATA, PERIMETER_BANDS, ROOT, ToolError, floor_block, load_prefs, perimeter_band,  # noqa: E402
-                          require_tools, run_perimeter_gen, save_prefs, slime_row, tool)
+from slime_common import (DATA, PERIMETER_BANDS, ROOT, SEARCH_ON, SEARCH_TOOLS, ToolError, floor_block,  # noqa: E402
+                          load_prefs, perimeter_band, require_tools, run_perimeter_gen, save_prefs, searcher,
+                          slime_row, tool)
 
 PERIMETERS = os.path.join(DATA, "perimeters")
 RESULTS = os.path.join(DATA, "studio_results.json")   # every finished search, so it never runs twice
-TILES = os.path.join(DATA, "studio_tiles")            # each GPU tile's answer, per seed: a stopped scan resumes
+TILES = os.path.join(DATA, "studio_tiles")            # each tile's answer, per seed: a stopped scan resumes
 TILE_M = 16000                 # slime_gpu --m-chunks caps here (+-256,000 blocks per call)
 EDGE = 1874000 - 8             # slime_gpu: |centre chunk| + m-chunks + 8 <= 1,874,000
 WORLD_RANGE = 29_983_000       # the whole world, to within ~16k blocks of the border (slime_gpu's edge)
 PRESETS = [("10k", 10_000), ("100k", 100_000), ("1M", 1_000_000), ("10M", 10_000_000), ("World", 30_000_000)]
-TILE_S = 0.026                 # seconds per full GPU tile through one --worker, measured on an RTX 4050 laptop
+# seconds per full tile through one --worker, as measured on a laptop (RTX 4050 / Radeon 680M / 6 cores): the first guess,
+# replaced by this machine's own timing after its first big scan
+TILE_S = {"slime_gpu": 0.03, "slime_cl": 0.35, "slime_cpu": 0.25}
 LIMIT = 32500                  # characters a command block holds
 RADIUS = 152                   # perimeter_gen/src/Perimeter.c RADIUS
 WORLD = 30_000_000
@@ -830,9 +833,14 @@ def eta(secs):
     return "%d h %02d min" % (secs // 3600, secs % 3600 // 60)
 
 
+def raise_no_search():
+    raise ToolError("no search tool works here - run ./build.sh, then ./slime doctor")
+
+
 def gpu_tiles(job, seed, centers, m, known=None):
-    """Many fixed-seed position searches through ONE slime_gpu --worker: the CUDA start-up (~0.3 s, nearly all
-    of a lone tile's time) is paid once, so the whole world's 13,924 tiles take minutes, not an hour.
+    """Many fixed-seed position searches through ONE --worker (slime_gpu, slime_cl or slime_cpu): the start-up
+    (~0.3 s, nearly all of a lone tile's time on a GPU) is paid once, so the whole world's 13,924 tiles take
+    minutes on a graphics card, not an hour.
     Each line is the exact CLI search ./slime best-spot runs. Stops early on cancel; returns what it has.
     known: {"m cx cz": [chunks, x, z]} from earlier scans of this seed - those tiles aren't run again, and
     every new one is added to it."""
@@ -841,11 +849,12 @@ def gpu_tiles(job, seed, centers, m, known=None):
     out = [tuple(known["%d %d %d" % (m, c[0], c[1])]) for c in centers if "%d %d %d" % (m, c[0], c[1]) in known]
     if not todo:
         return out
-    p = subprocess.Popen([tool("slime_gpu"), "--worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    name = searcher() or raise_no_search()
+    p = subprocess.Popen([tool(name), "--worker"], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, bufsize=1)
     try:
-        if p.stdout.readline().strip() != "WORKER READY":
-            raise ToolError("slime_gpu --worker didn't start - ./slime doctor checks your setup")
+        if not any(l.strip() == "WORKER READY" for l in p.stdout):     # (a graphics driver may print its own lines first)
+            raise ToolError("%s --worker didn't start - ./slime doctor checks your setup" % name)
         t0 = time.time()
         for k, (cx, cz) in enumerate(todo):
             if job.cancel.is_set():
@@ -862,13 +871,13 @@ def gpu_tiles(job, seed, centers, m, known=None):
                 elif line.startswith("===SPOT-DONE==="):
                     break
             if best is None:
-                raise ToolError("slime_gpu: %s" % (err or "stopped mid-scan"))
+                raise ToolError("%s: %s" % (name, err or "stopped mid-scan"))
             out.append(best)
             known["%d %d %d" % (m, cx, cz)] = list(best)
             el = time.time() - t0
             job.tile_s = el / (k + 1)
             done = len(centers) - len(todo) + k + 1
-            job.progress = "GPU tiles %s of %s, %s left" % (fmt(done), fmt(len(centers)),
+            job.progress = "tiles %s of %s, %s left" % (fmt(done), fmt(len(centers)),
                                                            eta(job.tile_s * (len(todo) - k - 1)))
             job.frac = done / len(centers)
     finally:
@@ -887,7 +896,7 @@ def gpu_tiles(job, seed, centers, m, known=None):
 def search_worker(cli, job, seed, mode, rng, x, z):
     tiles, m = tiles_for(rng)
     if len(tiles) == 1:
-        job.progress = "GPU search"
+        job.progress = "searching on " + SEARCH_ON[searcher() or raise_no_search()]
         cands = [cli.gpu_best(seed, x, z, m)]
     else:
         known = load_json(tiles_path(seed), {})
@@ -896,7 +905,7 @@ def search_worker(cli, job, seed, mode, rng, x, z):
         if len(known) > before:
             save_json(tiles_path(seed), known)
         if len(tiles) >= 16 and len(known) - before >= 16:
-            save_prefs(studio_tile_s=round(job.tile_s * (m / TILE_M) ** -2, 4))   # this GPU's speed, per full tile
+            save_prefs(**{"studio_tile_s_" + searcher(): round(job.tile_s * (m / TILE_M) ** -2, 4)})   # this machine's speed, per full tile
     if not cands:
         return None
     partial = len(cands) < len(tiles)
@@ -1124,18 +1133,16 @@ class App:
         self.view_auto = True                 # re-fit the map to the window until you zoom or pan yourself
         self.map_view = "chunks"              # the map card's tab: chunks, or the floor the commands build
         self.help, self.confirm_long, self.dense = False, False, False
-        self.tile_s = p.get("studio_tile_s")  # this GPU's measured seconds per full tile, once a big scan ran
+        self.search = next((n for n in SEARCH_TOOLS if os.path.exists(tool(n))), None)   # what Find will use, if it runs
+        self.tile_s = self.saved_tile_s(p)    # this machine's measured seconds per full tile, once a big scan ran
         self.tab, self.focus, self.focus_moved = "find", "seed", False
         self.scroll, self.copy_i = {}, {}
         self.status, self.toast, self.job = None, None, None
         self.drag, self.hover, self.mapgeo = None, None, None
         self.minecraft = False
-        self.missing = [n for n in ("slime_gpu", "slime_refine", "afk_rescan") if not os.path.exists(tool(n))]
-        # only the GPU tool missing, the rest built: a CPU-only install (macOS, no NVIDIA card) - not an unbuilt tree
-        self.no_gpu = self.missing == ["slime_gpu"]
-        if self.no_gpu:
-            self.missing = []
-            self.mode = "manual"
+        self.missing = [n for n in ("slime_refine", "afk_rescan") if not os.path.exists(tool(n))]
+        if not self.search:
+            self.missing.append("slime_cpu")
         if not os.path.exists(os.path.join(ROOT, "perimeter_gen", "perimeter_gen" + (".exe" if os.name == "nt" else ""))):
             self.missing.append("perimeter_gen")
         self.chunks, self.map_cache, self.floor_cache = {}, (None, None), (None, None)
@@ -1231,15 +1238,12 @@ class App:
         key = search_key(self.seed, self.mode, rng, x, z)
         if key in self.results:                            # searched before: the same answer, now
             return self.on_result(dict(self.results[key]["res"]), self.results[key]["secs"], saved=True)
-        if self.no_gpu:
-            return self.set_status("Best AFK and Cluster search run on an NVIDIA GPU (CUDA), which this install doesn't "
-                                   "have. Use Manual: type or click a spot, and Score it.", "err")
-        miss = [t for t in ("slime_gpu", "slime_refine") if t in self.missing]
+        miss = [t for t in ("slime_cpu", "slime_refine") if t in self.missing]
         if miss:
             return self.set_status("%s not built - run %s first" % (", ".join(miss), self.build_cmd()), "err")
         if self.minecraft and len(tiles_for(rng)[0]) > 16 and not self.confirm_long:
             self.confirm_long = True
-            return self.set_status("Minecraft is open. A long GPU scan next to it can crash some laptops: close it, "
+            return self.set_status("Minecraft is open. A long scan next to it can crash some laptops: close it, "
                                    "or press Find again to start anyway.", "err")
         self.confirm_long = False
         self.start("search", search_worker, lambda res, secs: self.on_result(res, secs, key=key),
@@ -1260,11 +1264,11 @@ class App:
         elif res["mode"] == "manual":
             self.set_status("scored in %s" % took, "ok")
         elif res.get("partial"):
-            self.set_status("stopped after %s of %s GPU tiles - the best of those" % (fmt(res["scanned"]), fmt(res["tiles"])))
+            self.set_status("stopped after %s of %s tiles - the best of those" % (fmt(res["scanned"]), fmt(res["tiles"])))
         else:
-            self.set_status("found in %s%s" % (took, " (%s GPU tiles)" % fmt(res["tiles"]) if res["tiles"] > 1 else ""), "ok")
+            self.set_status("found in %s%s" % (took, " (%s tiles)" % fmt(res["tiles"]) if res["tiles"] > 1 else ""), "ok")
         if res.get("tiles", 0) >= 16:
-            self.tile_s = load_prefs().get("studio_tile_s", self.tile_s)
+            self.tile_s = self.saved_tile_s(load_prefs()) or self.tile_s
 
     def restore_result(self, keep_afk=False, recenter=True):
         """This seed's last finished search, with the inputs that made it, so Find gives it straight back."""
@@ -1310,14 +1314,17 @@ class App:
         n = i + d
         self.set_range(vals[n % len(vals)] if wrap_around else vals[max(0, min(len(vals) - 1, n))])
 
+    def saved_tile_s(self, prefs):
+        return prefs.get("studio_tile_s_" + (self.search or "")) or (prefs.get("studio_tile_s") if self.search == "slime_gpu" else None)
+
     def estimate(self, rng):
-        """Tiles and time for a search of +-rng: this GPU's measured speed once a big scan ran here."""
+        """Tiles and time for a search of +-rng: this machine's measured speed once a big scan ran here."""
         world = rng >= WORLD_RANGE
         tiles, m = tiles_for(WORLD_RANGE if world else rng)
         n = len(tiles)
-        secs = 0.4 + (0 if n == 1 else n * (self.tile_s or TILE_S) * (m / TILE_M) ** 2) + 0.03 * min(n, 32)
-        where = "" if n < 100 else (" on this GPU" if self.tile_s else " on an RTX 4050 laptop")
-        return "%s%s GPU tile%s, about %s%s." % ("The whole world from 0, 0: " if world else "", fmt(n),
+        secs = 0.4 + (0 if n == 1 else n * (self.tile_s or TILE_S.get(self.search, 0.3)) * (m / TILE_M) ** 2) + 0.03 * min(n, 32)
+        where = "" if n < 100 else (" on " + SEARCH_ON.get(self.search, "this machine") if self.tile_s else " on " + SEARCH_ON.get(self.search, "this machine") + " (a rough guess)")
+        return "%s%s tile%s, about %s%s." % ("The whole world from 0, 0: " if world else "", fmt(n),
                                                 "" if n == 1 else "s", eta(secs), where)
 
     def cancel(self):
@@ -1923,13 +1930,13 @@ class App:
 
     def warnings(self):
         out = []
-        if self.no_gpu:
-            out.append("No NVIDIA GPU here, so Best AFK and Cluster search are off. Manual scoring, the map and the "
-                       "perimeter commands all work.")
+        if self.search == "slime_cpu":
+            out.append("Searching on the CPU: fine up to ±1M blocks, slow for the whole world. A graphics card with OpenCL "
+                       "(or an NVIDIA GPU with CUDA) is much faster.")
         if self.missing:
             out.append("Not built yet: %s. Run %s, then open this again." % (", ".join(self.missing), self.build_cmd()))
         if self.minecraft:
-            out.append("Minecraft is running. Close it before big searches: heavy GPU work next to it can crash "
+            out.append("Minecraft is running. Close it before big searches: heavy work next to it can crash "
                        "some laptops.")
         return out
 

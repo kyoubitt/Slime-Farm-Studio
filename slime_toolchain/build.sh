@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # build.sh - Linux equivalent of build.ps1: all four tools, one folder, one
-# slime_core.h, then the three self-tests. Mandatory first step on any machine
+# slime_core.h, then the self-tests. Mandatory first step on any machine
 # (see AI_CONTEXT.md, "STOP - BUILD FIRST"): -arch=native bakes in THIS
 # GPU's compute capability, so binaries from another box will not run here.
 #
 #   ./build.sh            build + self-tests + orientation banner
 #   ./build.sh --no-test  build only
-#   ./build.sh --cpu-only just the tools that need no GPU (slime_refine, perimeter_setup, afk_rescan, geo_rank,
-#                         perimeter_gen). This is also what happens, with a note, when there's no nvcc: macOS
-#                         and any machine without an NVIDIA GPU. The app then does Manual scoring, the map and
-#                         the perimeter commands; Best AFK / Cluster search needs the GPU build.
+#   ./build.sh --cpu-only just the tools that need no CUDA (slime_cpu, slime_cl, slime_refine, perimeter_setup,
+#                         afk_rescan, geo_rank, perimeter_gen). This is also what happens, with a note, when
+#                         there's no nvcc: macOS and any machine without an NVIDIA GPU. Best AFK / Cluster search
+#                         then runs on slime_cl (any graphics card with OpenCL: AMD, Intel, Apple) or slime_cpu.
 #
 # Environment overrides:
 #   NVCC=/path/to/nvcc     default: nvcc on PATH, else /opt/cuda/bin/nvcc,
@@ -60,8 +60,8 @@ if [[ -n "${CUDA_ARCH:-}" ]]; then NVFLAGS+=(-arch="$CUDA_ARCH"); else NVFLAGS+=
 # Delete first. The Windows build learned this the hard way: if a compile
 # fails and the old binary survives, the self-tests below "pass" against it
 # and prove nothing about the source just edited.
-ALL_TOOLS=(hotspot_scan slime_gpu slime_refine perimeter_setup afk_rescan geo_rank phase_prepass)
-TOOLS=(slime_refine perimeter_setup afk_rescan geo_rank)
+ALL_TOOLS=(hotspot_scan slime_gpu slime_cl slime_cpu slime_refine perimeter_setup afk_rescan geo_rank phase_prepass)
+TOOLS=(slime_cl slime_cpu slime_refine perimeter_setup afk_rescan geo_rank)
 (( CPU_ONLY )) || TOOLS=("${ALL_TOOLS[@]}")
 for t in "${ALL_TOOLS[@]}"; do rm -f "$t" "$t.exe"; done
 rm -f perimeter_gen/perimeter_gen
@@ -72,6 +72,14 @@ cyan "building..."
 build() { local name="$1"; shift; if ! "$@"; then red "$name FAILED TO COMPILE"; exit 1; fi; }
 (( CPU_ONLY )) || build hotspot_scan.cu    "$NVCC" "${NVFLAGS[@]}" hotspot_scan.cu -o hotspot_scan
 (( CPU_ONLY )) || build slime_gpu.cu       "$NVCC" "${NVFLAGS[@]}" slime_gpu.cu    -o slime_gpu
+# slime_cpu / slime_cl: the position search without CUDA. slime_cpu is several times faster built for this very
+# CPU (AVX2 / NEON), so use the compiler's "native" flag where it takes one (-march on x86, -mcpu on Apple silicon).
+NATIVE=()
+for f in -march=native -mcpu=native; do
+    if echo 'int main(){return 0;}' | "$CXX" "$f" -x c++ - -o /dev/null 2>/dev/null; then NATIVE=("$f"); break; fi
+done
+build slime_cpu.cpp      "$CXX" -O3 ${NATIVE[@]+"${NATIVE[@]}"} -std=c++17 -pthread slime_cpu.cpp -o slime_cpu
+build slime_cl.cpp       "$CXX" -O2 -std=c++17 slime_cl.cpp -ldl -o slime_cl     # opens the OpenCL driver at run time: no SDK
 build slime_refine.cpp   "$CXX" -O3 -std=c++17 -pthread slime_refine.cpp    -o slime_refine
 build perimeter_setup.cpp "$CXX" -O3 -std=c++17         perimeter_setup.cpp -o perimeter_setup
 build afk_rescan.cpp     "$CXX" -O3 -std=c++17         afk_rescan.cpp   -o afk_rescan
@@ -100,8 +108,10 @@ if (( RUN_TESTS )); then
     if (( CPU_ONLY )); then
         cyan "self-test"
         ./slime_refine --self-test || { red "slime_refine FAILED"; exit 1; }
+        ./slime_cpu    --self-test | tail -1 | grep -q PASSED || { red "slime_cpu FAILED"; exit 1; }
+        if ./slime_cl --self-test >/dev/null 2>&1; then dim "slime_cl: runs on this graphics card"; else dim "slime_cl: no usable OpenCL graphics card here (slime_cpu does the search)"; fi
         echo
-        grn "slime_refine self-test passed (CPU-only build: no GPU tools)."
+        grn "Self-tests passed (CPU-only build: no CUDA tools)."
     else
         cyan "self-tests (all three must pass)"
         ./hotspot_scan --self-test || { red "hotspot_scan FAILED"; exit 1; }
@@ -116,9 +126,9 @@ fi
 
 if (( CPU_ONLY )); then
     echo
-    cyan "CPU-only build done: slime_refine, perimeter_setup, afk_rescan, geo_rank, perimeter_gen."
-    dim "Run ./slime gui (or slimebyte). Best AFK / Cluster search needs an NVIDIA GPU + CUDA (then ./build.sh again);"
-    dim "Manual scoring, the map and the perimeter commands work as they are."
+    cyan "Build done: slime_cpu, slime_cl, slime_refine, perimeter_setup, afk_rescan, geo_rank, perimeter_gen."
+    dim "Run ./slime gui (or slimebyte). Best AFK / Cluster search runs on slime_cl (any OpenCL graphics card) or slime_cpu;"
+    dim "an NVIDIA GPU with CUDA is faster still (install the CUDA toolkit, then ./build.sh again)."
     exit 0
 fi
 

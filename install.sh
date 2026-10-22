@@ -11,12 +11,12 @@
 # install yourself. What it does:
 #   1. checks for git, python3 and a C/C++ compiler (and tells you the command to get any that's missing)
 #   2. downloads SlimeByte to ~/.local/share/slimebyte
-#   3. builds the tools: the GPU ones too if the CUDA toolkit (nvcc) is installed, otherwise just the CPU
-#      ones (then Best AFK / Cluster search is off, and Manual scoring, the map and the commands work)
+#   3. builds the tools: the CUDA ones too if the toolkit (nvcc) is installed. Without it the search runs on any
+#      graphics card with OpenCL (AMD, Intel, Apple), or else on the CPU
 #   4. puts a `slimebyte` command in ~/.local/bin
 #
 # Overrides (environment): SLIMEBYTE_HOME (install folder), SLIMEBYTE_BIN (where `slimebyte` goes),
-# SLIMEBYTE_CPU_ONLY=1 (skip the GPU tools even with CUDA), SLIMEBYTE_REPO / SLIMEBYTE_BRANCH.
+# SLIMEBYTE_CPU_ONLY=1 (skip the CUDA tools even with the toolkit), SLIMEBYTE_REPO / SLIMEBYTE_BRANCH.
 set -euo pipefail
 
 REPO="${SLIMEBYTE_REPO:-https://github.com/kyoubitt/SlimeByte.git}"
@@ -88,11 +88,11 @@ export CXX="${CXX:-$(command -v g++ || command -v clang++)}"
 export CC="${CC:-$(command -v gcc || command -v clang || command -v cc)}"
 flags=(--no-test)
 [[ -n "${SLIMEBYTE_CPU_ONLY:-}" ]] && flags+=(--cpu-only)
-cyan "building (the GPU tools take a minute or two; the CPU ones are quick)"
+cyan "building (the CUDA tools take a minute or two; the others are quick)"
 if ! ./build.sh "${flags[@]}"; then
     if [[ -z "${SLIMEBYTE_CPU_ONLY:-}" ]]; then
-        red "the GPU build failed (often a CUDA / g++ version mismatch: see LINUX.md, NVCC_CCBIN)."
-        cyan "building the CPU tools only instead"
+        red "the CUDA build failed (often a CUDA / g++ version mismatch: see LINUX.md, NVCC_CCBIN)."
+        cyan "building without CUDA instead (the search then uses OpenCL or the CPU)"
         ./build.sh --no-test --cpu-only || die "build failed - see the messages above."
     else
         die "build failed - see the messages above."
@@ -116,4 +116,4 @@ case ":$PATH:" in
        echo "    echo 'export PATH=\"$BIN:\$PATH\"' >> ~/.profile   # (or your shell's rc file), then open a new terminal"
        echo "or run it right now with:  $BIN/slimebyte" ;;
 esac
-[[ -x "$DEST/slime_toolchain/slime_gpu" ]] || dim "No GPU tools built: Manual scoring, the map and the commands work; Best AFK / Cluster need an NVIDIA GPU + CUDA."
+[[ -x "$DEST/slime_toolchain/slime_gpu" ]] || dim "No CUDA: Best AFK / Cluster search uses your graphics card through OpenCL, or the CPU ('slimebyte doctor' says which.)"

@@ -32,9 +32,9 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from slime_common import (DATA, PERIMETER_BANDS, ROOT, die, load_prefs, num, perimeter_band,  # noqa: E402
-                          ps_command, read_csv, require_tools, run_capture, run_perimeter_gen,
-                          save_prefs, say, tool, write_text)
+from slime_common import (DATA, PERIMETER_BANDS, ROOT, SEARCH_ON, SEARCH_TOOLS, die, load_prefs, num,  # noqa: E402
+                          perimeter_band, ps_command, read_csv, require_tools, run_capture,
+                          run_perimeter_gen, save_prefs, say, search_runs, searcher, tool, write_text)
 
 WORK = os.path.join(DATA, "work")
 RECORDS = os.path.join(DATA, "records")
@@ -93,14 +93,15 @@ def verdict(cq):
 
 # ---- tool calls ---------------------------------------------------------------------
 def gpu_best(seed, x, z, m_chunks):
-    """Fixed-seed position search on the GPU -> (chunks, bx, bz)."""
-    rc, lines = run_capture([tool("slime_gpu"), "--seed", str(seed), "--center-x", str(x),
+    """Fixed-seed position search (the NVIDIA GPU, else any OpenCL card, else the CPU) -> (chunks, bx, bz)."""
+    name = searcher() or die("no search tool works here - run ./build.sh, then ./slime doctor")
+    rc, lines = run_capture([tool(name), "--seed", str(seed), "--center-x", str(x),
                              "--center-z", str(z), "--m-chunks", str(m_chunks)])
     for l in lines:
         m = re.match(r"Best: score=(\d+) at x=(-?\d+) z=(-?\d+)", l)
         if m:
             return int(m.group(1)), int(m.group(2)), int(m.group(3))
-    die("slime_gpu gave no result:\n  " + "\n  ".join(lines[-8:]) + "\n(./slime doctor checks your setup)")
+    die("%s gave no result:\n  " % name + "\n  ".join(lines[-8:]) + "\n(./slime doctor checks your setup)")
 
 
 def refine(seeds, x, z, radius=6, family=None, images=False, tag="score"):
@@ -171,7 +172,8 @@ def remember_farm(seed, x, z, best=None):
 
 # ---- best-spot ------------------------------------------------------------------------
 def cmd_best_spot(o):
-    require_tools("slime_gpu", "slime_refine")
+    require_tools("slime_refine")
+    on = SEARCH_ON[searcher() or die("no search tool works here - run ./build.sh, then ./slime doctor")]
     passes = [("10k", 625, [(0, 0)]), ("100k", 6250, [(0, 0)])]
     if not o.no_million:
         # --m-chunks caps at 16000 (+/-256k blocks), so 1M is a 4x4 grid of
@@ -180,7 +182,7 @@ def cmd_best_spot(o):
         passes.append(("1M", 16000, [(dx, dz) for dx in offs for dz in offs]))
     results = []
     for label, m, tiles in passes:
-        say("searching %-4s blocks around (%d,%d) on the GPU..." % (label, o.x, o.z), "cyan")
+        say("searching %-4s blocks around (%d,%d) on %s..." % (label, o.x, o.z, on), "cyan")
         cands = []
         for dx, dz in tiles:
             c, bx, bz = gpu_best(o.seed, o.x + dx, o.z + dz, m)
@@ -584,6 +586,7 @@ def cmd_stop(o):
 # ---- doctor ------------------------------------------------------------------------------
 TOOL_SOURCES = {
     "hotspot_scan": ["hotspot_scan.cu", "cuda_device.h"], "slime_gpu": ["slime_gpu.cu", "cuda_device.h"],
+    "slime_cl": ["slime_cl.cpp"], "slime_cpu": ["slime_cpu.cpp"],
     "phase_prepass": ["phase_prepass.cu", "cuda_device.h"], "slime_refine": ["slime_refine.cpp", "png_writer.h"],
     "perimeter_setup": ["perimeter_setup.cpp"], "afk_rescan": ["afk_rescan.cpp"], "geo_rank": ["geo_rank.cpp"],
     "perimeter_gen/perimeter_gen": ["perimeter_gen/src/Perimeter.c", "perimeter_gen/src/main.c",
@@ -615,13 +618,13 @@ def cmd_doctor(o):
     if smi:
         r = subprocess.run([smi, "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
         gpu = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else ""
-    line(bool(gpu), "NVIDIA GPU", gpu or "not found", "install the NVIDIA driver (Arch: nvidia-open or nvidia)")
+    line(bool(gpu), "NVIDIA GPU", gpu or "not found - fine: the search runs on OpenCL or the CPU instead")
     nvcc = shutil.which("nvcc") or next((p for p in ["/opt/cuda/bin/nvcc", "/usr/local/cuda/bin/nvcc"] if os.path.exists(p)), None)
     ver = ""
     if nvcc:
         m = re.search(r"release ([\d.]+)", subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout)
         ver = m.group(1) if m else "?"
-    line(bool(nvcc), "CUDA toolkit (nvcc)", ver or "not found", "install the CUDA toolkit (Arch: sudo pacman -S cuda)")
+    line(bool(nvcc), "CUDA toolkit (nvcc)", ver or "not found - only the NVIDIA-only tools need it (Arch: sudo pacman -S cuda)")
     cxx = shutil.which("g++") or shutil.which("cl")
     line(bool(cxx), "C++ compiler", os.path.basename(cxx) if cxx else "not found",
          "install gcc (Arch: sudo pacman -S gcc)" if not win else "install VS Build Tools (C++ workload)")
@@ -636,6 +639,9 @@ def cmd_doctor(o):
     for name, srcs in TOOL_SOURCES.items():
         exe = os.path.join(ROOT, name + (".exe" if win else ""))
         if not os.path.exists(exe):
+            if name in ("hotspot_scan", "slime_gpu", "phase_prepass") and not nvcc:
+                line(False, os.path.basename(name), "not built - needs an NVIDIA GPU with CUDA (the search runs without it)")
+                continue
             line(False, os.path.basename(name), "not built", build)
             built_ok = False
             continue
@@ -644,15 +650,19 @@ def cmd_doctor(o):
         stale = os.path.getmtime(exe) < newest
         line(not stale, os.path.basename(name), "older than its source - rebuild" if stale else "built", build if stale else None)
         built_ok &= not stale
-    if os.path.exists(tool("slime_gpu")):
-        rc, out = run_capture([tool("slime_gpu"), "--seed", "1", "--m-chunks", "1"], timeout=60)
-        txt = " ".join(out)
-        if any(l.startswith("Best:") for l in out):
-            line(True, "runs on this GPU", "yes")
-        elif "no kernel image" in txt:
-            line(False, "runs on this GPU", "built for a different GPU", build)
-        else:
-            line(False, "runs on this GPU", (out[-1] if out else "no output")[:70], build + "   (then ./slime doctor again)")
+    for name in SEARCH_TOOLS:
+        if os.path.exists(tool(name)):
+            rc, out = run_capture([tool(name), "--seed", "1", "--m-chunks", "1", "--center-x", "0", "--center-z", "0"], timeout=60)
+            if any(l.startswith("Best:") for l in out):
+                line(True, "%s runs" % name, "yes, on " + SEARCH_ON[name])
+            elif "no kernel image" in " ".join(out):
+                line(False, "%s runs" % name, "built for a different GPU", build)
+            else:
+                line(False, "%s runs" % name, (out[-1] if out else "no output")[:70],
+                     build if name == "slime_cpu" else None)
+    best = searcher()
+    line(bool(best), "position search", ("using " + SEARCH_ON[best]) if best else "no search tool works here",
+         build + "   (then ./slime doctor again)")
     if os.path.exists(tool("slime_refine")):
         rc, out = run_capture([tool("slime_refine"), "--self-test"], timeout=120)
         line(any("SELF TEST PASSED" in l for l in out), "scoring self-test", "passed" if rc == 0 else "FAILED", build)

@@ -92,6 +92,31 @@ def run_capture(args, timeout=None):
         return None, out.splitlines()
 
 
+# ---- the position search: three tools, one answer ---------------------------------------------------
+# slime_gpu (CUDA, NVIDIA) is fastest; slime_cl runs on any graphics card with an OpenCL driver (AMD, Intel, Apple);
+# slime_cpu uses every core and always works. Same flags, same output, same tie-break.
+SEARCH_TOOLS = ("slime_gpu", "slime_cl", "slime_cpu")
+SEARCH_ON = {"slime_gpu": "the NVIDIA GPU", "slime_cl": "the graphics card (OpenCL)", "slime_cpu": "the CPU"}
+_search_runs = {}
+
+
+def search_runs(name):
+    """Whether this search tool is built AND runs here (a 1-chunk search, tried once per process): the OpenCL one
+    exits with an error on a machine with no driver, or a card that gets a different answer from the CPU."""
+    if name not in _search_runs:
+        ok = False
+        if os.path.exists(tool(name)):
+            rc, out = run_capture([tool(name), "--seed", "1", "--m-chunks", "1", "--center-x", "0", "--center-z", "0"], timeout=60)
+            ok = rc == 0 and any(l.startswith("Best:") for l in out)
+        _search_runs[name] = ok
+    return _search_runs[name]
+
+
+def searcher():
+    """The fastest search tool that works here, or None."""
+    return next((n for n in SEARCH_TOOLS if search_runs(n)), None)
+
+
 # ---- remembered answers for ./slime's menu (a convenience only) --------------------------
 PREFS = os.path.join(DATA, "slime_prefs.json")
 
