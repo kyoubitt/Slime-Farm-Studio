@@ -1,7 +1,7 @@
 // cuda_device.h - --device N, shared by hotspot_scan.cu and slime_gpu.cu.
 //
 // Without this every process piles onto GPU 0 regardless of how many cards
-// exist (AI_CONTEXT.md, "WHAT'S GENUINELY NOT DONE"). The flag is consumed
+// exist (OVERVIEW.md, "WHAT'S GENUINELY NOT DONE"). The flag is consumed
 // and REMOVED from argv before the tool's own parser runs, so neither tool's
 // "unknown arg" check needs to know about it, and slime_gpu's --worker spot
 // lines (parsed by the same parseOneArg) never see it - a device is chosen

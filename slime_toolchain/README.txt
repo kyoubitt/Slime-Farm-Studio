@@ -6,7 +6,7 @@ New here? Run ./slime gui (the app, right in your terminal) or ./slime for a men
 (one page) first. On Windows: python slime gui.
 This file is the command reference. FEATURES.txt has a quick capability
 checklist, STEP_BY_STEP_GUIDE.txt explains the concepts from easy to hard,
-AI_CONTEXT.md is where to start, docs\ holds the detail, and docs\REFERENCE.md
+OVERVIEW.md is where to start, docs\ holds the detail, and docs\REFERENCE.md
 is the older everything-in-one-place reference.
 ================================================================================
 [STOP] BUILD FIRST. This copy ships NO .exe files, on purpose: they are compiled
@@ -45,7 +45,7 @@ is the older everything-in-one-place reference.
       otherwise nvcc errors, the old .exe files survive, and the self-tests
       "PASS" against stale binaries while proving nothing about the source.
   Skip the rebuild ONLY on the same machine that produced the binaries, with
-  no source change since. See AI_CONTEXT.md's STOP section for detail.
+  no source change since. See OVERVIEW.md's STOP section for detail.
 ================================================================================
 [!!!] READ THIS BEFORE TRUSTING A SINGLE NUMBER BELOW: every wall-clock
   figure and every tuned default in this entire file (-Seconds, -GateTop,

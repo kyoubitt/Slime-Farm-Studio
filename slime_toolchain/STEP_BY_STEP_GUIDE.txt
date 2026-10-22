@@ -23,7 +23,7 @@ That needs the CUDA Toolkit (for nvcc - and a toolkit-ONLY CUDA 13 install
 needs the cuda_crt, libnvvm and cuda_nvcc bin/crt components added or it
 cannot compile a .cu at all) plus Visual Studio Build Tools with the
 "Desktop development with C++" workload (for cl.exe). Neither ships in this
-folder. Full detail in AI_CONTEXT.md's STOP section and README.txt's header.
+folder. Full detail in OVERVIEW.md's STOP section and README.txt's header.
 
 IMPORTANT, before any command below: every speed number and every tuned
 default anywhere in this project was measured on ONE specific GPU, not a
@@ -419,11 +419,7 @@ estimate (it did twice, by ~200), the estimate is the one that is wrong.
 ================================================================================
 - README.txt: the actual command reference, kept current, read top-down.
 - FEATURES.txt: a scannable checklist of everything this toolchain can do.
-- AI_CONTEXT.md (start here) and docs/ - docs/REFERENCE.md is the older full
+- OVERVIEW.md (start here) and docs/ - docs/REFERENCE.md is the older full
   reference: every hard number, the exact code for the trickier finds,
   and rejected ideas, no narrative - written to be sufficient on its own if
-  you (or an AI) only read one file.
-
-Faster than reading any of these end to end: if an AI coding assistant is
-available, just point it at this folder and ask it directly - it can read
-the source and every doc here and answer immediately.
+  you only read one file.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh - Linux equivalent of build.ps1: all four tools, one folder, one
 # slime_core.h, then the self-tests. Mandatory first step on any machine
-# (see AI_CONTEXT.md, "STOP - BUILD FIRST"): -arch=native bakes in THIS
+# (see OVERVIEW.md, "STOP - BUILD FIRST"): -arch=native bakes in THIS
 # GPU's compute capability, so binaries from another box will not run here.
 #
 #   ./build.sh            build + self-tests + orientation banner

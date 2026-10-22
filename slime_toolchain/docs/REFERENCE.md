@@ -1,6 +1,6 @@
-> **The previous full AI_CONTEXT.md**, kept for the record-cycle tools (record_cycle.ps1, reclimb_top.ps1, ./slime climb / dupes) and the sections the new short `AI_CONTEXT.md` does not carry. Its numbers predate the 20,506 record and the heat pipeline: where they differ, `AI_CONTEXT.md` and `docs\*.txt` win. The phase model now lives in `docs\PHASE_MODEL.txt`.
+> **The previous full OVERVIEW.md**, kept for the record-cycle tools (record_cycle.ps1, reclimb_top.ps1, ./slime climb / dupes) and the sections the new short `OVERVIEW.md` does not carry. Its numbers predate the 20,506 record and the heat pipeline: where they differ, `OVERVIEW.md` and `docs\*.txt` win. The phase model now lives in `docs\PHASE_MODEL.txt`.
 
-# AI_CONTEXT — read this first
+# OVERVIEW — read this first
 
 --------------------------------------------------------------------------------
 ## ⛔ STOP — DO THIS FIRST, BEFORE ANY OTHER COMMAND IN ANY DOC
@@ -136,7 +136,7 @@ measured in SECONDS does need re-checking.
 
 --------------------------------------------------------------------------------
 
-Purpose: a single, dense, comprehensive brief for anyone (human or AI)
+Purpose: a single, dense, comprehensive brief for anyone (whoever)
 picking up this project cold. It intentionally duplicates the essential
 facts from README.txt and STEP_BY_STEP_GUIDE.txt rather than just pointing
 at them, so this one file is sufficient on its own.
@@ -220,7 +220,7 @@ FEATURES.txt               capability checklist - what this can actually do
 STEP_BY_STEP_GUIDE.txt    concept-by-concept explainer, easy to hard,
                           includes the same runnable commands with what
                           each flag does
-AI_CONTEXT.md              this file
+OVERVIEW.md              this file
 ```
 
 ## Hardware

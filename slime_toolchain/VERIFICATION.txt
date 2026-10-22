@@ -33,7 +33,7 @@ CHECKED   Peak GPU memory 2,034 MiB of 6,141 MiB during that run, desktop includ
           of it is this tool.
 NOT       A GPU with less than 6 GB. If you have 3-4 GB, set PP_WORKERS=1 or 2 (environment variable) before
           trusting a long run; each worker carries its own buffers.
-NOT       --y39 mode in this share. Note the floor difference documented in AI_CONTEXT.md: --floor 64 is
+NOT       --y39 mode in this share. Note the floor difference documented in OVERVIEW.md: --floor 64 is
           verified identical in chunk mode but moves `best` on 4 spots in 3,000 in --y39 mode.
 
 afk_rescan.exe + y39_rank.ps1 (the -39 ranking)
@@ -74,9 +74,9 @@ NOT       Built or run. Shipped as source with its own build.bat and notes; it i
 Personal data
 -------------
 CHECKED   Case-insensitive content and filename scan for absolute user paths, the author's username and
-          email, hardware model names, .claude paths and "the user" phrasing. All hits inspected by hand
+          email, hardware model names, tool-config paths and "the user" phrasing. All hits inspected by hand
           and fixed; the final scan returns zero text-file matches. No binaries, no hidden files, exactly
-          one .md (AI_CONTEXT.md).
+          one .md (OVERVIEW.md).
 
 What the sender still has to do
 -------------------------------

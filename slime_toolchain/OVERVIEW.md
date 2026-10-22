@@ -1,4 +1,4 @@
-# AI_CONTEXT — read this first
+# OVERVIEW — read this first
 
 A GPU search for the best **slime farm** in Minecraft Java: the AFK spot whose perimeter holds the most
 slime-chunk area, measured the way `/perimeterinfo` reads it with the player's feet at **y −39** over a −64

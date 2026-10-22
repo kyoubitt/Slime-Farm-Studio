@@ -50,4 +50,4 @@ GOOD TO KNOW
 - Results live in main/records/ (a .txt and .png per farm), main/cycles.txt (the hunt log) and
   main/y_phase.csv (best heights).
 - Deeper docs: README.txt (every flag), STEP_BY_STEP_GUIDE.txt (why it works), LINUX.md (Linux),
-  AI_CONTEXT.md (start here) and docs\ (every number).
+  OVERVIEW.md (start here) and docs\ (every number).

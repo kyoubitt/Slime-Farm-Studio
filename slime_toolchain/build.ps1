@@ -122,7 +122,7 @@ Write-Host " DOCS" -ForegroundColor $c
 Write-Host "   FEATURES.txt            capability checklist, shortest read"
 Write-Host "   STEP_BY_STEP_GUIDE.txt  concepts, easiest to hardest"
 Write-Host "   README.txt              full command reference"
-Write-Host "   AI_CONTEXT.md           start here: the hunt, its numbers, known answers"
+Write-Host "   OVERVIEW.md           start here: the hunt, its numbers, known answers"
 Write-Host "   docs\                   the detail (docs\REFERENCE.md: the older full reference)"
 Write-Host ""
 Write-Host "------------------------------------------------------------------------------" -ForegroundColor $y

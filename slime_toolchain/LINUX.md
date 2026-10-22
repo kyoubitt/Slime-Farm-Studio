@@ -47,7 +47,7 @@ pwsh -File stop_all.ps1                  # the ONLY correct way to stop a hunt
 pwsh -File stress_toolchain.ps1 -Quick
 ./hotspot_scan.exe --bench --center-x 0 --center-z 0 --range 40
 
-# the heat hunt (AI_CONTEXT.md "How the hunt works"); needs main/theory/prediction/universe_tier1.csv - data/DATA.txt
+# the heat hunt (OVERVIEW.md "How the hunt works"); needs main/theory/prediction/universe_tier1.csv - data/DATA.txt
 pwsh -File heat/universe_chunk.ps1 -Minutes 10
 pwsh -File heat/second_pass.ps1
 pwsh -File heat/tier2_skim.ps1 -Batches 6        # the heat45 skim that found the 20,506 record

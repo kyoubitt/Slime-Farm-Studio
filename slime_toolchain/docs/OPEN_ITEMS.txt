@@ -40,7 +40,7 @@ Note the ordering: cq does NOT rank farms at -39 (docs\PREDICTION.txt 13c).
    exact search now logs, per spot, layouts >= 64/66/68/70 and every 68+ layout
    (`main\theory\heat\phase_layouts\`): enough data soon to fit a better ranking (heat, possible-count
    statistics, line, X value) and reorder the spot list.
-5. DONE 2026-09-12: every X column, every Z line and 3M candidate spots measured on the GPU (AI_CONTEXT "WHOLE-WORLD COVERAGE"); the spot list is now measured, not predicted. Was: `hotspot_scan --heat-survey` (GPU, same heat40 definition, validated vs the 2M CPU values; 20,000 columns x 50k seeds in 0.8 s) surveying every column of line 10617. **Wider X survey** — the X list covers the survey's top 20,000 columns of ~3.75M; hot columns kept
+5. DONE 2026-09-12: every X column, every Z line and 3M candidate spots measured on the GPU (OVERVIEW "WHOLE-WORLD COVERAGE"); the spot list is now measured, not predicted. Was: `hotspot_scan --heat-survey` (GPU, same heat40 definition, validated vs the 2M CPU values; 20,000 columns x 50k seeds in 0.8 s) surveying every column of line 10617. **Wider X survey** — the X list covers the survey's top 20,000 columns of ~3.75M; hot columns kept
    appearing deep in it (the hottest was survey rank 12,893). Needs a GPU heat measurement.
 6. DONE 2026-09-13 as a side folder: main\records\over66_y-39\ (`<peri>-<cq>-<seed>.png`, measured farms `-measured`; see README RAISED-AFK FOLDER). **Raised-AFK rescan of collected results** (to the project owner's spec, 2026-09-12). A SEPARATE
    tool, NOT part of the search: re-score the farms already collected (records / over66.csv / the phase_layouts keep and
@@ -102,7 +102,7 @@ Note the ordering: cq does NOT rank farms at -39 (docs\PREDICTION.txt 13c).
    67+ 3%, mean 64.3. So heat roughly doubles the 66+ rate, but inside 30-34 the rate is flat (69.30 came
    from heat 30.3) - going down the list costs little. Repeat at ~300 spots of heat 24-28.
 9. **Cut checks**: every 50 spots; if one ever finds a 70+ layout outside the 5% cut, raise the cut.
-10. **Model vs game**: measured gaps +0.3%, +1.2%, +1.7% - each new in-game measurement goes in AI_CONTEXT.
+10. **Model vs game**: measured gaps +0.3%, +1.2%, +1.7% - each new in-game measurement goes in OVERVIEW.
 
 ## Patterns 2026-09-12 (479 exact spots, after the 70.34)
 - **A rich spot = one rich family.** At 40 spots with >= 40 rows of 70+ chunks, the top family holds 50-100% of them
@@ -147,7 +147,7 @@ Note the ordering: cq does NOT rank farms at -39 (docs\PREDICTION.txt 13c).
    screen passed over.
 5. NOT on the timeline: naming record seeds directly without a search. See section 9's negatives.
 
-### Judgment on the full predictive model (2026-09-20, Claude's read - opinion, not measurement)
+### Judgment on the full predictive model (2026-09-20, maintainer's read - opinion, not measurement)
 
 - **A much stronger prior: probably reachable (~70% confidence).** geo_rank's -0.29 comes from ONE hand-picked
   statistic fitted on 1,724 biased labels. More features plus ~50,000 screen-labelled spots should do clearly better.
@@ -219,7 +219,8 @@ seeds is a GPU race). The shortlist IS reproducible, and it is the only file the
 
 ### NEXT (prediction): re-rank the re-screen by -39
 
-`main	heory\predictionescreened.csv` (15,613 spots, essentially the whole heat-20 backlog) was screened by
+`main	heory\prediction
+escreened.csv` (15,613 spots, essentially the whole heat-20 backlog) was screened by
 CHUNK COUNT. On 400 labelled spots the -39 screen puts 18 of the true top 40 in its top 40 against 13 for count
 (docs\PREDICTION.txt 11). Re-screening the file with `phase_prepass --y39` is ~80 min of GPU (0.32 s/spot) and changes
 which 40 spots the exact search takes next. Still open behind it: the heat-20 universe sweep (~167k spots,

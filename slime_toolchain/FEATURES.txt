@@ -6,7 +6,7 @@ earlier sampling-based tools, still built and working.
  FEATURES - what this toolchain can actually do, at a glance
 ================================================================================
 A checklist, not an explanation. See STEP_BY_STEP_GUIDE.txt for why each of
-these exists, README.txt for the exact flags, AI_CONTEXT.md and docs\ for the deep
+these exists, README.txt for the exact flags, OVERVIEW.md and docs\ for the deep
 numbers.
 
 *** STOP - BUILD FIRST. The .exe files here are compiled with -arch=native
@@ -21,7 +21,7 @@ rebuilt all four tools and passed every self-test. So on any new machine:
 Needs the CUDA Toolkit (for nvcc; a toolkit-ONLY CUDA 13 install must have
 cuda_crt + libnvvm + cuda_nvcc's bin/crt added or .cu files will not compile
 at all) and Visual Studio Build Tools with the "Desktop development with
-C++" workload (for cl.exe). Neither ships here. Detail in AI_CONTEXT.md's
+C++" workload (for cl.exe). Neither ships here. Detail in OVERVIEW.md's
 STOP section. ***
 
 *** IMPORTANT: every speed/throughput number anywhere in this project was

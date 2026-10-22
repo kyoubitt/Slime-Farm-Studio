@@ -627,7 +627,7 @@ that is spread everywhere: inside the grid, 13+ is still 66% of spots at column 
 | inside the survey | | | | | ~2.5M | ~63k |
 
 - At heat 22+ the world holds **about as many spots outside the survey as inside it** (mostly region B, which
-  AI_CONTEXT already listed as "not covered"). The 1.19x figure was an extrapolation of a power law fitted
+  OVERVIEW already listed as "not covered"). The 1.19x figure was an extrapolation of a power law fitted
   inside the grid; it under-counted.
 - At 13+ the survey holds ~1% of the population.
 - The 19,400-19,750 ceiling (13f) was a ceiling for the SURVEYED universe. With ~100x more viable spots in the
