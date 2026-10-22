@@ -1,3 +1,5 @@
+<p align="center"><img src="slime_toolchain/docs/logo.png" width="128" alt="SlimeByte"></p>
+
 # SlimeByte
 
 Finds the best spot for a Minecraft slime farm on a world seed — the AFK block with the most
