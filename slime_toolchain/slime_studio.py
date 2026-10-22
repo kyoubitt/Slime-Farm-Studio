@@ -1135,6 +1135,7 @@ class App:
         self.help, self.confirm_long, self.dense = False, False, False
         self.search = next((n for n in SEARCH_TOOLS if os.path.exists(tool(n))), None)   # what Find will use, if it runs
         self.tile_s = self.saved_tile_s(p)    # this machine's measured seconds per full tile, once a big scan ran
+        threading.Thread(target=self.probe_search, args=(p,), daemon=True).start()
         self.tab, self.focus, self.focus_moved = "find", "seed", False
         self.scroll, self.copy_i = {}, {}
         self.status, self.toast, self.job = None, None, None
@@ -1313,6 +1314,15 @@ class App:
             i = sum(1 for v in vals if cur is not None and v < cur) - (1 if d > 0 else 0)
         n = i + d
         self.set_range(vals[n % len(vals)] if wrap_around else vals[max(0, min(len(vals) - 1, n))])
+
+    def probe_search(self, prefs):
+        """Which search tool really runs here (the OpenCL one may have no driver): tried once in the background,
+        then the time estimate names the right one."""
+        name = searcher()
+        if name and name != self.search:
+            self.search = name
+            self.tile_s = self.saved_tile_s(prefs)
+            self.dirty = True
 
     def saved_tile_s(self, prefs):
         return prefs.get("studio_tile_s_" + (self.search or "")) or (prefs.get("studio_tile_s") if self.search == "slime_gpu" else None)
