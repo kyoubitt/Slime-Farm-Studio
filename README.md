@@ -1,6 +1,9 @@
-<p align="center"><img src="slime_toolchain/docs/logo.png" width="128" alt="SlimeByte"></p>
-
-# SlimeByte
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="slime_toolchain/docs/logo-wordmark-dark.png">
+    <img src="slime_toolchain/docs/logo-wordmark.png" width="420" alt="SlimeByte">
+  </picture>
+</p>
 
 Finds the best spot for a Minecraft slime farm on a world seed — the AFK block with the most
 spawning spaces around it — then writes the commands that build the perimeter.
